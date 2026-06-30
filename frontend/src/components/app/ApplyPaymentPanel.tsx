@@ -1,0 +1,229 @@
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { api } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Badge } from "@/components/ui/badge";
+import { Textarea } from "@/components/ui/textarea";
+import { toast } from "sonner";
+import { fmtMoney, daysBetween, type Customer, type Invoice } from "@/lib/ledger";
+
+export function ApplyPaymentPanel() {
+  const qc = useQueryClient();
+  const [customerId, setCustomerId] = useState("");
+  const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [amount, setAmount] = useState<string>("");
+  const [note, setNote] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [useBalance, setUseBalance] = useState(false);
+
+  const { data: customers = [] } = useQuery({
+    queryKey: ["customers"],
+    queryFn: async () => {
+      const res = await api.getCustomers();
+      return res.customers as Customer[];
+    },
+  });
+
+  const { data: openInvoices = [] } = useQuery({
+    queryKey: ["open-invoices", customerId, paymentDate],
+    enabled: !!customerId && !!paymentDate,
+    queryFn: async () => {
+      const res = await api.getInvoices({ customer_id: customerId, status: "open", due_date_lte: paymentDate });
+      return res.invoices as Invoice[];
+    },
+  });
+
+  const { data: previousRemaining = 0 } = useQuery({
+    queryKey: ["customer-balance", customerId],
+    enabled: !!customerId,
+    queryFn: async () => {
+      const res = await api.getCustomerBalance(customerId);
+      return res.remaining;
+    },
+  });
+
+  const paymentAmount = parseFloat(amount) || 0;
+  const availableAmount = paymentAmount + (useBalance ? previousRemaining : 0);
+
+  const allocations = useMemo(() => {
+    let remaining = availableAmount;
+    const orderedSelected = openInvoices.filter((i) => selected.has(i.id));
+    const result: { invoice: Invoice; apply: number; closes: boolean; newBalance: number }[] = [];
+    for (const inv of orderedSelected) {
+      if (remaining <= 0) {
+        result.push({ invoice: inv, apply: 0, closes: false, newBalance: Number(inv.balance) });
+        continue;
+      }
+      const apply = Math.min(remaining, Number(inv.balance));
+      const newBalance = +(Number(inv.balance) - apply).toFixed(2);
+      const closes = newBalance <= 0;
+      result.push({ invoice: inv, apply: +apply.toFixed(2), closes, newBalance });
+      remaining = +(remaining - apply).toFixed(2);
+    }
+    return { rows: result, remaining: +remaining.toFixed(2), applied: +(availableAmount - remaining).toFixed(2) };
+  }, [openInvoices, selected, availableAmount]);
+
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  const submit = useMutation({
+    mutationFn: async () => {
+      if (!customerId) throw new Error("Select a customer");
+      if (availableAmount <= 0) throw new Error("Enter a payment amount or use an existing balance");
+      if (selected.size === 0) throw new Error("Select at least one invoice");
+
+      await api.applyPayment({
+        customer_id: customerId,
+        payment_date: paymentDate,
+        amount: paymentAmount,
+        note: note || undefined,
+        selected_invoice_ids: Array.from(selected),
+        use_balance: useBalance,
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries();
+      setSelected(new Set());
+      setAmount("");
+      setNote("");
+      setUseBalance(false);
+      toast.success("Payment applied");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const isOverdue = (dueDate: string) => new Date(dueDate) < new Date(paymentDate);
+
+  return (
+    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
+      <Card>
+        <CardHeader><CardTitle>Bulk payment</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-1.5">
+            <Label>Customer</Label>
+            <Select value={customerId} onValueChange={(v) => { setCustomerId(v); setSelected(new Set()); }}>
+              <SelectTrigger><SelectValue placeholder="Select customer" /></SelectTrigger>
+              <SelectContent>
+                {customers.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="pdate">Payment date</Label>
+            <Input id="pdate" type="date" value={paymentDate} onChange={(e) => { setPaymentDate(e.target.value); setSelected(new Set()); }} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="pamt">Payment amount</Label>
+            <Input id="pamt" type="number" min="0" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
+          </div>
+          {previousRemaining > 0 && (
+            <div className="flex items-center gap-2 rounded-lg border bg-muted/40 p-3">
+              <Checkbox
+                id="useBalance"
+                checked={useBalance}
+                onCheckedChange={(v) => { setUseBalance(v === true); setSelected(new Set()); }}
+              />
+              <Label htmlFor="useBalance" className="text-sm font-normal">
+                Use previous balance <span className="font-medium">{fmtMoney(previousRemaining)}</span>
+              </Label>
+            </div>
+          )}
+          <div className="space-y-1.5">
+            <Label htmlFor="note">Note (optional)</Label>
+            <Textarea id="note" value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
+          </div>
+          <div className="rounded-lg border bg-muted/40 p-3 text-sm space-y-1">
+            <div className="flex justify-between"><span className="text-muted-foreground">Payment amount</span><span>{fmtMoney(paymentAmount)}</span></div>
+            {useBalance && previousRemaining > 0 && (
+              <div className="flex justify-between"><span className="text-muted-foreground">Previous balance</span><span>+{fmtMoney(previousRemaining)}</span></div>
+            )}
+            <div className="flex justify-between"><span className="text-muted-foreground">Available</span><span className="font-medium">{fmtMoney(availableAmount)}</span></div>
+            <div className="flex justify-between"><span className="text-muted-foreground">To apply</span><span className="font-medium">{fmtMoney(allocations.applied)}</span></div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Remaining</span>
+              <span className={allocations.remaining > 0 ? "font-semibold text-warning" : ""}>{fmtMoney(allocations.remaining)}</span>
+            </div>
+          </div>
+          <Button className="w-full" disabled={submit.isPending || !customerId || availableAmount <= 0 || selected.size === 0}
+            onClick={() => submit.mutate()}>
+            {submit.isPending ? "Applying\u2026" : "Apply payment"}
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Invoices due / overdue as of {paymentDate || "\u2014"}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {!customerId ? (
+            <p className="text-sm text-muted-foreground">Select a customer to see outstanding invoices.</p>
+          ) : openInvoices.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No open invoices due by this date.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-10" />
+                    <TableHead>Invoice #</TableHead>
+                    <TableHead>Issued</TableHead>
+                    <TableHead>Due</TableHead>
+                    <TableHead className="text-right">Amount</TableHead>
+                    <TableHead className="text-right">Balance</TableHead>
+                    <TableHead className="text-right">Will apply</TableHead>
+                    <TableHead className="text-right">After</TableHead>
+                    <TableHead>Status</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {openInvoices.map((inv) => {
+                    const row = allocations.rows.find((r) => r.invoice.id === inv.id);
+                    const checked = selected.has(inv.id);
+                    return (
+                      <TableRow key={inv.id} data-state={checked ? "selected" : undefined}>
+                        <TableCell>
+                          <Checkbox checked={checked} onCheckedChange={() => toggle(inv.id)} />
+                        </TableCell>
+                        <TableCell className="font-medium">{inv.invoice_number}</TableCell>
+                        <TableCell>{inv.issue_date}</TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            {inv.due_date}
+                            {isOverdue(inv.due_date) && <Badge variant="destructive" className="text-xs">overdue</Badge>}
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right">{fmtMoney(Number(inv.amount))}</TableCell>
+                        <TableCell className="text-right">{fmtMoney(Number(inv.balance))}</TableCell>
+                        <TableCell className="text-right">{row ? fmtMoney(row.apply) : "\u2014"}</TableCell>
+                        <TableCell className="text-right">{row ? fmtMoney(row.newBalance) : "\u2014"}</TableCell>
+                        <TableCell>
+                          {row?.closes
+                            ? <Badge className="bg-success text-success-foreground hover:bg-success">closes</Badge>
+                            : row && row.apply > 0
+                              ? <Badge variant="secondary">partial</Badge>
+                              : <span className="text-xs text-muted-foreground">\u2014</span>}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
