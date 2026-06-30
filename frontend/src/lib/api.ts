@@ -1,6 +1,8 @@
 import { getToken } from "./auth";
 
-const API_BASE = "/api";
+const API_BASE = import.meta.env.VITE_URL
+  ? `${import.meta.env.VITE_URL}/api`
+  : "/api";
 
 export class ApiError extends Error {
   status: number;

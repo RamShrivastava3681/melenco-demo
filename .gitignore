@@ -21,6 +21,7 @@ backend/data/
 .env
 *.local
 backend/.env
+frontend/.env
 
 # Editor
 .vscode/*
