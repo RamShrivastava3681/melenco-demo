@@ -21,6 +21,7 @@ export function ApplyPaymentPanel() {
   const [note, setNote] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [useBalance, setUseBalance] = useState(false);
+  const [creditOnly, setCreditOnly] = useState(false);
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -81,14 +82,14 @@ export function ApplyPaymentPanel() {
     mutationFn: async () => {
       if (!customerId) throw new Error("Select a customer");
       if (availableAmount <= 0) throw new Error("Enter a payment amount or use an existing balance");
-      if (selected.size === 0) throw new Error("Select at least one invoice");
+      if (!creditOnly && selected.size === 0) throw new Error("Select at least one invoice");
 
       await api.applyPayment({
         customer_id: customerId,
         payment_date: paymentDate,
         amount: paymentAmount,
         note: note || undefined,
-        selected_invoice_ids: Array.from(selected),
+        selected_invoice_ids: creditOnly ? [] : Array.from(selected),
         use_balance: useBalance,
       });
     },
@@ -98,6 +99,7 @@ export function ApplyPaymentPanel() {
       setAmount("");
       setNote("");
       setUseBalance(false);
+      setCreditOnly(false);
       toast.success("Payment applied");
     },
     onError: (e: Error) => toast.error(e.message),
@@ -136,9 +138,18 @@ export function ApplyPaymentPanel() {
               />
               <Label htmlFor="useBalance" className="text-sm font-normal">
                 Use previous balance <span className="font-medium">{fmtMoney(previousRemaining)}</span>
-              </Label>
-            </div>
-          )}
+              </Label>        </div>
+      )}
+          <div className="flex items-center gap-2 rounded-lg border bg-muted/40 p-3">
+            <Checkbox
+              id="creditOnly"
+              checked={creditOnly}
+              onCheckedChange={(v) => { setCreditOnly(v === true); setSelected(new Set()); }}
+            />
+            <Label htmlFor="creditOnly" className="text-sm font-normal">
+              Add as credit only <span className="text-xs text-muted-foreground">(carry forward to future invoices)</span>
+            </Label>
+          </div>
           <div className="space-y-1.5">
             <Label htmlFor="note">Note (optional)</Label>
             <Textarea id="note" value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
@@ -155,9 +166,9 @@ export function ApplyPaymentPanel() {
               <span className={allocations.remaining > 0 ? "font-semibold text-warning" : ""}>{fmtMoney(allocations.remaining)}</span>
             </div>
           </div>
-          <Button className="w-full" disabled={submit.isPending || !customerId || availableAmount <= 0 || selected.size === 0}
+          <Button className="w-full" disabled={submit.isPending || !customerId || availableAmount <= 0 || (!creditOnly && selected.size === 0)}
             onClick={() => submit.mutate()}>
-            {submit.isPending ? "Applying\u2026" : "Apply payment"}
+            {submit.isPending ? "Applying\u2026" : creditOnly ? "Add credit" : "Apply payment"}
           </Button>
         </CardContent>
       </Card>
@@ -167,12 +178,25 @@ export function ApplyPaymentPanel() {
           <CardTitle>Invoices due / overdue as of {paymentDate || "\u2014"}</CardTitle>
         </CardHeader>
         <CardContent>
-          {!customerId ? (
+          {creditOnly ? (
+            <p className="text-sm text-muted-foreground">Credit-only mode — the full amount will carry forward as available balance.</p>
+          ) : !customerId ? (
             <p className="text-sm text-muted-foreground">Select a customer to see outstanding invoices.</p>
           ) : openInvoices.length === 0 ? (
             <p className="text-sm text-muted-foreground">No open invoices due by this date.</p>
           ) : (
             <div className="overflow-x-auto">
+              <div className="flex items-center gap-2 mb-2">
+                <Button variant="outline" size="sm" onClick={() => setSelected(new Set(openInvoices.map(i => i.id)))}>
+                  Select all
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>
+                  Clear all
+                </Button>
+                {selected.size > 0 && (
+                  <span className="text-xs text-muted-foreground">{selected.size} selected</span>
+                )}
+              </div>
               <Table>
                 <TableHeader>
                   <TableRow>
