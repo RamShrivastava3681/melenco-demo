@@ -112,7 +112,7 @@ export function InvoicesPanel() {
         const buf = await file.arrayBuffer();
         const wb = XLSX.read(buf, { type: "array", cellDates: true });
         const sheet = wb.Sheets[wb.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { raw: true });
+        const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { raw: false, defval: "" });
         rows = normalizeRows(json);
       }
       if (rows.length === 0) throw new Error("File is empty");

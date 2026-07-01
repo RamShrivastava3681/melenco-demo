@@ -52,7 +52,7 @@ router.post("/", (req: Request, res: Response) => {
         db.prepare(
           `INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`
-        ).run(id, req.user!.userId, inv.customer_id, inv.invoice_number, inv.issue_date, inv.due_date, inv.amount);
+        ).run(id, req.user!.userId, inv.customer_id, inv.invoice_number, inv.issue_date, inv.due_date, inv.amount, inv.amount);
 
         const row = db.prepare("SELECT * FROM invoices WHERE id = ?").get(id);
         created.push(row);
