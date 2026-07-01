@@ -162,6 +162,42 @@ router.post("/apply", (req: Request, res: Response) => {
   }
 });
 
+// Subtract from payment remaining balance
+router.patch("/:id/subtract-remaining", (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { amount } = req.body;
+
+  if (amount === undefined || amount === null || !isFinite(amount) || Number(amount) <= 0) {
+    res.status(400).json({ error: "Provide a valid positive amount to subtract" });
+    return;
+  }
+
+  const userId = req.user!.userId;
+
+  const payment = db
+    .prepare("SELECT * FROM payments WHERE id = ? AND user_id = ?")
+    .get(id, userId) as any;
+
+  if (!payment) {
+    res.status(404).json({ error: "Payment not found" });
+    return;
+  }
+
+  const currentRemaining = Number(payment.remaining);
+  const subtractAmount = Number(amount);
+
+  if (subtractAmount > currentRemaining) {
+    res.status(400).json({ error: `Cannot subtract more than the remaining balance (${currentRemaining.toFixed(2)})` });
+    return;
+  }
+
+  const newRemaining = +(currentRemaining - subtractAmount).toFixed(2);
+
+  db.prepare("UPDATE payments SET remaining = ? WHERE id = ?").run(newRemaining, id);
+
+  res.json({ success: true, remaining: newRemaining });
+});
+
 function daysBetween(a: string, b: string): number {
   const ms = new Date(b).getTime() - new Date(a).getTime();
   return Math.round(ms / 86400000);

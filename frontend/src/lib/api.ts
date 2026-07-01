@@ -112,6 +112,12 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  subtractRemaining: (paymentId: string, amount: number) =>
+    request<{ success: boolean; remaining: number }>(`/payments/${paymentId}/subtract-remaining`, {
+      method: "PATCH",
+      body: JSON.stringify({ amount }),
+    }),
+
   // Allocations
   getAllocations: () =>
     request<{ allocations: any[] }>("/allocations"),

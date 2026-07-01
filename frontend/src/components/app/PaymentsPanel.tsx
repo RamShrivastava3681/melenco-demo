@@ -1,11 +1,33 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { api } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { fmtMoney, type Customer, type Payment, type Allocation, type Invoice } from "@/lib/ledger";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
 
 export function PaymentsPanel() {
+  const qc = useQueryClient();
+  const [adjustingId, setAdjustingId] = useState<string | null>(null);
+  const [adjustAmount, setAdjustAmount] = useState<string>("");
+
+  const adjustRemaining = useMutation({
+    mutationFn: async ({ paymentId, amount }: { paymentId: string; amount: number }) => {
+      await api.subtractRemaining(paymentId, amount);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["payments"] });
+      qc.invalidateQueries({ queryKey: ["customer-balance"] });
+      setAdjustingId(null);
+      setAdjustAmount("");
+      toast.success("Remaining balance adjusted");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
     queryFn: async () => {
@@ -54,11 +76,12 @@ export function PaymentsPanel() {
               <TableHead className="text-right">Applied</TableHead>
               <TableHead className="text-right">Remaining</TableHead>
               <TableHead>Closed invoices</TableHead>
+              <TableHead className="w-28">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {payments.length === 0 ? (
-              <TableRow><TableCell colSpan={6} className="text-center text-sm text-muted-foreground">No payments yet</TableCell></TableRow>
+              <TableRow><TableCell colSpan={7} className="text-center text-sm text-muted-foreground">No payments yet</TableCell></TableRow>
             ) : payments.map((p) => {
               const allocs = allocations.filter((a) => a.payment_id === p.id);
               return (
@@ -82,6 +105,66 @@ export function PaymentsPanel() {
                           </Badge>
                         ))}
                     </div>
+                  </TableCell>
+                  <TableCell>
+                    {Number(p.remaining) > 0 && (
+                      <div className="flex items-center gap-1">
+                        {adjustingId === p.id ? (
+                          <div className="flex items-center gap-1">
+                            <Input
+                              type="number"
+                              min="0.01"
+                              max={String(Number(p.remaining))}
+                              step="0.01"
+                              value={adjustAmount}
+                              onChange={(e) => setAdjustAmount(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  const amt = parseFloat(adjustAmount);
+                                  if (amt > 0 && amt <= Number(p.remaining) && !adjustRemaining.isPending) {
+                                    adjustRemaining.mutate({ paymentId: p.id, amount: amt });
+                                  }
+                                }
+                              }}
+                              placeholder="Amount"
+                              className="h-8 w-20 text-xs"
+                              autoFocus
+                            />
+                            <Button
+                              size="sm"
+                              variant="default"
+                              className="h-8 text-xs"
+                              disabled={adjustRemaining.isPending || !adjustAmount || parseFloat(adjustAmount) <= 0 || parseFloat(adjustAmount) > Number(p.remaining)}
+                              onClick={() => {
+                                const amt = parseFloat(adjustAmount);
+                                if (amt > 0 && amt <= Number(p.remaining)) {
+                                  adjustRemaining.mutate({ paymentId: p.id, amount: amt });
+                                }
+                              }}
+                            >
+                              Subtract
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-8 text-xs"
+                              onClick={() => { setAdjustingId(null); setAdjustAmount(""); }}
+                            >
+                              Cancel
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 text-xs"
+                            onClick={() => { setAdjustingId(p.id); setAdjustAmount(""); }}
+                          >
+                            Adjust
+                          </Button>
+                        )}
+                      </div>
+                    )}
                   </TableCell>
                 </TableRow>
               );
