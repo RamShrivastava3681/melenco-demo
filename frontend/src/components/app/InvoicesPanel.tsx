@@ -126,14 +126,25 @@ export function InvoicesPanel() {
 
   const exportMut = useMutation({
     mutationFn: async () => {
-      const res = await api.exportClosedInvoices();
+      const params: { customer_id?: string; status?: string } = {};
+      if (customerId) params.customer_id = customerId;
+      if (filterStatus !== "all") params.status = filterStatus;
+      const res = await api.exportInvoices(params);
       return res.rows;
     },
     onSuccess: (rows) => {
       if (rows.length === 0) {
-        toast.error("No closed invoices to export");
+        toast.error("No invoices to export");
         return;
       }
+
+      // Derive sheet name and filename from filters
+      const statusLabel = filterStatus === "all" ? "All" : filterStatus.charAt(0).toUpperCase() + filterStatus.slice(1);
+      const customerLabel = customerId
+        ? customers.find((c) => c.id === customerId)?.name?.replace(/\s+/g, "-") ?? "customer"
+        : "all-customers";
+      const sheetName = `${statusLabel} Invoices`;
+      const fileName = `${customerLabel}-${statusLabel.toLowerCase().replace(/\s+/g, "-")}-invoices-${new Date().toISOString().slice(0, 10)}.xlsx`;
 
       // Map to flat export-friendly format
       const data = rows.map((r: any) => ({
@@ -143,6 +154,7 @@ export function InvoicesPanel() {
         "Due Date": r.due_date,
         "Amount": Number(r.amount),
         "Balance": Number(r.balance),
+        "Status": r.status ?? "",
         "Closed Date": r.closed_date ?? "",
         "Payment Days": r.payment_days ?? "",
         "Late Payment Days": r.late_payment_days ?? "",
@@ -156,13 +168,13 @@ export function InvoicesPanel() {
 
       const wb = XLSX.utils.book_new();
       const ws = XLSX.utils.json_to_sheet(data);
-      XLSX.utils.book_append_sheet(wb, ws, "Closed Invoices");
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([wbout], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `closed-invoices-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
       toast.success(`Exported ${rows.length} row${rows.length > 1 ? "s" : ""}`);
@@ -210,7 +222,7 @@ export function InvoicesPanel() {
           </div>
           <div className="ml-auto flex gap-2">
             <Button variant="outline" onClick={() => exportMut.mutate()} disabled={exportMut.isPending}>
-              <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : "Export Closed"}
+              <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : `Export ${filterStatus === "all" ? "All" : filterStatus.charAt(0).toUpperCase() + filterStatus.slice(1)}`}
             </Button>
             <Button variant="outline" onClick={downloadTemplate}><Download className="mr-2 h-4 w-4" />Template</Button>
             <Button onClick={() => fileRef.current?.click()} disabled={importMut.isPending || !customerId}>

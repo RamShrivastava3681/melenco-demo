@@ -87,8 +87,13 @@ export const api = {
       body: JSON.stringify({ invoices }),
     }),
 
-  exportClosedInvoices: () =>
-    request<{ rows: any[] }>("/invoices/export/closed"),
+  exportInvoices: (params?: { customer_id?: string; status?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.customer_id) search.set("customer_id", params.customer_id);
+    if (params?.status) search.set("status", params.status);
+    const qs = search.toString();
+    return request<{ rows: any[] }>(`/invoices/export${qs ? `?${qs}` : ""}`);
+  },
 
   deleteInvoice: (id: string) =>
     request<{ success: boolean }>(`/invoices/${id}`, {

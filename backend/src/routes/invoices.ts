@@ -72,37 +72,51 @@ router.post("/", (req: Request, res: Response) => {
   }
 });
 
-// Export closed invoices with payment and allocation details
-router.get("/export/closed", (req: Request, res: Response) => {
+// Export invoices with payment and allocation details, filterable by customer and status
+router.get("/export", (req: Request, res: Response) => {
   const userId = req.user!.userId;
+  const { customer_id, status } = req.query;
 
-  const rows = db
-    .prepare(`
-      SELECT
+  let sql = `      SELECT
         i.invoice_number,
         i.issue_date,
         i.due_date,
         i.amount,
         i.balance,
+        i.status,
         i.closed_date,
         i.payment_days,
         i.late_payment_days,
-        c.name AS customer_name,
-        pa.amount_applied,
-        pa.applied_date,
-        pa.closed_invoice,
-        p.payment_date AS payment_date,
-        p.amount AS payment_amount,
-        p.note AS payment_note
-      FROM invoices i
-      LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = ?
-      LEFT JOIN payment_allocations pa ON pa.invoice_id = i.id AND pa.user_id = ?
-      LEFT JOIN payments p ON p.id = pa.payment_id AND p.user_id = ?
-      WHERE i.user_id = ? AND i.status = 'closed'
-      ORDER BY i.closed_date DESC, i.invoice_number
-    `)
-    .all(userId, userId, userId, userId);
+      c.name AS customer_name,
+      pa.amount_applied,
+      pa.applied_date,
+      pa.closed_invoice,
+      p.payment_date AS payment_date,
+      p.amount AS payment_amount,
+      p.note AS payment_note
+    FROM invoices i
+    LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = ?
+    LEFT JOIN payment_allocations pa ON pa.invoice_id = i.id AND pa.user_id = ?
+    LEFT JOIN payments p ON p.id = pa.payment_id AND p.user_id = ?
+    WHERE i.user_id = ?
+  `;
+  const params: any[] = [userId, userId, userId, userId];
 
+  if (customer_id) {
+    sql += ` AND i.customer_id = ?`;
+    params.push(customer_id);
+  }
+
+  if (status === "open") {
+    sql += ` AND i.status = 'open'`;
+  } else if (status === "closed") {
+    sql += ` AND i.status = 'closed'`;
+  }
+  // status = "all" or unset — export all statuses
+
+  sql += ` ORDER BY i.closed_date DESC, i.invoice_number`;
+
+  const rows = db.prepare(sql).all(...params);
   res.json({ rows });
 });
 
