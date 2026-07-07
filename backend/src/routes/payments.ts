@@ -127,8 +127,8 @@ router.post("/apply", (req: Request, res: Response) => {
         if (auto_fifo) {
           // FIFO mode: only close if full balance can be paid (no partials)
           if (remainingAmount < balance) {
-            // Can't close this invoice — stop processing (carry forward)
-            break;
+            // Can't fully pay this invoice — skip it and try the next one
+            continue;
           }
         }
 
@@ -181,7 +181,7 @@ router.post("/apply", (req: Request, res: Response) => {
         for (const inv of futureInvoices) {
           if (remainingAmount <= 0) break;
           const balance = Number(inv.balance);
-          if (remainingAmount < balance) break;
+          if (remainingAmount < balance) continue;
 
           // Close using invoice's due_date as the closed_date (payment made on due date)
           const closedDate = inv.due_date;

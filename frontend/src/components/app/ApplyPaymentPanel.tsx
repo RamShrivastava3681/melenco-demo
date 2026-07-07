@@ -89,16 +89,14 @@ export function ApplyPaymentPanel() {
     const pastInvoices = allOpenInvoices.filter((i) => i.due_date <= paymentDate);
     const futureInvoices = allOpenInvoices.filter((i) => i.due_date > paymentDate);
 
-    // Pass 1: process invoices due on or before payment date (existing FIFO logic)
+    // Pass 1: process invoices due on or before payment date — skip unpayable ones
     const pastRows: { invoice: Invoice; closes: boolean; type: 'past' | 'future' }[] = [];
-    let stopped = false;
     for (const inv of pastInvoices) {
       const balance = Number(inv.balance);
-      if (!stopped && remaining >= balance) {
+      if (remaining >= balance) {
         pastRows.push({ invoice: inv, closes: true, type: 'past' });
         remaining = +(remaining - balance).toFixed(2);
       } else {
-        stopped = true;
         pastRows.push({ invoice: inv, closes: false, type: 'past' });
       }
     }
@@ -110,11 +108,9 @@ export function ApplyPaymentPanel() {
         const balance = Number(inv.balance);
         if (remaining >= balance) {
           futureRows.push({ invoice: inv, closes: true, type: 'future' });
-          remaining = +(remaining - balance).toFixed(2);
-        } else {
-          futureRows.push({ invoice: inv, closes: false, type: 'future' });
-          break;
-        }
+          remaining = +(remaining - balance).toFixed(2);          } else {
+            futureRows.push({ invoice: inv, closes: false, type: 'future' });
+          }
       }
     } else {
       // Without closeFuture, future invoices just show as skipped
@@ -327,7 +323,7 @@ export function ApplyPaymentPanel() {
                   {fifoPreview && fifoPreview.willCloseCount > 0
                     ? `Will close ${fifoPreview.willCloseCount} invoice${fifoPreview.willCloseCount > 1 ? 's' : ''}${closeFuture && fifoPreview.futureCloseCount > 0 ? ` (${fifoPreview.futureCloseCount} future at due date)` : ''} — oldest invoices paid first.`
                     : availableAmount > 0
-                      ? `Cannot close any invoice — amount is too small for the oldest invoice balance. Amount will carry forward.`
+                      ? `Cannot close any invoice — amount is too small for all open invoice balances. Amount will carry forward.`
                       : `Enter an amount to see which invoices will be closed.`}
                 </div>
                 <Table>
