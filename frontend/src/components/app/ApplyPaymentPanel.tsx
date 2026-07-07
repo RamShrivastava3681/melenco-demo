@@ -22,6 +22,7 @@ export function ApplyPaymentPanel() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [useBalance, setUseBalance] = useState(false);
   const [creditOnly, setCreditOnly] = useState(false);
+  const [autoFifo, setAutoFifo] = useState(false);
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -33,9 +34,18 @@ export function ApplyPaymentPanel() {
 
   const { data: openInvoices = [] } = useQuery({
     queryKey: ["open-invoices", customerId, paymentDate],
-    enabled: !!customerId && !!paymentDate,
+    enabled: !!customerId && !!paymentDate && !autoFifo,
     queryFn: async () => {
       const res = await api.getInvoices({ customer_id: customerId, status: "open", due_date_lte: paymentDate });
+      return res.invoices as Invoice[];
+    },
+  });
+
+  const { data: allOpenInvoices = [] } = useQuery({
+    queryKey: ["open-invoices-all", customerId],
+    enabled: !!customerId && autoFifo,
+    queryFn: async () => {
+      const res = await api.getInvoices({ customer_id: customerId, status: "open" });
       return res.invoices as Invoice[];
     },
   });
@@ -70,6 +80,25 @@ export function ApplyPaymentPanel() {
     return { rows: result, remaining: +remaining.toFixed(2), applied: +(availableAmount - remaining).toFixed(2) };
   }, [openInvoices, selected, availableAmount]);
 
+  // FIFO preview: only full closures, no partials, in due_date order
+  const fifoPreview = useMemo(() => {
+    if (!autoFifo) return null;
+    let remaining = availableAmount;
+    let stopped = false;
+    const rows: { invoice: Invoice; closes: boolean }[] = [];
+    for (const inv of allOpenInvoices) {
+      const balance = Number(inv.balance);
+      if (!stopped && remaining >= balance) {
+        rows.push({ invoice: inv, closes: true });
+        remaining = +(remaining - balance).toFixed(2);
+      } else {
+        stopped = true;
+        rows.push({ invoice: inv, closes: false });
+      }
+    }
+    return { rows, remaining, willCloseCount: rows.filter((r) => r.closes).length };
+  }, [allOpenInvoices, availableAmount, autoFifo]);
+
   function toggle(id: string) {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -82,15 +111,16 @@ export function ApplyPaymentPanel() {
     mutationFn: async () => {
       if (!customerId) throw new Error("Select a customer");
       if (availableAmount <= 0) throw new Error("Enter a payment amount or use an existing balance");
-      if (!creditOnly && selected.size === 0) throw new Error("Select at least one invoice");
+      if (!creditOnly && !autoFifo && selected.size === 0) throw new Error("Select at least one invoice");
 
       await api.applyPayment({
         customer_id: customerId,
         payment_date: paymentDate,
         amount: paymentAmount,
         note: note || undefined,
-        selected_invoice_ids: creditOnly ? [] : Array.from(selected),
+        selected_invoice_ids: creditOnly || autoFifo ? [] : Array.from(selected),
         use_balance: useBalance,
+        auto_fifo: autoFifo,
       });
     },
     onSuccess: () => {
@@ -100,6 +130,7 @@ export function ApplyPaymentPanel() {
       setNote("");
       setUseBalance(false);
       setCreditOnly(false);
+      setAutoFifo(false);
       toast.success("Payment applied");
     },
     onError: (e: Error) => toast.error(e.message),
@@ -144,10 +175,22 @@ export function ApplyPaymentPanel() {
             <Checkbox
               id="creditOnly"
               checked={creditOnly}
-              onCheckedChange={(v) => { setCreditOnly(v === true); setSelected(new Set()); }}
+              disabled={autoFifo}
+              onCheckedChange={(v) => { setCreditOnly(v === true); if (v === true) setAutoFifo(false); setSelected(new Set()); }}
             />
-            <Label htmlFor="creditOnly" className="text-sm font-normal">
+            <Label htmlFor="creditOnly" className={`text-sm font-normal ${autoFifo ? 'text-muted-foreground' : ''}`}>
               Add as credit only <span className="text-xs text-muted-foreground">(carry forward to future invoices)</span>
+            </Label>
+          </div>
+          <div className="flex items-center gap-2 rounded-lg border bg-muted/40 p-3">
+            <Checkbox
+              id="autoFifo"
+              checked={autoFifo}
+              disabled={creditOnly}
+              onCheckedChange={(v) => { setAutoFifo(v === true); if (v === true) setCreditOnly(false); setSelected(new Set()); }}
+            />
+            <Label htmlFor="autoFifo" className={`text-sm font-normal ${creditOnly ? 'text-muted-foreground' : ''}`}>
+              Auto-close via FIFO <span className="text-xs text-muted-foreground">(oldest invoices first, no partials)</span>
             </Label>
           </div>
           <div className="space-y-1.5">
@@ -160,26 +203,118 @@ export function ApplyPaymentPanel() {
               <div className="flex justify-between"><span className="text-muted-foreground">Previous balance</span><span>+{fmtMoney(previousRemaining)}</span></div>
             )}
             <div className="flex justify-between"><span className="text-muted-foreground">Available</span><span className="font-medium">{fmtMoney(availableAmount)}</span></div>
-            <div className="flex justify-between"><span className="text-muted-foreground">To apply</span><span className="font-medium">{fmtMoney(allocations.applied)}</span></div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Remaining</span>
-              <span className={allocations.remaining > 0 ? "font-semibold text-warning" : ""}>{fmtMoney(allocations.remaining)}</span>
-            </div>
+            {autoFifo ? (
+              <>
+                {fifoPreview ? (
+                  <>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Invoices to close</span>
+                      <span className="font-medium">{fifoPreview.willCloseCount}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">To apply</span>
+                      <span className="font-medium">{fmtMoney(+(availableAmount - fifoPreview.remaining).toFixed(2))}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Remaining (carry forward)</span>
+                      <span className={fifoPreview.remaining > 0 ? "font-semibold text-warning" : ""}>{fmtMoney(fifoPreview.remaining)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Available</span>
+                    <span className="font-medium">{fmtMoney(availableAmount)}</span>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="flex justify-between"><span className="text-muted-foreground">To apply</span><span className="font-medium">{fmtMoney(allocations.applied)}</span></div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Remaining</span>
+                  <span className={allocations.remaining > 0 ? "font-semibold text-warning" : ""}>{fmtMoney(allocations.remaining)}</span>
+                </div>
+              </>
+            )}
           </div>
-          <Button className="w-full" disabled={submit.isPending || !customerId || availableAmount <= 0 || (!creditOnly && selected.size === 0)}
+          <Button className="w-full" disabled={submit.isPending || !customerId || availableAmount <= 0 || (!creditOnly && !autoFifo && selected.size === 0)}
             onClick={() => submit.mutate()}>
-            {submit.isPending ? "Applying\u2026" : creditOnly ? "Add credit" : "Apply payment"}
+            {submit.isPending
+              ? "Applying\u2026"
+              : creditOnly
+                ? "Add credit"
+                : autoFifo
+                  ? "Apply & close via FIFO"
+                  : "Apply payment"}
           </Button>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Invoices due / overdue as of {paymentDate || "\u2014"}</CardTitle>
+          <CardTitle>
+            {autoFifo ? "All open invoices (FIFO order)" : `Invoices due / overdue as of ${paymentDate || "\u2014"}`}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           {creditOnly ? (
             <p className="text-sm text-muted-foreground">Credit-only mode — the full amount will carry forward as available balance.</p>
+          ) : autoFifo ? (
+            !customerId ? (
+              <p className="text-sm text-muted-foreground">Select a customer to see outstanding invoices.</p>
+            ) : allOpenInvoices.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No open invoices for this customer. Payment will carry forward as available balance.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="mb-2 text-xs text-muted-foreground">
+                  {fifoPreview && fifoPreview.willCloseCount > 0
+                    ? `Will close ${fifoPreview.willCloseCount} invoice${fifoPreview.willCloseCount > 1 ? 's' : ''} — oldest invoices paid first.`
+                    : availableAmount > 0
+                      ? `Cannot close any invoice — amount is too small for the oldest invoice balance. Amount will carry forward.`
+                      : `Enter an amount to see which invoices will be closed.`}
+                </div>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Invoice #</TableHead>
+                      <TableHead>Issued</TableHead>
+                      <TableHead>Due</TableHead>
+                      <TableHead className="text-right">Amount</TableHead>
+                      <TableHead className="text-right">Balance</TableHead>
+                      <TableHead>FIFO status</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {allOpenInvoices.map((inv) => {
+                      const row = fifoPreview?.rows.find((r) => r.invoice.id === inv.id);
+                      return (
+                        <TableRow key={inv.id}>
+                          <TableCell className="font-medium">{inv.invoice_number}</TableCell>
+                          <TableCell>{inv.issue_date}</TableCell>
+                          <TableCell>
+                            <div className="flex items-center gap-2">
+                              {inv.due_date}
+                              {isOverdue(inv.due_date) && <Badge variant="destructive" className="text-xs">overdue</Badge>}
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-right">{fmtMoney(Number(inv.amount))}</TableCell>
+                          <TableCell className="text-right">{fmtMoney(Number(inv.balance))}</TableCell>
+                          <TableCell>
+                            {!row ? (
+                              <span className="text-xs text-muted-foreground">pending</span>
+                            ) : row.closes ? (
+                              <Badge className="bg-success text-success-foreground hover:bg-success">will close</Badge>
+                            ) : (
+                              <Badge variant="secondary">skipped</Badge>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            )
           ) : !customerId ? (
             <p className="text-sm text-muted-foreground">Select a customer to see outstanding invoices.</p>
           ) : openInvoices.length === 0 ? (

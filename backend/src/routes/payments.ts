@@ -37,10 +37,16 @@ router.post("/apply", (req: Request, res: Response) => {
     note,
     selected_invoice_ids,
     use_balance = false,
+    auto_fifo = false,
   } = req.body;
 
-  if (!customer_id || !payment_date || amount === undefined || amount === null || !Array.isArray(selected_invoice_ids)) {
-    res.status(400).json({ error: "Missing required fields: customer_id, payment_date, amount, selected_invoice_ids" });
+  if (!customer_id || !payment_date || amount === undefined || amount === null) {
+    res.status(400).json({ error: "Missing required fields: customer_id, payment_date, amount" });
+    return;
+  }
+
+  if (!auto_fifo && !Array.isArray(selected_invoice_ids)) {
+    res.status(400).json({ error: "Missing required field: selected_invoice_ids" });
     return;
   }
 
@@ -78,60 +84,79 @@ router.post("/apply", (req: Request, res: Response) => {
       let totalApplied = 0;
       const allocations: any[] = [];
 
-      // 3. Allocate to selected invoices (if any)
-      if (selected_invoice_ids.length > 0) {
+      // 3. Allocate to invoices
+      let invoiceRows: any[] = [];
+
+      if (auto_fifo) {
+        // FIFO mode: fetch all open invoices for this customer, ordered by due_date
+        invoiceRows = db
+          .prepare(
+            `SELECT * FROM invoices WHERE user_id = ? AND customer_id = ? AND status = 'open' ORDER BY due_date`
+          )
+          .all(userId, customer_id) as any[];
+      } else if (selected_invoice_ids.length > 0) {
+        // Manual mode: fetch selected invoices
         const placeholders = selected_invoice_ids.map(() => "?").join(",");
-        const invoiceRows = db
+        invoiceRows = db
           .prepare(
             `SELECT * FROM invoices WHERE id IN (${placeholders}) AND user_id = ? AND customer_id = ? AND status = 'open' ORDER BY due_date`
           )
           .all(...selected_invoice_ids, userId, customer_id) as any[];
+      }
 
-        if (invoiceRows.length === 0) {
+      if (invoiceRows.length === 0 && !auto_fifo) {
           throw new Error("No valid open invoices found");
-        }
+      }
 
-        for (const inv of invoiceRows) {
-          if (remainingAmount <= 0) break;
+      for (const inv of invoiceRows) {
+        if (remainingAmount <= 0) break;
 
-          const balance = Number(inv.balance);
-          const apply = Math.min(remainingAmount, balance);
-          const newBalance = +(balance - apply).toFixed(2);
-          const closes = newBalance <= 0;
+        const balance = Number(inv.balance);
 
-          // Update invoice
-          let updateSql = "UPDATE invoices SET balance = ?";
-          const updateParams: any[] = [newBalance];
-
-          if (closes) {
-            updateSql += ", status = 'closed', closed_date = ?, payment_days = ?, late_payment_days = ?";
-            const paymentDays = daysBetween(inv.issue_date, payment_date);
-            const lateDays = Math.max(0, daysBetween(inv.due_date, payment_date));
-            updateParams.push(payment_date, paymentDays, lateDays);
+        if (auto_fifo) {
+          // FIFO mode: only close if full balance can be paid (no partials)
+          if (remainingAmount < balance) {
+            // Can't close this invoice — stop processing (carry forward)
+            break;
           }
-
-          updateSql += " WHERE id = ?";
-          updateParams.push(inv.id);
-          db.prepare(updateSql).run(...updateParams);
-
-          // Create allocation
-          const allocId = uuidv4();
-          db.prepare(
-            `INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`
-          ).run(allocId, userId, paymentId, inv.id, +apply.toFixed(2), payment_date, closes ? 1 : 0);
-
-          allocations.push({
-            id: allocId,
-            invoice_id: inv.id,
-            invoice_number: inv.invoice_number,
-            amount_applied: +apply.toFixed(2),
-            closed_invoice: closes,
-          });
-
-          totalApplied += apply;
-          remainingAmount = +(remainingAmount - apply).toFixed(2);
         }
+
+        const apply = auto_fifo ? balance : Math.min(remainingAmount, balance);
+        const newBalance = +(balance - apply).toFixed(2);
+        const closes = newBalance <= 0;
+
+        // Update invoice
+        let updateSql = "UPDATE invoices SET balance = ?";
+        const updateParams: any[] = [newBalance];
+
+        if (closes) {
+          updateSql += ", status = 'closed', closed_date = ?, payment_days = ?, late_payment_days = ?";
+          const paymentDays = daysBetween(inv.issue_date, payment_date);
+          const lateDays = Math.max(0, daysBetween(inv.due_date, payment_date));
+          updateParams.push(payment_date, paymentDays, lateDays);
+        }
+
+        updateSql += " WHERE id = ?";
+        updateParams.push(inv.id);
+        db.prepare(updateSql).run(...updateParams);
+
+        // Create allocation
+        const allocId = uuidv4();
+        db.prepare(
+          `INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(allocId, userId, paymentId, inv.id, +apply.toFixed(2), payment_date, closes ? 1 : 0);
+
+        allocations.push({
+          id: allocId,
+          invoice_id: inv.id,
+          invoice_number: inv.invoice_number,
+          amount_applied: +apply.toFixed(2),
+          closed_invoice: closes,
+        });
+
+        totalApplied += apply;
+        remainingAmount = +(remainingAmount - apply).toFixed(2);
       }
 
       // 4. Insert payment record

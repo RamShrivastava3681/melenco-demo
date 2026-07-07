@@ -106,6 +106,7 @@ export const api = {
     note?: string;
     selected_invoice_ids: string[];
     use_balance?: boolean;
+    auto_fifo?: boolean;
   }) =>
     request<{ payment: any; allocations: any[] }>("/payments/apply", {
       method: "POST",
@@ -117,6 +118,10 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ amount }),
     }),
+
+  // Customer stats
+  getCustomerPaymentStats: () =>
+    request<{ stats: Record<string, { avg_pay_days: number | null; median_pay_days: number | null; max_pay_days: number | null; min_pay_days: number | null; closed_count: number }> }>("/customers/stats"),
 
   // Allocations
   getAllocations: () =>
