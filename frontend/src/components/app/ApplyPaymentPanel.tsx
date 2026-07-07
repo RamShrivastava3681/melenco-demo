@@ -23,6 +23,7 @@ export function ApplyPaymentPanel() {
   const [useBalance, setUseBalance] = useState(false);
   const [creditOnly, setCreditOnly] = useState(false);
   const [autoFifo, setAutoFifo] = useState(false);
+  const [closeFuture, setCloseFuture] = useState(false);
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -80,24 +81,54 @@ export function ApplyPaymentPanel() {
     return { rows: result, remaining: +remaining.toFixed(2), applied: +(availableAmount - remaining).toFixed(2) };
   }, [openInvoices, selected, availableAmount]);
 
-  // FIFO preview: only full closures, no partials, in due_date order
+  // FIFO preview: two-pass logic (past invoices first, then optional future pass)
   const fifoPreview = useMemo(() => {
     if (!autoFifo) return null;
     let remaining = availableAmount;
+
+    const pastInvoices = allOpenInvoices.filter((i) => i.due_date <= paymentDate);
+    const futureInvoices = allOpenInvoices.filter((i) => i.due_date > paymentDate);
+
+    // Pass 1: process invoices due on or before payment date (existing FIFO logic)
+    const pastRows: { invoice: Invoice; closes: boolean; type: 'past' | 'future' }[] = [];
     let stopped = false;
-    const rows: { invoice: Invoice; closes: boolean }[] = [];
-    for (const inv of allOpenInvoices) {
+    for (const inv of pastInvoices) {
       const balance = Number(inv.balance);
       if (!stopped && remaining >= balance) {
-        rows.push({ invoice: inv, closes: true });
+        pastRows.push({ invoice: inv, closes: true, type: 'past' });
         remaining = +(remaining - balance).toFixed(2);
       } else {
         stopped = true;
-        rows.push({ invoice: inv, closes: false });
+        pastRows.push({ invoice: inv, closes: false, type: 'past' });
       }
     }
-    return { rows, remaining, willCloseCount: rows.filter((r) => r.closes).length };
-  }, [allOpenInvoices, availableAmount, autoFifo]);
+
+    // Pass 2: future-dated invoices (only if closeFuture is enabled)
+    const futureRows: { invoice: Invoice; closes: boolean; type: 'past' | 'future' }[] = [];
+    if (closeFuture) {
+      for (const inv of futureInvoices) {
+        const balance = Number(inv.balance);
+        if (remaining >= balance) {
+          futureRows.push({ invoice: inv, closes: true, type: 'future' });
+          remaining = +(remaining - balance).toFixed(2);
+        } else {
+          futureRows.push({ invoice: inv, closes: false, type: 'future' });
+          break;
+        }
+      }
+    } else {
+      // Without closeFuture, future invoices just show as skipped
+      for (const inv of futureInvoices) {
+        futureRows.push({ invoice: inv, closes: false, type: 'future' });
+      }
+    }
+
+    const rows = [...pastRows, ...futureRows];
+    const willCloseCount = rows.filter((r) => r.closes).length;
+    const futureCloseCount = futureRows.filter((r) => r.closes).length;
+
+    return { rows, pastRows, futureRows, remaining, willCloseCount, futureCloseCount };
+  }, [allOpenInvoices, availableAmount, autoFifo, paymentDate, closeFuture]);
 
   function toggle(id: string) {
     setSelected((prev) => {
@@ -121,6 +152,7 @@ export function ApplyPaymentPanel() {
         selected_invoice_ids: creditOnly || autoFifo ? [] : Array.from(selected),
         use_balance: useBalance,
         auto_fifo: autoFifo,
+        close_future_invoices: closeFuture,
       });
     },
     onSuccess: () => {
@@ -131,6 +163,7 @@ export function ApplyPaymentPanel() {
       setUseBalance(false);
       setCreditOnly(false);
       setAutoFifo(false);
+      setCloseFuture(false);
       toast.success("Payment applied");
     },
     onError: (e: Error) => toast.error(e.message),
@@ -187,12 +220,24 @@ export function ApplyPaymentPanel() {
               id="autoFifo"
               checked={autoFifo}
               disabled={creditOnly}
-              onCheckedChange={(v) => { setAutoFifo(v === true); if (v === true) setCreditOnly(false); setSelected(new Set()); }}
+              onCheckedChange={(v) => { setAutoFifo(v === true); if (v === true) { setCreditOnly(false); } else { setCloseFuture(false); } setSelected(new Set()); }}
             />
             <Label htmlFor="autoFifo" className={`text-sm font-normal ${creditOnly ? 'text-muted-foreground' : ''}`}>
               Auto-close via FIFO <span className="text-xs text-muted-foreground">(oldest invoices first, no partials)</span>
             </Label>
           </div>
+          {autoFifo && (
+            <div className="flex items-center gap-2 rounded-lg border bg-muted/40 p-3">
+              <Checkbox
+                id="closeFuture"
+                checked={closeFuture}
+                onCheckedChange={(v) => setCloseFuture(v === true)}
+              />
+              <Label htmlFor="closeFuture" className="text-sm font-normal">
+                Pre-close future invoices <span className="text-xs text-muted-foreground">(remaining balance closes future-dated invoices at their due date)</span>
+              </Label>
+            </div>
+          )}
           <div className="space-y-1.5">
             <Label htmlFor="note">Note (optional)</Label>
             <Textarea id="note" value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
@@ -208,9 +253,15 @@ export function ApplyPaymentPanel() {
                 {fifoPreview ? (
                   <>
                     <div className="flex justify-between">
-                      <span className="text-muted-foreground">Invoices to close</span>
-                      <span className="font-medium">{fifoPreview.willCloseCount}</span>
+                      <span className="text-muted-foreground">Past invoices to close</span>
+                      <span className="font-medium">{fifoPreview.willCloseCount - fifoPreview.futureCloseCount}</span>
                     </div>
+                    {closeFuture && fifoPreview.futureCloseCount > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Future invoices to close</span>
+                        <span className="font-medium">{fifoPreview.futureCloseCount}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">To apply</span>
                       <span className="font-medium">{fmtMoney(+(availableAmount - fifoPreview.remaining).toFixed(2))}</span>
@@ -244,7 +295,9 @@ export function ApplyPaymentPanel() {
               : creditOnly
                 ? "Add credit"
                 : autoFifo
-                  ? "Apply & close via FIFO"
+                  ? closeFuture
+                    ? "Apply & close (incl. future)"
+                    : "Apply & close via FIFO"
                   : "Apply payment"}
           </Button>
         </CardContent>
@@ -253,7 +306,11 @@ export function ApplyPaymentPanel() {
       <Card>
         <CardHeader>
           <CardTitle>
-            {autoFifo ? "All open invoices (FIFO order)" : `Invoices due / overdue as of ${paymentDate || "\u2014"}`}
+            {autoFifo ? (
+            closeFuture
+              ? "All open invoices (FIFO + future pre-close)"
+              : "All open invoices (FIFO order)"
+          ) : `Invoices due / overdue as of ${paymentDate || "\u2014"}`}
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -268,7 +325,7 @@ export function ApplyPaymentPanel() {
               <div className="overflow-x-auto">
                 <div className="mb-2 text-xs text-muted-foreground">
                   {fifoPreview && fifoPreview.willCloseCount > 0
-                    ? `Will close ${fifoPreview.willCloseCount} invoice${fifoPreview.willCloseCount > 1 ? 's' : ''} — oldest invoices paid first.`
+                    ? `Will close ${fifoPreview.willCloseCount} invoice${fifoPreview.willCloseCount > 1 ? 's' : ''}${closeFuture && fifoPreview.futureCloseCount > 0 ? ` (${fifoPreview.futureCloseCount} future at due date)` : ''} — oldest invoices paid first.`
                     : availableAmount > 0
                       ? `Cannot close any invoice — amount is too small for the oldest invoice balance. Amount will carry forward.`
                       : `Enter an amount to see which invoices will be closed.`}
@@ -302,8 +359,10 @@ export function ApplyPaymentPanel() {
                           <TableCell>
                             {!row ? (
                               <span className="text-xs text-muted-foreground">pending</span>
-                            ) : row.closes ? (
+                            ) : row.closes && row.type === 'past' ? (
                               <Badge className="bg-success text-success-foreground hover:bg-success">will close</Badge>
+                            ) : row.closes && row.type === 'future' ? (
+                              <Badge variant="outline" className="border-blue-500 text-blue-500">pre-close</Badge>
                             ) : (
                               <Badge variant="secondary">skipped</Badge>
                             )}

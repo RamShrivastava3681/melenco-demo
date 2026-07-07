@@ -107,6 +107,7 @@ export const api = {
     selected_invoice_ids: string[];
     use_balance?: boolean;
     auto_fifo?: boolean;
+    close_future_invoices?: boolean;
   }) =>
     request<{ payment: any; allocations: any[] }>("/payments/apply", {
       method: "POST",

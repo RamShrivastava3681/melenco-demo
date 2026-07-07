@@ -38,6 +38,7 @@ router.post("/apply", (req: Request, res: Response) => {
     selected_invoice_ids,
     use_balance = false,
     auto_fifo = false,
+    close_future_invoices = false,
   } = req.body;
 
   if (!customer_id || !payment_date || amount === undefined || amount === null) {
@@ -88,12 +89,22 @@ router.post("/apply", (req: Request, res: Response) => {
       let invoiceRows: any[] = [];
 
       if (auto_fifo) {
-        // FIFO mode: fetch all open invoices for this customer, ordered by due_date
-        invoiceRows = db
-          .prepare(
-            `SELECT * FROM invoices WHERE user_id = ? AND customer_id = ? AND status = 'open' ORDER BY due_date`
-          )
-          .all(userId, customer_id) as any[];
+        // FIFO mode: fetch open invoices ordered by due_date
+        if (close_future_invoices) {
+          // Pass 1: only invoices due on or before payment date (future invoices handled in pass 2)
+          invoiceRows = db
+            .prepare(
+              `SELECT * FROM invoices WHERE user_id = ? AND customer_id = ? AND status = 'open' AND due_date <= ? ORDER BY due_date`
+            )
+            .all(userId, customer_id, payment_date) as any[];
+        } else {
+          // Current behavior: all open invoices regardless of due date
+          invoiceRows = db
+            .prepare(
+              `SELECT * FROM invoices WHERE user_id = ? AND customer_id = ? AND status = 'open' ORDER BY due_date`
+            )
+            .all(userId, customer_id) as any[];
+        }
       } else if (selected_invoice_ids.length > 0) {
         // Manual mode: fetch selected invoices
         const placeholders = selected_invoice_ids.map(() => "?").join(",");
@@ -157,6 +168,48 @@ router.post("/apply", (req: Request, res: Response) => {
 
         totalApplied += apply;
         remainingAmount = +(remainingAmount - apply).toFixed(2);
+      }
+
+      // 3b. If close_future_invoices is enabled, close future-dated invoices with remaining balance
+      if (auto_fifo && close_future_invoices && remainingAmount > 0) {
+        const futureInvoices = db
+          .prepare(
+            `SELECT * FROM invoices WHERE user_id = ? AND customer_id = ? AND status = 'open' AND due_date > ? ORDER BY due_date`
+          )
+          .all(userId, customer_id, payment_date) as any[];
+
+        for (const inv of futureInvoices) {
+          if (remainingAmount <= 0) break;
+          const balance = Number(inv.balance);
+          if (remainingAmount < balance) break;
+
+          // Close using invoice's due_date as the closed_date (payment made on due date)
+          const closedDate = inv.due_date;
+          const paymentDays = daysBetween(inv.issue_date, closedDate);
+          const lateDays = 0;
+
+          db.prepare(
+            "UPDATE invoices SET balance = 0, status = 'closed', closed_date = ?, payment_days = ?, late_payment_days = ? WHERE id = ?"
+          ).run(closedDate, paymentDays, lateDays, inv.id);
+
+          const allocId = uuidv4();
+          db.prepare(
+            `INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(allocId, userId, paymentId, inv.id, +balance.toFixed(2), closedDate, 1);
+
+          allocations.push({
+            id: allocId,
+            invoice_id: inv.id,
+            invoice_number: inv.invoice_number,
+            amount_applied: +balance.toFixed(2),
+            closed_invoice: true,
+            future_closed: true,
+          });
+
+          totalApplied += balance;
+          remainingAmount = +(remainingAmount - balance).toFixed(2);
+        }
       }
 
       // 4. Insert payment record
