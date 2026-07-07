@@ -8,11 +8,35 @@ const router = Router();
 // All routes require authentication
 router.use(requireAuth);
 
-// List customers
+// List customers with outstanding and remaining balances
 router.get("/", (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+
   const rows = db
-    .prepare("SELECT id, name, created_at FROM customers WHERE user_id = ? ORDER BY name")
-    .all(req.user!.userId);
+    .prepare(
+      `SELECT
+         c.id,
+         c.name,
+         c.created_at,
+         COALESCE(open_sum.total_balance, 0) AS outstanding_balance,
+         COALESCE(rem_sum.total_remaining, 0) AS remaining_balance
+       FROM customers c
+       LEFT JOIN (
+         SELECT customer_id, SUM(balance) AS total_balance
+         FROM invoices
+         WHERE user_id = ? AND status = 'open'
+         GROUP BY customer_id
+       ) open_sum ON open_sum.customer_id = c.id
+       LEFT JOIN (
+         SELECT customer_id, SUM(remaining) AS total_remaining
+         FROM payments
+         WHERE user_id = ? AND remaining > 0
+         GROUP BY customer_id
+       ) rem_sum ON rem_sum.customer_id = c.id
+       WHERE c.user_id = ?
+       ORDER BY c.name`
+    )
+    .all(userId, userId, userId);
 
   res.json({ customers: rows });
 });

@@ -72,6 +72,40 @@ router.post("/", (req: Request, res: Response) => {
   }
 });
 
+// Export closed invoices with payment and allocation details
+router.get("/export/closed", (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+
+  const rows = db
+    .prepare(`
+      SELECT
+        i.invoice_number,
+        i.issue_date,
+        i.due_date,
+        i.amount,
+        i.balance,
+        i.closed_date,
+        i.payment_days,
+        i.late_payment_days,
+        c.name AS customer_name,
+        pa.amount_applied,
+        pa.applied_date,
+        pa.closed_invoice,
+        p.payment_date AS payment_date,
+        p.amount AS payment_amount,
+        p.note AS payment_note
+      FROM invoices i
+      LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = ?
+      LEFT JOIN payment_allocations pa ON pa.invoice_id = i.id AND pa.user_id = ?
+      LEFT JOIN payments p ON p.id = pa.payment_id AND p.user_id = ?
+      WHERE i.user_id = ? AND i.status = 'closed'
+      ORDER BY i.closed_date DESC, i.invoice_number
+    `)
+    .all(userId, userId, userId, userId);
+
+  res.json({ rows });
+});
+
 // Delete invoice
 router.delete("/:id", (req: Request, res: Response) => {
   const { id } = req.params;

@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { toast } from "sonner";
-import { type Customer } from "@/lib/ledger";
+import { fmtMoney, type Customer } from "@/lib/ledger";
 import { Trash2, TrendingUp } from "lucide-react";
 
 export function CustomersPanel() {
@@ -17,7 +17,7 @@ export function CustomersPanel() {
     queryKey: ["customers"],
     queryFn: async () => {
       const res = await api.getCustomers();
-      return res.customers as Customer[];
+      return res.customers as (Customer & { outstanding_balance: number; remaining_balance: number })[];
     },
   });
 
@@ -74,6 +74,8 @@ export function CustomersPanel() {
                 <TableHead className="text-right">Median days</TableHead>
                 <TableHead className="text-right">Max days</TableHead>
                 <TableHead className="text-right">Min days</TableHead>
+                <TableHead className="text-right">Outstanding</TableHead>
+                <TableHead className="text-right">Remaining</TableHead>
                 <TableHead className="text-right">Closed</TableHead>
                 <TableHead className="w-20" />
               </TableRow>
@@ -81,7 +83,7 @@ export function CustomersPanel() {
             <TableBody>
               {customers.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-sm text-muted-foreground">No customers yet</TableCell>
+                  <TableCell colSpan={9} className="text-center text-sm text-muted-foreground">No customers yet</TableCell>
                 </TableRow>
               ) : customers.map((c) => {
                 const s = stats[c.id];
@@ -99,6 +101,12 @@ export function CustomersPanel() {
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {s ? s.min_pay_days?.toFixed(1) : "\u2014"}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums font-medium">
+                      {fmtMoney(c.outstanding_balance)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums text-muted-foreground">
+                      {c.remaining_balance > 0 ? fmtMoney(c.remaining_balance) : "\u2014"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-muted-foreground">
                       {s ? s.closed_count : "\u2014"}

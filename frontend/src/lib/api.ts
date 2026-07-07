@@ -87,6 +87,9 @@ export const api = {
       body: JSON.stringify({ invoices }),
     }),
 
+  exportClosedInvoices: () =>
+    request<{ rows: any[] }>("/invoices/export/closed"),
+
   deleteInvoice: (id: string) =>
     request<{ success: boolean }>(`/invoices/${id}`, {
       method: "DELETE",

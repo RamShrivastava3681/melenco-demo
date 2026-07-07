@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { fmtMoney, type Customer, type Invoice } from "@/lib/ledger";
-import { Trash2, Upload, Download } from "lucide-react";
+import { Trash2, Upload, Download, FileDown } from "lucide-react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -124,6 +124,52 @@ export function InvoicesPanel() {
     }
   }
 
+  const exportMut = useMutation({
+    mutationFn: async () => {
+      const res = await api.exportClosedInvoices();
+      return res.rows;
+    },
+    onSuccess: (rows) => {
+      if (rows.length === 0) {
+        toast.error("No closed invoices to export");
+        return;
+      }
+
+      // Map to flat export-friendly format
+      const data = rows.map((r: any) => ({
+        "Invoice #": r.invoice_number,
+        "Customer": r.customer_name,
+        "Issue Date": r.issue_date,
+        "Due Date": r.due_date,
+        "Amount": Number(r.amount),
+        "Balance": Number(r.balance),
+        "Closed Date": r.closed_date ?? "",
+        "Payment Days": r.payment_days ?? "",
+        "Late Payment Days": r.late_payment_days ?? "",
+        "Payment Date": r.payment_date ?? "",
+        "Payment Amount": r.payment_amount != null ? Number(r.payment_amount) : "",
+        "Amount Applied": r.amount_applied != null ? Number(r.amount_applied) : "",
+        "Applied Date": r.applied_date ?? "",
+        "Closed by Allocation": r.closed_invoice ? "Yes" : "No",
+        "Payment Note": r.payment_note ?? "",
+      }));
+
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, "Closed Invoices");
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([wbout], { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `closed-invoices-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(`Exported ${rows.length} row${rows.length > 1 ? "s" : ""}`);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
   function downloadTemplate() {
     const csv = "invoice_number,issue_date,due_date,amount\nINV-001,2025-01-15,2025-02-14,1500.00\nINV-002,2025-01-20,2025-02-19,2750.50\n";
     const blob = new Blob([csv], { type: "text/csv" });
@@ -163,6 +209,9 @@ export function InvoicesPanel() {
             </Select>
           </div>
           <div className="ml-auto flex gap-2">
+            <Button variant="outline" onClick={() => exportMut.mutate()} disabled={exportMut.isPending}>
+              <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : "Export Closed"}
+            </Button>
             <Button variant="outline" onClick={downloadTemplate}><Download className="mr-2 h-4 w-4" />Template</Button>
             <Button onClick={() => fileRef.current?.click()} disabled={importMut.isPending || !customerId}>
               <Upload className="mr-2 h-4 w-4" />Import CSV/XLSX
