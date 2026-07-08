@@ -2,12 +2,14 @@ import { Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { Receipt, LogOut } from "lucide-react";
+import { Receipt, LogOut, Sun, Moon } from "lucide-react";
+import { useTheme } from "@/lib/useTheme";
 
 export function DashboardLayout() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const { user, signout } = useAuth();
+  const { theme, toggleTheme } = useTheme();
 
   function handleSignOut() {
     qc.cancelQueries();
@@ -24,8 +26,20 @@ export function DashboardLayout() {
             <Receipt className="h-5 w-5 text-primary" />
             <span>Ledgerly</span>
           </div>
-          <div className="flex items-center gap-3 text-sm">
+          <div className="flex items-center gap-1 text-sm">
             <span className="hidden text-muted-foreground sm:inline">{user?.email}</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleTheme}
+              title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {theme === "dark" ? (
+                <Sun className="h-4 w-4" />
+              ) : (
+                <Moon className="h-4 w-4" />
+              )}
+            </Button>
             <Button variant="ghost" size="sm" onClick={handleSignOut}>
               <LogOut className="mr-1 h-4 w-4" /> Sign out
             </Button>
