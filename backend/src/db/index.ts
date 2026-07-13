@@ -203,6 +203,24 @@ export async function initializeDatabase(): Promise<void> {
     )
   `);
 
+  // Xero connections table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS xero_connections (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      xero_user_id TEXT,
+      tenant_id TEXT,
+      tenant_name TEXT,
+      access_token TEXT,
+      refresh_token TEXT,
+      token_expires_at TEXT,
+      session_state TEXT,
+      connected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (user_id)
+    )
+  `);
+
   // Create indexes
   try { db.run("CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id, status)"); } catch {}
   try { db.run("CREATE INDEX IF NOT EXISTS idx_alloc_payment ON payment_allocations(payment_id)"); } catch {}

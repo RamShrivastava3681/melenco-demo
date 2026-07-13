@@ -7,6 +7,7 @@ import customerRoutes from "./routes/customers.js";
 import invoiceRoutes from "./routes/invoices.js";
 import paymentRoutes from "./routes/payments.js";
 import allocationRoutes from "./routes/allocations.js";
+import xeroRoutes from "./routes/xero.js";
 
 async function main() {
   // Initialize database tables
@@ -37,6 +38,7 @@ async function main() {
   app.use("/api/invoices", invoiceRoutes);
   app.use("/api/payments", paymentRoutes);
   app.use("/api/allocations", allocationRoutes);
+app.use("/api/xero", xeroRoutes);
 
   // Start server
   const server = app.listen(PORT, () => {
