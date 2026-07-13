@@ -35,9 +35,9 @@ router.get("/auth-url", requireAuth, (req: Request, res: Response) => {
         .run(id, req.user!.userId, state);
     }
 
-    xero.buildConsentUrl().then((consentUrl) => {
+    xero.buildConsentUrl().then((consentUrl: string) => {
       res.json({ url: consentUrl });
-    }).catch((err) => {
+    }).catch((err: any) => {
       console.error("Xero buildConsentUrl error:", err);
       res.status(500).json({ error: "Failed to generate Xero consent URL" });
     });
