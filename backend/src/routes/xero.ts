@@ -6,7 +6,7 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-function getXeroClient(): XeroClient {
+function getXeroClient(state?: string): XeroClient {
   return new XeroClient({
     clientId: process.env.XERO_CLIENT_ID || "",
     clientSecret: process.env.XERO_CLIENT_SECRET || "",
@@ -15,16 +15,17 @@ function getXeroClient(): XeroClient {
     ],
     scopes: ["openid", "profile", "email", "accounting.contacts", "accounting.invoices", "accounting.payments", "offline_access"],
     httpTimeout: 30000,
+    state, // <-- CRITICAL: Pass state so buildConsentUrl() includes it in the URL
   });
 }
 
 // --- Generate Xero consent URL ---
 router.get("/auth-url", requireAuth, (req: Request, res: Response) => {
   try {
-    const xero = getXeroClient();
     const state = uuidv4();
+    console.log("[Xero auth-url] Generated state:", state);
 
-    // Store state in the session/DB for CSRF verification
+    // Store state in the DB FIRST, before building the consent URL
     const existing = db.prepare("SELECT id FROM xero_connections WHERE user_id = ?").get(req.user!.userId);
     if (existing) {
       db.prepare("UPDATE xero_connections SET session_state = ?, updated_at = datetime('now') WHERE user_id = ?")
@@ -35,14 +36,19 @@ router.get("/auth-url", requireAuth, (req: Request, res: Response) => {
         .run(id, req.user!.userId, state);
     }
 
+    // IMPORTANT: Pass the state to getXeroClient() so buildConsentUrl() includes it
+    const xero = getXeroClient(state);
+    console.log("[Xero auth-url] Redirect URI:", process.env.XERO_REDIRECT_URI || "http://localhost:3001/api/xero/callback");
+
     xero.buildConsentUrl().then((consentUrl: string) => {
+      console.log("[Xero auth-url] Generated consent URL:", consentUrl);
       res.json({ url: consentUrl });
     }).catch((err: any) => {
-      console.error("Xero buildConsentUrl error:", err);
+      console.error("[Xero auth-url] buildConsentUrl error:", err);
       res.status(500).json({ error: "Failed to generate Xero consent URL" });
     });
   } catch (error) {
-    console.error("Xero auth URL error:", error);
+    console.error("[Xero auth-url] Error:", error);
     res.status(500).json({ error: "Failed to generate Xero auth URL" });
   }
 });
@@ -51,19 +57,26 @@ router.get("/auth-url", requireAuth, (req: Request, res: Response) => {
 router.get("/callback", async (req: Request, res: Response) => {
   try {
     const { code, state, error } = req.query;
+    const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+
+    console.log("[Xero callback] Received callback request");
+    console.log("[Xero callback] Full URL:", `${req.protocol}://${req.get("host")}${req.originalUrl}`);
+    console.log("[Xero callback] Query params - code:", code ? "PRESENT" : "MISSING", "state:", state ? "PRESENT" : "MISSING", "error:", error || "none");
 
     if (error) {
-      console.error("Xero OAuth error:", error);
-      const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      console.error("[Xero callback] Xero returned error:", error);
       res.redirect(`${feUrl}/app?xero_error=${encodeURIComponent(error as string)}`);
       return;
     }
 
     if (!code || !state) {
-      const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      console.error("[Xero callback] Missing code or state - code:", !!code, "state:", !!state);
       res.redirect(`${feUrl}/app?xero_error=missing_code_or_state`);
       return;
     }
+
+    console.log("[Xero callback] Received code:", (code as string).substring(0, 20) + "...");
+    console.log("[Xero callback] Received state:", state);
 
     // Find the connection by state
     const connection = db.prepare(
@@ -71,15 +84,26 @@ router.get("/callback", async (req: Request, res: Response) => {
     ).get(state) as { id: string; user_id: string } | undefined;
 
     if (!connection) {
-      const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      console.error("[Xero callback] No connection found for state:", state);
+      // Debug: show all stored states
+      const allStates = db.prepare("SELECT id, session_state, user_id FROM xero_connections WHERE session_state IS NOT NULL").all();
+      console.error("[Xero callback] Stored states in DB:", JSON.stringify(allStates));
       res.redirect(`${feUrl}/app?xero_error=invalid_state`);
       return;
     }
 
-    const xero = getXeroClient();
+    console.log("[Xero callback] Found connection. ID:", connection.id, "User:", connection.user_id);
+
+    // IMPORTANT: Pass the state to XeroClient so apiCallback() can validate it internally
+    const xero = getXeroClient(state as string);
     // xero-node's apiCallback does `new URL(callbackUrl)` internally, so we need the FULL absolute URL
     const fullCallbackUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    console.log("[Xero callback] Full callback URL for apiCallback:", fullCallbackUrl);
+
     const tokenSet = await xero.apiCallback(fullCallbackUrl);
+    console.log("[Xero callback] Token exchange successful! expires_in:", tokenSet.expires_in);
+    console.log("[Xero callback] Has access_token:", !!tokenSet.access_token);
+    console.log("[Xero callback] Has refresh_token:", !!tokenSet.refresh_token);
 
     // Update the connection with tokens
     const expiresAt = new Date(
@@ -104,10 +128,13 @@ router.get("/callback", async (req: Request, res: Response) => {
     // Get tenants
     await xero.updateTenants(false);
     const tenants = xero.tenants;
+    console.log("[Xero callback] Tenants found:", tenants?.length || 0);
 
     if (tenants && tenants.length > 0) {
       const tenant = tenants[0];
       const decoded = tokenSet.decodedPayload as Record<string, any> | undefined;
+      console.log("[Xero callback] Tenant ID:", tenant.tenantId, "Name:", tenant.tenantName);
+
       db.prepare(`
         UPDATE xero_connections SET
           tenant_id = ?,
@@ -123,10 +150,10 @@ router.get("/callback", async (req: Request, res: Response) => {
       );
     }
 
-    const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    console.log("[Xero callback] Success! Redirecting to frontend with xero_connected=true");
     res.redirect(`${feUrl}/app?xero_connected=true`);
   } catch (error) {
-    console.error("Xero callback error:", error);
+    console.error("[Xero callback] Error:", error);
     const feUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     res.redirect(`${feUrl}/app?xero_error=callback_failed`);
   }
