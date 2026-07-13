@@ -13,7 +13,7 @@ function getXeroClient(): XeroClient {
     redirectUris: [
       process.env.XERO_REDIRECT_URI || "http://localhost:3001/api/xero/callback",
     ],
-    scopes: ["openid", "profile", "email", "accounting.transactions", "accounting.contacts", "offline_access"],
+    scopes: ["openid", "profile", "email", "accounting.contacts", "accounting.invoices", "accounting.payments", "offline_access"],
     httpTimeout: 30000,
   });
 }
