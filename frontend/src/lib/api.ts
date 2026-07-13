@@ -135,4 +135,17 @@ export const api = {
   // Allocations
   getAllocations: () =>
     request<{ allocations: any[] }>("/allocations"),
+
+  // Xero
+  getXeroAuthUrl: () =>
+    request<{ url: string }>("/xero/auth-url"),
+
+  getXeroStatus: () =>
+    request<{ connected: boolean; tenantId?: string; tenantName?: string; tokenExpired?: boolean }>("/xero/status"),
+
+  disconnectXero: () =>
+    request<{ success: boolean }>("/xero/disconnect", { method: "POST" }),
+
+  syncXero: () =>
+    request<{ success: boolean; contacts: { created: number; updated: number }; invoices: { created: number; updated: number }; payments: { created: number } }>("/xero/sync", { method: "POST" }),
 };
