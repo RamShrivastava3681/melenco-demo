@@ -82,7 +82,14 @@ export const api = {
   },
 
   createInvoices: (invoices: any[]) =>
-    request<{ invoices: any[]; count: number }>("/invoices", {
+    request<{
+      imported: any[];
+      skipped: Array<{ invoice_number: string; customer_id: string; reason: string }>;
+      errors: Array<{ invoice_number: string; error: string }>;
+      importedCount: number;
+      skippedCount: number;
+      errorCount: number;
+    }>("/invoices", {
       method: "POST",
       body: JSON.stringify({ invoices }),
     }),

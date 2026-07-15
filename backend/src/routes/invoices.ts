@@ -32,6 +32,9 @@ router.get("/", (req: Request, res: Response) => {
 });
 
 // Create invoice(s) — bulk import
+// Returns two lists:
+//   imported — invoices that were successfully created
+//   skipped  — invoices that already exist for this customer (same invoice_number)
 router.post("/", (req: Request, res: Response) => {
   const { invoices: invoiceList } = req.body;
 
@@ -40,33 +43,59 @@ router.post("/", (req: Request, res: Response) => {
     return;
   }
 
-  const created: any[] = [];
+  const userId = req.user!.userId;
+  const imported: any[] = [];
+  const skipped: Array<{ invoice_number: string; customer_id: string; reason: string }> = [];
+  const errors: Array<{ invoice_number: string; error: string }> = [];
 
   try {
     const tx = db.transaction(() => {
       for (const inv of invoiceList) {
         if (!inv.customer_id || !inv.invoice_number || !inv.issue_date || !inv.due_date || !inv.amount) {
-          throw new Error(`Missing required fields for invoice: ${inv.invoice_number || "unknown"}`);
+          errors.push({
+            invoice_number: inv.invoice_number || "unknown",
+            error: "Missing required fields",
+          });
+          continue;
         }
+
+        // Check if invoice already exists for this customer
+        const existing = db
+          .prepare(
+            "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
+          )
+          .get(userId, inv.customer_id, inv.invoice_number) as { id: string } | undefined;
+
+        if (existing) {
+          skipped.push({
+            invoice_number: inv.invoice_number,
+            customer_id: inv.customer_id,
+            reason: "Already exists in the platform",
+          });
+          continue;
+        }
+
         const id = uuidv4();
         db.prepare(
           `INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`
-        ).run(id, req.user!.userId, inv.customer_id, inv.invoice_number, inv.issue_date, inv.due_date, inv.amount, inv.amount);
+        ).run(id, userId, inv.customer_id, inv.invoice_number, inv.issue_date, inv.due_date, inv.amount, inv.amount);
 
         const row = db.prepare("SELECT * FROM invoices WHERE id = ?").get(id);
-        created.push(row);
+        imported.push(row);
       }
     });
 
     tx();
-    res.status(201).json({ invoices: created, count: created.length });
+    res.status(201).json({
+      imported,
+      skipped,
+      errors,
+      importedCount: imported.length,
+      skippedCount: skipped.length,
+      errorCount: errors.length,
+    });
   } catch (error: any) {
-    const msg = error?.message || String(error);
-    if (msg.includes("UNIQUE") || msg.includes("unique")) {
-      res.status(409).json({ error: "Duplicate invoice number for this customer" });
-      return;
-    }
     console.error("Create invoices error:", error);
     res.status(500).json({ error: error.message || "Internal server error" });
   }

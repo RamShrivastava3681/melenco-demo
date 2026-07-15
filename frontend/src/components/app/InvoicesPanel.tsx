@@ -8,9 +8,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { fmtMoney, type Customer, type Invoice } from "@/lib/ledger";
-import { Trash2, Upload, Download, FileDown } from "lucide-react";
+import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+
+// Types for the import result
+interface ImportResult {
+  importedCount: number;
+  skippedCount: number;
+  skipped: Array<{ invoice_number: string; customer_id: string; reason: string }>;
+  errors: Array<{ invoice_number: string; error: string }>;
+}
 
 type Row = { invoice_number: string; issue_date: string; due_date: string; amount: number };
 
@@ -69,6 +77,8 @@ export function InvoicesPanel() {
     },
   });
 
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+
   const importMut = useMutation({
     mutationFn: async (rows: Row[]) => {
       if (!customerId) throw new Error("Pick a customer first");
@@ -80,14 +90,35 @@ export function InvoicesPanel() {
         amount: r.amount,
       }));
       const res = await api.createInvoices(payload);
-      return res.count;
+      return res;
     },
-    onSuccess: (n) => {
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["invoices"] });
-      toast.success(`Imported ${n} invoices`);
+      setImportResult({
+        importedCount: res.importedCount,
+        skippedCount: res.skippedCount,
+        skipped: res.skipped,
+        errors: res.errors,
+      });
+
+      // Build a summary toast
+      const parts: string[] = [];
+      if (res.importedCount > 0) parts.push(`${res.importedCount} imported`);
+      if (res.skippedCount > 0) parts.push(`${res.skippedCount} skipped (already exist)`);
+      if (res.errorCount > 0) parts.push(`${res.errorCount} errored`);
+
+      if (parts.length > 0) {
+        toast.success(`Import complete: ${parts.join(", ")}`);
+      } else {
+        toast.success("No invoices were imported");
+      }
     },
     onError: (e: Error) => toast.error(e.message),
   });
+
+  function clearImportResult() {
+    setImportResult(null);
+  }
 
   const del = useMutation({
     mutationFn: async (id: string) => {
@@ -101,6 +132,7 @@ export function InvoicesPanel() {
   });
 
   async function handleFile(file: File) {
+    clearImportResult();
     if (!customerId) { toast.error("Select a customer first"); return; }
     try {
       let rows: Row[];
@@ -202,7 +234,7 @@ export function InvoicesPanel() {
         <div className="flex flex-wrap items-end gap-3">
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Customer (for import & filter)</label>
-            <Select value={customerId} onValueChange={setCustomerId}>
+            <Select value={customerId} onValueChange={(v) => { setCustomerId(v); clearImportResult(); }}>
               <SelectTrigger className="w-64"><SelectValue placeholder="Select customer" /></SelectTrigger>
               <SelectContent>
                 {customers.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
@@ -232,6 +264,90 @@ export function InvoicesPanel() {
               onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
           </div>
         </div>
+
+        {/* Import Result Panel */}
+        {importResult && (
+          <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
+            <div className="flex items-center justify-between border-b px-4 py-3">
+              <h4 className="text-sm font-semibold">Import Results</h4>
+              <Button variant="ghost" size="sm" onClick={clearImportResult} className="h-6 text-xs">
+                Dismiss
+              </Button>
+            </div>
+            <div className="divide-y">
+              {/* Imported count */}
+              <div className="flex items-center gap-3 px-4 py-3">
+                <CheckCircle2 className="h-5 w-5 shrink-0 text-success" />
+                <div className="flex-1">
+                  <p className="text-sm font-medium">{importResult.importedCount} invoice{importResult.importedCount !== 1 ? "s" : ""} imported successfully</p>
+                  <p className="text-xs text-muted-foreground">These invoices were added to the platform.</p>
+                </div>
+              </div>
+
+              {/* Skipped */}
+              {importResult.skippedCount > 0 && (
+                <div className="px-4 py-3">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                    <div className="flex-1">
+                      <p className="text-sm font-medium">{importResult.skippedCount} invoice{importResult.skippedCount !== 1 ? "s" : ""} skipped (already in platform)</p>
+                      <p className="text-xs text-muted-foreground mb-2">These invoice numbers already exist for the selected customer and were not imported.</p>
+                      <div className="max-h-40 overflow-y-auto rounded border">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="bg-muted/50">
+                              <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Invoice #</th>
+                              <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Reason</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {importResult.skipped.map((s, i) => (
+                              <tr key={i} className="border-t">
+                                <td className="px-3 py-1.5 font-mono">{s.invoice_number}</td>
+                                <td className="px-3 py-1.5 text-muted-foreground">{s.reason}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Errors */}
+              {importResult.errors.length > 0 && (
+                <div className="px-4 py-3">
+                  <div className="flex items-start gap-3">
+                    <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+                    <div className="flex-1">
+                      <p className="text-sm font-medium">{importResult.errors.length} invoice{importResult.errors.length !== 1 ? "s" : ""} had errors</p>
+                      <p className="text-xs text-muted-foreground mb-2">These rows had missing or invalid data and were skipped.</p>
+                      <div className="max-h-32 overflow-y-auto rounded border">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="bg-muted/50">
+                              <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Invoice #</th>
+                              <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Error</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {importResult.errors.map((e, i) => (
+                              <tr key={i} className="border-t">
+                                <td className="px-3 py-1.5 font-mono">{e.invoice_number}</td>
+                                <td className="px-3 py-1.5 text-muted-foreground">{e.error}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         <div className="overflow-x-auto">
           <Table>
