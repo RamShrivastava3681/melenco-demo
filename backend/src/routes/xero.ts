@@ -373,8 +373,8 @@ router.post("/preview", requireAuth, async (req: Request, res: Response) => {
         const issueDate = formatDate(inv.date);
         const netDays = paymentTerms?.[contactId] || 0;
         const dueDate = netDays > 0 ? computeDueDate(issueDate, netDays) : formatDate(inv.dueDate);
-        const amount = inv.total ? Math.abs(Number(inv.total)) : 0;
-        const amountDue = inv.amountDue ? Math.abs(Number(inv.amountDue)) : amount;
+        const amount = inv.total ? Number(inv.total) : 0;
+        const amountDue = inv.amountDue ? Number(inv.amountDue) : amount;
         const xeroStatus = String(inv.status || "");
         const ourStatus = (xeroStatus === "AUTHORISED" || xeroStatus === "SUBMITTED") ? "open"
           : xeroStatus === "PAID" ? "closed"
@@ -588,8 +588,8 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       const issueDate = formatDate(xeroInv.date);
       const netDays = paymentTerms?.[xeroInv.contact.contactID] || 0;
       const dueDate = netDays > 0 ? computeDueDate(issueDate, netDays) : formatDate(xeroInv.dueDate);
-      const amount = xeroInv.total ? Math.abs(Number(xeroInv.total)) : 0;
-      const amountDue = xeroInv.amountDue ? Math.abs(Number(xeroInv.amountDue)) : amount;
+      const amount = xeroInv.total ? Number(xeroInv.total) : 0;
+      const amountDue = xeroInv.amountDue ? Number(xeroInv.amountDue) : amount;
       const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
 
       // Check if invoice exists
@@ -627,7 +627,7 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
     const importedInvoiceNumbers = new Set(relevantInvoices.map((inv: any) => inv.invoiceNumber));
 
     for (const xeroPay of xeroPayments) {
-      if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.contactID || !xeroPay.amount) continue;
+      if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.contactID) continue;
 
       // Only process payments for selected contacts' invoices that were imported
       if (!selectedContactIdsSet.has(xeroPay.contact.contactID)) continue;
@@ -644,7 +644,7 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       if (!invoice) continue;
 
       const paymentDate = formatDate(xeroPay.date);
-      const amount = Math.abs(Number(xeroPay.amount));
+      const amount = Number(xeroPay.amount);
 
       // Check if this payment already exists
       const existingPay = db.prepare(`
@@ -654,9 +654,11 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       `).get(req.user!.userId, customerId, invoice.id, paymentDate, amount) as { id: string } | undefined;
 
       if (!existingPay) {
+        const payAmount = Math.min(amount, invoice.balance);
+        if (payAmount === 0) continue;
+
         const paymentId = uuidv4();
         const allocationId = uuidv4();
-        const payAmount = Math.min(amount, invoice.balance);
 
         db.prepare(`
           INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)
@@ -756,8 +758,8 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         const invoiceNumber = xeroInv.invoiceNumber;
         const issueDate = formatDate(xeroInv.date);
         const dueDate = formatDate(xeroInv.dueDate);
-        const amount = xeroInv.total ? Math.abs(Number(xeroInv.total)) : 0;
-        const amountDue = xeroInv.amountDue ? Math.abs(Number(xeroInv.amountDue)) : amount;
+        const amount = xeroInv.total ? Number(xeroInv.total) : 0;
+        const amountDue = xeroInv.amountDue ? Number(xeroInv.amountDue) : amount;
         const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
 
         // Check if invoice exists
@@ -792,7 +794,7 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
       let paymentsCreated = 0;
 
       for (const xeroPay of xeroPayments) {
-        if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.name || !xeroPay.amount) continue;
+        if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.name) continue;
 
         // Find customer
         const customer = db.prepare(
@@ -809,7 +811,7 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         if (!invoice) continue;
 
         const paymentDate = formatDate(xeroPay.date);
-        const amount = Math.abs(Number(xeroPay.amount));
+        const amount = Number(xeroPay.amount);
 
         // Check if this payment already exists
         const existingPay = db.prepare(`
@@ -819,9 +821,11 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         `).get(req.user!.userId, customer.id, invoice.id, paymentDate, amount) as { id: string } | undefined;
 
         if (!existingPay) {
+          const payAmount = Math.min(amount, invoice.balance);
+          if (payAmount === 0) continue;
+
           const paymentId = uuidv4();
           const allocationId = uuidv4();
-          const payAmount = Math.min(amount, invoice.balance);
 
           db.prepare(`
             INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)

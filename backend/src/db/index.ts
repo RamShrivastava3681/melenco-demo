@@ -84,42 +84,111 @@ function getDbPath(): string {
   return path.join(dataDir, "ledgerly.db");
 }
 
-/** Migrate payments table: change CHECK (amount > 0) to CHECK (amount >= 0) */
-function migratePaymentsTable(): void {
-  try {
-    const rows = db.exec(
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'"
-    );
-    if (rows.length === 0 || rows[0].values.length === 0) return;
-    const createSql = rows[0].values[0][0] as string;
-    if (!createSql.includes("CHECK (amount > 0)")) return;
-
-    // Temporarily disable FK checks so renaming payments doesn't break
-    // payment_allocations FK references
-    db.run("PRAGMA foreign_keys = OFF");
-    try {
-      db.run("ALTER TABLE payments RENAME TO payments_old");
-      db.run(`
+/** Migrate CHECK constraints on invoices, payments, and payment_allocations
+ *  to allow negative values (for credit notes, refunds, etc.). */
+function migrateConstraintsForNegatives(): void {
+  const migrations: { table: string; oldPattern: string; newCreateSql: string; label: string }[] = [
+    {
+      table: "invoices",
+      oldPattern: "CHECK (amount > 0)",
+      newCreateSql: `
+        CREATE TABLE invoices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+          invoice_number TEXT NOT NULL,
+          issue_date TEXT NOT NULL,
+          due_date TEXT NOT NULL,
+          amount REAL NOT NULL CHECK (amount != 0),
+          balance REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+          closed_date TEXT,
+          payment_days INTEGER,
+          late_payment_days INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (user_id, customer_id, invoice_number)
+        )
+      `,
+      label: "invoices: amount CHECK (amount != 0)",
+    },
+    {
+      table: "payments",
+      oldPattern: "CHECK (amount > 0)",
+      newCreateSql: `
         CREATE TABLE payments (
           id TEXT PRIMARY KEY,
           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
           payment_date TEXT NOT NULL,
-          amount REAL NOT NULL CHECK (amount >= 0),
+          amount REAL NOT NULL CHECK (amount != 0),
           applied_amount REAL NOT NULL DEFAULT 0,
           remaining REAL NOT NULL,
           note TEXT,
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
-      `);
-      db.run("INSERT INTO payments SELECT * FROM payments_old");
-      db.run("DROP TABLE payments_old");
-      console.log("✅ Migrated payments table: amount CHECK (amount >= 0)");
-    } finally {
-      db.run("PRAGMA foreign_keys = ON");
+      `,
+      label: "payments: amount CHECK (amount != 0)",
+    },
+    {
+      table: "payments",
+      oldPattern: "CHECK (amount >= 0)",
+      newCreateSql: `
+        CREATE TABLE payments (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+          payment_date TEXT NOT NULL,
+          amount REAL NOT NULL CHECK (amount != 0),
+          applied_amount REAL NOT NULL DEFAULT 0,
+          remaining REAL NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `,
+      label: "payments: amount CHECK (amount != 0) [from >=0]",
+    },
+    {
+      table: "payment_allocations",
+      oldPattern: "CHECK (amount_applied > 0)",
+      newCreateSql: `
+        CREATE TABLE payment_allocations (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+          invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+          amount_applied REAL NOT NULL CHECK (amount_applied != 0),
+          applied_date TEXT NOT NULL,
+          closed_invoice INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `,
+      label: "payment_allocations: amount_applied CHECK (amount_applied != 0)",
+    },
+  ];
+
+  for (const m of migrations) {
+    try {
+      const rows = db.exec(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='${m.table}'`
+      );
+      if (rows.length === 0 || rows[0].values.length === 0) continue;
+      const createSql = rows[0].values[0][0] as string;
+      if (!createSql.includes(m.oldPattern)) continue;
+
+      const tempName = `${m.table}_old`;
+      db.run("PRAGMA foreign_keys = OFF");
+      try {
+        db.run(`ALTER TABLE ${m.table} RENAME TO ${tempName}`);
+        db.run(m.newCreateSql);
+        db.run(`INSERT INTO ${m.table} SELECT * FROM ${tempName}`);
+        db.run(`DROP TABLE ${tempName}`);
+        console.log(`✅ Migrated ${m.label}`);
+      } finally {
+        db.run("PRAGMA foreign_keys = ON");
+      }
+    } catch (e) {
+      console.error(`Migration error for ${m.table}:`, e);
     }
-  } catch (e) {
-    console.error("Migration error:", e);
   }
 }
 
@@ -165,7 +234,7 @@ export async function initializeDatabase(): Promise<void> {
       invoice_number TEXT NOT NULL,
       issue_date TEXT NOT NULL,
       due_date TEXT NOT NULL,
-      amount REAL NOT NULL CHECK (amount > 0),
+      amount REAL NOT NULL CHECK (amount != 0),
       balance REAL NOT NULL,
       status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
       closed_date TEXT,
@@ -182,7 +251,7 @@ export async function initializeDatabase(): Promise<void> {
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
       payment_date TEXT NOT NULL,
-      amount REAL NOT NULL CHECK (amount >= 0),
+      amount REAL NOT NULL CHECK (amount != 0),
       applied_amount REAL NOT NULL DEFAULT 0,
       remaining REAL NOT NULL,
       note TEXT,
@@ -196,7 +265,7 @@ export async function initializeDatabase(): Promise<void> {
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
       invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-      amount_applied REAL NOT NULL CHECK (amount_applied > 0),
+      amount_applied REAL NOT NULL CHECK (amount_applied != 0),
       applied_date TEXT NOT NULL,
       closed_invoice INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -227,7 +296,7 @@ export async function initializeDatabase(): Promise<void> {
   try { db.run("CREATE INDEX IF NOT EXISTS idx_alloc_invoice ON payment_allocations(invoice_id)"); } catch {}
 
   // Run migrations
-  migratePaymentsTable();
+  migrateConstraintsForNegatives();
 
   // Seed admin user if configured
   await seedAdminUser();

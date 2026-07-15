@@ -53,7 +53,7 @@ router.post("/apply", (req: Request, res: Response) => {
 
   const userId = req.user!.userId;
   const paymentAmount = Number(amount);
-  if (!isFinite(paymentAmount) || paymentAmount < 0) {
+  if (!isFinite(paymentAmount) || paymentAmount <= 0) {
     res.status(400).json({ error: "Invalid payment amount" });
     return;
   }
