@@ -156,7 +156,13 @@ export const api = {
       body: JSON.stringify({ contactType }),
     }),
 
-  importXeroContacts: (data: { contactIds: string[]; dateFrom?: string }) =>
+  previewXeroImport: (data: { contactIds: string[]; dateFrom?: string; dateTo?: string; paymentTerms: Record<string, number> }) =>
+    request<{ success: boolean; invoices: Array<{ contactId: string; contactName: string; invoiceNumber: string; issueDate: string; dueDate: string; amount: number; balance: number; status: string; closedDate: string | null }>; summary: { totalInvoices: number; totalContacts: number; totalAmount: number } }>("/xero/preview", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  importXeroContacts: (data: { contactIds: string[]; dateFrom?: string; dateTo?: string; paymentTerms: Record<string, number> }) =>
     request<{ success: boolean; contacts: { created: number; updated: number }; invoices: { created: number; updated: number }; payments: { created: number } }>("/xero/import", {
       method: "POST",
       body: JSON.stringify(data),

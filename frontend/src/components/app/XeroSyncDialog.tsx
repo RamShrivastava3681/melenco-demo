@@ -34,7 +34,7 @@ interface XeroSyncDialogProps {
   onClose: () => void;
 }
 
-type Step = "choose-type" | "select-contacts" | "date-filter" | "importing" | "done";
+type Step = "choose-type" | "select-contacts" | "date-filter" | "payment-terms" | "preview" | "importing" | "done";
 
 export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
   const qc = useQueryClient();
@@ -46,6 +46,22 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
   const [page, setPage] = useState(1);
   const PAGE_SIZE = 25;
   const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [paymentTerms, setPaymentTerms] = useState<Record<string, number>>({});
+  const [previewData, setPreviewData] = useState<{
+    invoices: Array<{
+      contactId: string;
+      contactName: string;
+      invoiceNumber: string;
+      issueDate: string;
+      dueDate: string;
+      amount: number;
+      balance: number;
+      status: string;
+      closedDate: string | null;
+    }>;
+    summary: { totalInvoices: number; totalContacts: number; totalAmount: number };
+  } | null>(null);
   const [results, setResults] = useState<{
     contacts: { created: number; updated: number };
     invoices: { created: number; updated: number };
@@ -63,6 +79,9 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
       setSearchQuery("");
       setPage(1);
       setDateFrom("");
+      setDateTo("");
+      setPaymentTerms({});
+      setPreviewData(null);
       setResults(null);
       setFetchError(null);
     }
@@ -85,12 +104,32 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
     },
   });
 
+  // Preview mutation
+  const previewMut = useMutation({
+    mutationFn: () =>
+      api.previewXeroImport({
+        contactIds: Array.from(selectedIds),
+        dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+        paymentTerms,
+      }),
+    onSuccess: (data) => {
+      setPreviewData(data);
+      setStep("preview");
+    },
+    onError: (err: any) => {
+      toast.error(err.message || "Failed to preview invoices");
+    },
+  });
+
   // Import mutation
   const importMut = useMutation({
     mutationFn: () =>
       api.importXeroContacts({
         contactIds: Array.from(selectedIds),
         dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+        paymentTerms,
       }),
     onSuccess: (data) => {
       setResults(data);
@@ -129,11 +168,23 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
     }
   };
 
-  const handleImport = () => {
+  const handlePreview = () => {
     if (selectedIds.size === 0) {
       toast.error("Select at least one contact to import");
       return;
     }
+    // Initialize payment terms for selected contacts that don't have them
+    const updated = { ...paymentTerms };
+    for (const id of selectedIds) {
+      if (!updated[id]) {
+        updated[id] = 30; // Default to Net 30
+      }
+    }
+    setPaymentTerms(updated);
+    setStep("payment-terms");
+  };
+
+  const handleImport = () => {
     setStep("importing");
     importMut.mutate();
   };
@@ -203,9 +254,11 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
             { key: "choose-type", label: "Type" },
             { key: "select-contacts", label: "Contacts" },
             { key: "date-filter", label: "Date" },
+            { key: "payment-terms", label: "Terms" },
+            { key: "preview", label: "Review" },
             { key: "importing", label: step === "importing" || step === "done" ? "Import" : "Import" },
           ].map((s, i) => {
-            const stepOrder = ["choose-type", "select-contacts", "date-filter", "importing"];
+            const stepOrder = ["choose-type", "select-contacts", "date-filter", "payment-terms", "preview", "importing"];
             const currentIdx = stepOrder.indexOf(step);
             const thisIdx = stepOrder.indexOf(s.key);
             const isActive = currentIdx >= thisIdx;
@@ -231,7 +284,7 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
                 >
                   {s.label}
                 </span>
-                {i < 3 && <div className="flex-1 h-px bg-border mx-1" />}
+                {i < stepOrder.length - 1 && <div className="flex-1 h-px bg-border mx-1" />}
               </div>
             );
           })}
@@ -469,51 +522,251 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
                 </p>
               </div>
 
-              <div className="rounded-xl border bg-muted/20 p-5 space-y-4">
-                <div className="flex items-center gap-3">
-                  <div className="rounded-lg bg-primary/10 p-2.5">
-                    <Calendar className="h-5 w-5 text-primary" />
+              <div className="rounded-xl border bg-muted/20 p-5 space-y-5">
+                {/* From Date */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-lg bg-primary/10 p-2.5">
+                      <Calendar className="h-5 w-5 text-primary" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="text-sm font-medium">From Date</label>
+                      <p className="text-xs text-muted-foreground">
+                        Only import invoices issued on or after this date
+                      </p>
+                    </div>
                   </div>
-                  <div className="flex-1">
-                    <label className="text-sm font-medium">From Date</label>
-                    <p className="text-xs text-muted-foreground">
-                      Only import invoices issued on or after this date
-                    </p>
+
+                  <div className="relative">
+                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+                    <Input
+                      type="date"
+                      value={dateFrom}
+                      onChange={(e) => setDateFrom(e.target.value)}
+                      className="pl-9"
+                      max={dateTo || new Date().toISOString().split("T")[0]}
+                    />
                   </div>
+
+                  {dateFrom && (
+                    <button
+                      onClick={() => setDateFrom("")}
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      Clear date filter
+                    </button>
+                  )}
                 </div>
 
-                <div className="relative">
-                  <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
-                  <Input
-                    type="date"
-                    value={dateFrom}
-                    onChange={(e) => setDateFrom(e.target.value)}
-                    className="pl-9"
-                    max={new Date().toISOString().split("T")[0]}
-                  />
+                {/* Divider */}
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 h-px bg-border" />
+                  <span className="text-xs text-muted-foreground font-medium">AND</span>
+                  <div className="flex-1 h-px bg-border" />
                 </div>
 
-                {dateFrom && (
-                  <button
-                    onClick={() => setDateFrom("")}
-                    className="text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    Clear date filter
-                  </button>
-                )}
+                {/* To Date */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-lg bg-primary/10 p-2.5">
+                      <Calendar className="h-5 w-5 text-primary" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="text-sm font-medium">To Date</label>
+                      <p className="text-xs text-muted-foreground">
+                        Only import invoices issued on or before this date
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="relative">
+                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+                    <Input
+                      type="date"
+                      value={dateTo}
+                      onChange={(e) => setDateTo(e.target.value)}
+                      className="pl-9"
+                      min={dateFrom || undefined}
+                      max={new Date().toISOString().split("T")[0]}
+                    />
+                  </div>
+
+                  {dateTo && (
+                    <button
+                      onClick={() => setDateTo("")}
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      Clear date filter
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="rounded-lg bg-muted/30 p-3">
                 <p className="text-xs text-muted-foreground">
                   <strong className="text-foreground">{selectedIds.size}</strong>{" "}
                   {contactType === "customers" ? "customers" : "suppliers"} selected for import
-                  {dateFrom ? ` with invoices from ${new Date(dateFrom).toLocaleDateString()}` : " with all invoices"}
+                  {dateFrom || dateTo
+                    ? ` with invoices${dateFrom ? ` from ${new Date(dateFrom).toLocaleDateString()}` : ""}${dateTo ? ` to ${new Date(dateTo).toLocaleDateString()}` : ""}`
+                    : " with all invoices"}
                 </p>
               </div>
             </div>
           )}
 
-          {/* Step 4: Importing */}
+          {/* Step 4: Payment Terms */}
+          {step === "payment-terms" && (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground mb-1">Set Payment Terms</h3>
+                <p className="text-xs text-muted-foreground">
+                  Set the net payment terms for each contact. The due date will be automatically
+                  calculated from the invoice issue date.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {contacts
+                  .filter((c) => selectedIds.has(c.id))
+                  .map((contact) => (
+                    <div
+                      key={contact.id}
+                      className="flex items-center justify-between rounded-lg border p-3 gap-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium truncate">{contact.name}</p>
+                        {contact.email && (
+                          <p className="text-xs text-muted-foreground truncate">{contact.email}</p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <label className="text-xs text-muted-foreground">Net</label>
+                        <select
+                          value={paymentTerms[contact.id] || 30}
+                          onChange={(e) =>
+                            setPaymentTerms((prev) => ({
+                              ...prev,
+                              [contact.id]: parseInt(e.target.value),
+                            }))
+                          }
+                          className="h-9 rounded-lg border bg-background px-3 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                        >
+                          <option value={0}>0 (Due on issue)</option>
+                          <option value={7}>7 days</option>
+                          <option value={15}>15 days</option>
+                          <option value={30}>30 days</option>
+                          <option value={45}>45 days</option>
+                          <option value={60}>60 days</option>
+                          <option value={90}>90 days</option>
+                          <option value={120}>120 days</option>
+                        </select>
+                        <span className="text-xs text-muted-foreground">days</span>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+
+              <div className="rounded-lg bg-muted/30 p-3">
+                <p className="text-xs text-muted-foreground">
+                  <strong className="text-foreground">{selectedIds.size}</strong>{" "}
+                  {contactType === "customers" ? "customers" : "suppliers"} selected
+                  {dateFrom || dateTo
+                    ? ` with invoices${dateFrom ? ` from ${new Date(dateFrom).toLocaleDateString()}` : ""}${dateTo ? ` to ${new Date(dateTo).toLocaleDateString()}` : ""}`
+                    : " with all invoices"}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Step 5: Preview */}
+          {step === "preview" && previewData && (
+            <div className="space-y-5">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground mb-1">Review Import</h3>
+                <p className="text-xs text-muted-foreground">
+                  Review the invoices that will be imported. The due dates are calculated based on
+                  your payment terms.
+                </p>
+              </div>
+
+              {/* Summary cards */}
+              <div className="grid grid-cols-3 gap-3">
+                <Card className="p-3 text-center">
+                  <p className="text-2xl font-bold text-primary">{previewData.summary.totalContacts}</p>
+                  <p className="text-xs text-muted-foreground">Contacts</p>
+                </Card>
+                <Card className="p-3 text-center">
+                  <p className="text-2xl font-bold text-primary">{previewData.summary.totalInvoices}</p>
+                  <p className="text-xs text-muted-foreground">Invoices</p>
+                </Card>
+                <Card className="p-3 text-center">
+                  <p className="text-2xl font-bold text-primary">
+                    {new Intl.NumberFormat("en-US", {
+                      style: "currency",
+                      currency: "USD",
+                    }).format(previewData.summary.totalAmount)}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Total amount</p>
+                </Card>
+              </div>
+
+              {/* Invoice table */}
+              <div className="max-h-64 overflow-y-auto rounded-lg border">
+                <table className="w-full text-xs">
+                  <thead className="bg-muted/50 sticky top-0">
+                    <tr>
+                      <th className="text-left px-3 py-2 font-medium">Contact</th>
+                      <th className="text-left px-3 py-2 font-medium">Invoice #</th>
+                      <th className="text-left px-3 py-2 font-medium">Issued</th>
+                      <th className="text-left px-3 py-2 font-medium">Due</th>
+                      <th className="text-right px-3 py-2 font-medium">Amount</th>
+                      <th className="text-left px-3 py-2 font-medium">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewData.invoices.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="text-center py-8 text-muted-foreground">
+                          No invoices found for the selected filters
+                        </td>
+                      </tr>
+                    ) : (
+                      previewData.invoices.map((inv, idx) => (
+                        <tr
+                          key={`${inv.invoiceNumber}-${idx}`}
+                          className="border-t hover:bg-muted/20 transition-colors"
+                        >
+                          <td className="px-3 py-2 truncate max-w-[120px]">{inv.contactName}</td>
+                          <td className="px-3 py-2 font-medium">{inv.invoiceNumber}</td>
+                          <td className="px-3 py-2">{inv.issueDate}</td>
+                          <td className="px-3 py-2">{inv.dueDate}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {new Intl.NumberFormat("en-US", {
+                              style: "currency",
+                              currency: "USD",
+                            }).format(inv.amount)}
+                          </td>
+                          <td className="px-3 py-2">
+                            <span
+                              className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                inv.status === "closed"
+                                  ? "bg-emerald-500/10 text-emerald-600"
+                                  : "bg-amber-500/10 text-amber-600"
+                              }`}
+                            >
+                              {inv.status === "closed" ? "Paid" : "Open"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Step 6: Importing */}
           {step === "importing" && (
             <div className="flex flex-col items-center justify-center gap-4 py-12">
               <div className="relative">
@@ -570,7 +823,7 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
 
         {/* Footer */}
         <div className="flex items-center justify-between px-6 py-4 border-t bg-muted/20">
-          {/* Back button */}
+          {/* Back buttons */}
           {step === "select-contacts" && (
             <Button
               variant="ghost"
@@ -594,6 +847,26 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
               <ChevronLeft className="h-4 w-4" /> Back
             </Button>
           )}
+          {step === "payment-terms" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setStep("date-filter")}
+              className="gap-1"
+            >
+              <ChevronLeft className="h-4 w-4" /> Back
+            </Button>
+          )}
+          {step === "preview" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setStep("payment-terms")}
+              className="gap-1"
+            >
+              <ChevronLeft className="h-4 w-4" /> Back
+            </Button>
+          )}
           {step === "choose-type" && fetchContactsMut.isPending && (
             <Button variant="ghost" size="sm" disabled className="gap-1">
               <Loader2 className="h-4 w-4 animate-spin" /> Fetching...
@@ -612,13 +885,7 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
             {step === "select-contacts" && (
               <Button
                 size="sm"
-                onClick={() => {
-                  if (selectedIds.size === 0) {
-                    toast.error("Select at least one contact");
-                    return;
-                  }
-                  setStep("date-filter");
-                }}
+                onClick={() => setStep("date-filter")}
                 disabled={selectedIds.size === 0}
                 className="gap-1"
               >
@@ -629,10 +896,36 @@ export function XeroSyncDialog({ open, onClose }: XeroSyncDialogProps) {
             {step === "date-filter" && (
               <Button
                 size="sm"
-                onClick={handleImport}
+                onClick={handlePreview}
                 className="gap-1.5"
               >
-                <RefreshCw className="h-4 w-4" /> Import {selectedIds.size} {contactType === "customers" ? "customers" : "suppliers"}
+                <Calendar className="h-4 w-4" /> Set Payment Terms
+              </Button>
+            )}
+
+            {step === "payment-terms" && (
+              <Button
+                size="sm"
+                onClick={() => previewMut.mutate()}
+                disabled={previewMut.isPending}
+                className="gap-1.5"
+              >
+                {previewMut.isPending ? (
+                  <><Loader2 className="h-4 w-4 animate-spin" /> Previewing...</>
+                ) : (
+                  <><Search className="h-4 w-4" /> Preview Invoices</>
+                )}
+              </Button>
+            )}
+
+            {step === "preview" && (
+              <Button
+                size="sm"
+                onClick={handleImport}
+                disabled={importMut.isPending}
+                className="gap-1.5"
+              >
+                <RefreshCw className="h-4 w-4" /> Approve & Import {previewData?.summary.totalInvoices || 0} invoices
               </Button>
             )}
 

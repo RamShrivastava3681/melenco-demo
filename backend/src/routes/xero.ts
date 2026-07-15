@@ -285,6 +285,141 @@ function formatDate(d: any): string {
   return String(d).split("T")[0];
 }
 
+// Compute due date from issue date + net payment term days
+function computeDueDate(issueDate: string, netDays: number): string {
+  const d = new Date(issueDate);
+  if (isNaN(d.getTime())) return issueDate;
+  d.setDate(d.getDate() + netDays);
+  return d.toISOString().split("T")[0];
+}
+
+// --- Preview invoices from Xero (without saving) ---
+router.post("/preview", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { contactIds, dateFrom, dateTo, paymentTerms } = req.body;
+    if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
+      res.status(400).json({ error: "contactIds must be a non-empty array" });
+      return;
+    }
+
+    const tokens = await getValidToken(req.user!.userId);
+    if (!tokens) {
+      res.status(400).json({ error: "Xero not connected or session expired. Reconnect to Xero." });
+      return;
+    }
+
+    const xero = getXeroClient();
+    xero.setTokenSet({ access_token: tokens.accessToken } as any);
+    const tenantId = tokens.tenantId;
+
+    // --- Fetch Contacts from Xero ---
+    const contactsRes = await xero.accountingApi.getContacts(tenantId, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const allContacts: any[] = (contactsRes.body as any).contacts || [];
+
+    // Filter to only selected contact IDs
+    const selectedXeroContacts = allContacts.filter((c: any) => contactIds.includes(c.contactID));
+
+    // Build contact name map
+    const contactNameMap = new Map<string, string>();
+    for (const c of selectedXeroContacts) {
+      contactNameMap.set(c.contactID, c.name || "Unknown");
+    }
+
+    // --- Fetch Invoices from Xero ---
+    const invoicesRes = await xero.accountingApi.getInvoices(tenantId, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const xeroInvoices: any[] = (invoicesRes.body as any).invoices || [];
+
+    // Filter invoices to only those belonging to selected contacts
+    const selectedContactIdsSet = new Set(contactIds);
+
+    // Parse dateFrom and dateTo for client-side filtering by invoice date (issue date)
+    let dateFromMs: number | null = null;
+    if (dateFrom) {
+      const d = new Date(dateFrom);
+      if (!isNaN(d.getTime())) {
+        dateFromMs = d.getTime();
+      }
+    }
+    let dateToMs: number | null = null;
+    if (dateTo) {
+      const d = new Date(dateTo);
+      if (!isNaN(d.getTime())) {
+        dateToMs = d.getTime() + 86400000;
+      }
+    }
+
+    const previewInvoices = xeroInvoices
+      .filter((inv: any) => {
+        // Must belong to selected contact
+        if (!inv.contact?.contactID || !selectedContactIdsSet.has(inv.contact.contactID)) return false;
+
+        // Filter by invoice date (issue date)
+        if (inv.date) {
+          const invDate = new Date(inv.date).getTime();
+          if (!isNaN(invDate)) {
+            if (dateFromMs !== null && invDate < dateFromMs) return false;
+            if (dateToMs !== null && invDate >= dateToMs) return false;
+          }
+        }
+
+        return true;
+      })
+      .map((inv: any) => {
+        const contactId = inv.contact?.contactID || "";
+        const issueDate = formatDate(inv.date);
+        const netDays = paymentTerms?.[contactId] || 0;
+        const dueDate = netDays > 0 ? computeDueDate(issueDate, netDays) : formatDate(inv.dueDate);
+        const amount = inv.total ? Math.abs(Number(inv.total)) : 0;
+        const amountDue = inv.amountDue ? Math.abs(Number(inv.amountDue)) : amount;
+        const xeroStatus = String(inv.status || "");
+        const ourStatus = (xeroStatus === "AUTHORISED" || xeroStatus === "SUBMITTED") ? "open"
+          : xeroStatus === "PAID" ? "closed"
+          : "open";
+
+        return {
+          contactId,
+          contactName: contactNameMap.get(contactId) || "Unknown",
+          invoiceNumber: inv.invoiceNumber || "",
+          issueDate,
+          dueDate,
+          amount,
+          balance: amountDue,
+          status: ourStatus,
+          closedDate: ourStatus === "closed" ? formatDate(inv.fullyPaidOnDate) : null,
+        };
+      });
+
+    // Sort by contact name, then by issue date
+    previewInvoices.sort((a: any, b: any) => {
+      if (a.contactName !== b.contactName) return a.contactName.localeCompare(b.contactName);
+      return a.issueDate.localeCompare(b.issueDate);
+    });
+
+    const totalAmount = previewInvoices.reduce((sum: number, inv: any) => sum + inv.amount, 0);
+
+    res.json({
+      success: true,
+      invoices: previewInvoices,
+      summary: {
+        totalInvoices: previewInvoices.length,
+        totalContacts: contactIds.length,
+        totalAmount: +totalAmount.toFixed(2),
+      },
+    });
+  } catch (error: any) {
+    console.error("Xero preview error:", error);
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      res.status(401).json({ error: "Xero session expired. Please reconnect." });
+    } else {
+      res.status(500).json({ error: "Failed to preview invoices from Xero: " + (error.message || "Unknown error") });
+    }
+  }
+});
+
 // --- Fetch contacts from Xero filtered by type (customers/suppliers) ---
 router.post("/contacts", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -338,7 +473,7 @@ router.post("/contacts", requireAuth, async (req: Request, res: Response) => {
 // --- Import selected contacts and their invoices from Xero ---
 router.post("/import", requireAuth, async (req: Request, res: Response) => {
   try {
-    const { contactIds, dateFrom } = req.body;
+    const { contactIds, dateFrom, dateTo, paymentTerms } = req.body;
     if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
       res.status(400).json({ error: "contactIds must be a non-empty array" });
       return;
@@ -398,7 +533,7 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
     // Filter invoices to only those belonging to selected contacts
     const selectedContactIdsSet = new Set(contactIds);
 
-    // Parse dateFrom for client-side filtering by invoice date (issue date)
+    // Parse dateFrom and dateTo for client-side filtering by invoice date (issue date)
     let dateFromMs: number | null = null;
     if (dateFrom) {
       const d = new Date(dateFrom);
@@ -406,15 +541,28 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
         dateFromMs = d.getTime();
       }
     }
+    let dateToMs: number | null = null;
+    if (dateTo) {
+      const d = new Date(dateTo);
+      if (!isNaN(d.getTime())) {
+        // Set to end of day so invoices on the 'to' date are included
+        dateToMs = d.getTime() + 86400000;
+      }
+    }
 
     const relevantInvoices = xeroInvoices.filter((inv: any) => {
       // Must belong to selected contact
       if (!inv.contact?.contactID || !selectedContactIdsSet.has(inv.contact.contactID)) return false;
 
-      // If dateFrom is set, filter by invoice date (issue date)
-      if (dateFromMs !== null && inv.date) {
+      // Filter by invoice date (issue date)
+      if (inv.date) {
         const invDate = new Date(inv.date).getTime();
-        if (!isNaN(invDate) && invDate < dateFromMs) return false;
+        if (!isNaN(invDate)) {
+          // If dateFrom is set, only include invoices on or after that date
+          if (dateFromMs !== null && invDate < dateFromMs) return false;
+          // If dateTo is set, only include invoices on or before that date
+          if (dateToMs !== null && invDate >= dateToMs) return false;
+        }
       }
 
       return true;
@@ -438,7 +586,8 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
 
       const invoiceNumber = xeroInv.invoiceNumber;
       const issueDate = formatDate(xeroInv.date);
-      const dueDate = formatDate(xeroInv.dueDate);
+      const netDays = paymentTerms?.[xeroInv.contact.contactID] || 0;
+      const dueDate = netDays > 0 ? computeDueDate(issueDate, netDays) : formatDate(xeroInv.dueDate);
       const amount = xeroInv.total ? Math.abs(Number(xeroInv.total)) : 0;
       const amountDue = xeroInv.amountDue ? Math.abs(Number(xeroInv.amountDue)) : amount;
       const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
