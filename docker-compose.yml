@@ -12,7 +12,8 @@ services:
       - PORT=3001
       - JWT_SECRET=${JWT_SECRET:-change-me-to-a-random-secret-in-production}
       - DATABASE_URL=/app/data/ledgerly.db
-      - FRONTEND_URL=http://localhost:5173
+      - FRONTEND_URL=https://excel.frillchills.com
+      - XERO_REDIRECT_URI=https://excel.frillchills.com/api/xero/callback
     volumes:
       - ledgerly-data:/app/data
     restart: unless-stopped

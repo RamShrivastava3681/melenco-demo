@@ -285,7 +285,261 @@ function formatDate(d: any): string {
   return String(d).split("T")[0];
 }
 
-// --- Fetch data from Xero ---
+// --- Fetch contacts from Xero filtered by type (customers/suppliers) ---
+router.post("/contacts", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { contactType } = req.body;
+    if (!contactType || !["customers", "suppliers"].includes(contactType)) {
+      res.status(400).json({ error: "contactType must be 'customers' or 'suppliers'" });
+      return;
+    }
+
+    const tokens = await getValidToken(req.user!.userId);
+    if (!tokens) {
+      res.status(400).json({ error: "Xero not connected or session expired. Reconnect to Xero." });
+      return;
+    }
+
+    const xero = getXeroClient();
+    xero.setTokenSet({ access_token: tokens.accessToken } as any);
+    const tenantId = tokens.tenantId;
+
+    const contactsRes = await xero.accountingApi.getContacts(tenantId, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const contacts: any[] = (contactsRes.body as any).contacts || [];
+
+    // Filter by contact type
+    const filtered = contacts.filter((c: any) => {
+      if (contactType === "customers") return c.isCustomer === true;
+      return c.isSupplier === true;
+    }).map((c: any) => ({
+      id: c.contactID,
+      name: c.name || "Unknown",
+      email: c.emailAddress || "",
+      isCustomer: !!c.isCustomer,
+      isSupplier: !!c.isSupplier,
+    }));
+
+    // Sort alphabetically
+    filtered.sort((a: any, b: any) => a.name.localeCompare(b.name));
+
+    res.json({ contacts: filtered });
+  } catch (error: any) {
+    console.error("Xero fetch contacts error:", error);
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      res.status(401).json({ error: "Xero session expired. Please reconnect." });
+    } else {
+      res.status(500).json({ error: "Failed to fetch contacts from Xero: " + (error.message || "Unknown error") });
+    }
+  }
+});
+
+// --- Import selected contacts and their invoices from Xero ---
+router.post("/import", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { contactIds, dateFrom } = req.body;
+    if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
+      res.status(400).json({ error: "contactIds must be a non-empty array" });
+      return;
+    }
+
+    const tokens = await getValidToken(req.user!.userId);
+    if (!tokens) {
+      res.status(400).json({ error: "Xero not connected or session expired. Reconnect to Xero." });
+      return;
+    }
+
+    const xero = getXeroClient();
+    xero.setTokenSet({ access_token: tokens.accessToken } as any);
+    const tenantId = tokens.tenantId;
+
+    // --- Fetch Contacts from Xero ---
+    const contactsRes = await xero.accountingApi.getContacts(tenantId, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const allContacts: any[] = (contactsRes.body as any).contacts || [];
+
+    // Filter to only selected contact IDs
+    const selectedXeroContacts = allContacts.filter((c: any) => contactIds.includes(c.contactID));
+
+    // Map Xero contact IDs to our internal customer IDs
+    const contactIdMap = new Map<string, string>(); // Xero contactID -> our customer ID
+    let contactsCreated = 0;
+
+    for (const contact of selectedXeroContacts) {
+      const name = contact.name || "Unknown";
+      const existing = db.prepare(
+        "SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)"
+      ).get(req.user!.userId, name) as { id: string } | undefined;
+
+      if (existing) {
+        contactIdMap.set(contact.contactID, existing.id);
+      } else {
+        const id = uuidv4();
+        db.prepare(
+          "INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)"
+        ).run(id, req.user!.userId, name);
+        contactIdMap.set(contact.contactID, id);
+        contactsCreated++;
+      }
+    }
+
+    // --- Fetch Invoices from Xero ---
+    const invoicesOptions: any = {
+      headers: { "User-Agent": "Ledgerly" },
+    };
+
+    const invoicesRes = await xero.accountingApi.getInvoices(tenantId, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const xeroInvoices: any[] = (invoicesRes.body as any).invoices || [];
+
+    // Filter invoices to only those belonging to selected contacts
+    const selectedContactIdsSet = new Set(contactIds);
+
+    // Parse dateFrom for client-side filtering by invoice date (issue date)
+    let dateFromMs: number | null = null;
+    if (dateFrom) {
+      const d = new Date(dateFrom);
+      if (!isNaN(d.getTime())) {
+        dateFromMs = d.getTime();
+      }
+    }
+
+    const relevantInvoices = xeroInvoices.filter((inv: any) => {
+      // Must belong to selected contact
+      if (!inv.contact?.contactID || !selectedContactIdsSet.has(inv.contact.contactID)) return false;
+
+      // If dateFrom is set, filter by invoice date (issue date)
+      if (dateFromMs !== null && inv.date) {
+        const invDate = new Date(inv.date).getTime();
+        if (!isNaN(invDate) && invDate < dateFromMs) return false;
+      }
+
+      return true;
+    });
+
+    let invoicesCreated = 0;
+    let invoicesUpdated = 0;
+
+    for (const xeroInv of relevantInvoices) {
+      if (!xeroInv.invoiceNumber || !xeroInv.contact?.contactID) continue;
+
+      // Map Xero status to our status
+      const xeroStatus = String(xeroInv.status || "");
+      const ourStatus = (xeroStatus === "AUTHORISED" || xeroStatus === "SUBMITTED") ? "open"
+        : xeroStatus === "PAID" ? "closed"
+        : "open";
+
+      // Find our customer ID from the map
+      const customerId = contactIdMap.get(xeroInv.contact.contactID);
+      if (!customerId) continue;
+
+      const invoiceNumber = xeroInv.invoiceNumber;
+      const issueDate = formatDate(xeroInv.date);
+      const dueDate = formatDate(xeroInv.dueDate);
+      const amount = xeroInv.total ? Math.abs(Number(xeroInv.total)) : 0;
+      const amountDue = xeroInv.amountDue ? Math.abs(Number(xeroInv.amountDue)) : amount;
+      const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
+
+      // Check if invoice exists
+      const existing = db.prepare(
+        "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
+      ).get(req.user!.userId, customerId, invoiceNumber) as { id: string } | undefined;
+
+      if (existing) {
+        db.prepare(`
+          UPDATE invoices SET
+            issue_date = ?, due_date = ?, amount = ?, balance = ?,
+            status = ?, closed_date = ?
+          WHERE id = ?
+        `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, existing.id);
+        invoicesUpdated++;
+      } else {
+        const id = uuidv4();
+        db.prepare(`
+          INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, req.user!.userId, customerId, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate);
+        invoicesCreated++;
+      }
+    }
+
+    // --- Fetch Payments for imported invoices ---
+    const paymentsRes = await xero.accountingApi.getPayments(tenantId, undefined, undefined, undefined, undefined, undefined, {
+      headers: { "User-Agent": "Ledgerly" },
+    });
+    const xeroPayments: any[] = (paymentsRes.body as any).payments || [];
+
+    let paymentsCreated = 0;
+
+    // Get all imported invoice numbers
+    const importedInvoiceNumbers = new Set(relevantInvoices.map((inv: any) => inv.invoiceNumber));
+
+    for (const xeroPay of xeroPayments) {
+      if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.contactID || !xeroPay.amount) continue;
+
+      // Only process payments for selected contacts' invoices that were imported
+      if (!selectedContactIdsSet.has(xeroPay.contact.contactID)) continue;
+      if (!importedInvoiceNumbers.has(xeroPay.invoice.invoiceNumber)) continue;
+
+      const customerId = contactIdMap.get(xeroPay.contact.contactID);
+      if (!customerId) continue;
+
+      // Find invoice
+      const invoice = db.prepare(
+        "SELECT id, amount, balance FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
+      ).get(req.user!.userId, customerId, xeroPay.invoice.invoiceNumber) as { id: string; amount: number; balance: number } | undefined;
+
+      if (!invoice) continue;
+
+      const paymentDate = formatDate(xeroPay.date);
+      const amount = Math.abs(Number(xeroPay.amount));
+
+      // Check if this payment already exists
+      const existingPay = db.prepare(`
+        SELECT p.id FROM payments p
+        JOIN payment_allocations pa ON pa.payment_id = p.id
+        WHERE p.user_id = ? AND p.customer_id = ? AND pa.invoice_id = ? AND p.payment_date = ? AND pa.amount_applied = ?
+      `).get(req.user!.userId, customerId, invoice.id, paymentDate, amount) as { id: string } | undefined;
+
+      if (!existingPay) {
+        const paymentId = uuidv4();
+        const allocationId = uuidv4();
+        const payAmount = Math.min(amount, invoice.balance);
+
+        db.prepare(`
+          INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(paymentId, req.user!.userId, customerId, paymentDate, payAmount, payAmount, 0, "Xero sync");
+
+        db.prepare(`
+          INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(allocationId, req.user!.userId, paymentId, invoice.id, payAmount, paymentDate, payAmount >= invoice.balance ? 1 : 0);
+
+        paymentsCreated++;
+      }
+    }
+
+    res.json({
+      success: true,
+      contacts: { created: contactsCreated, updated: 0 },
+      invoices: { created: invoicesCreated, updated: invoicesUpdated },
+      payments: { created: paymentsCreated },
+    });
+  } catch (error: any) {
+    console.error("Xero import error:", error);
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      res.status(401).json({ error: "Xero session expired. Please reconnect." });
+    } else {
+      res.status(500).json({ error: "Failed to import from Xero: " + (error.message || "Unknown error") });
+    }
+  }
+});
+
+// --- Legacy full sync (keep for backward compatibility) ---
 router.post("/sync", requireAuth, async (req: Request, res: Response) => {
   try {
     const tokens = await getValidToken(req.user!.userId);

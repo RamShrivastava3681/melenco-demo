@@ -7,6 +7,7 @@ import { useTheme } from "@/lib/useTheme";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { useEffect, useState } from "react";
+import { XeroSyncDialog } from "@/components/app/XeroSyncDialog";
 
 export function DashboardLayout() {
   const navigate = useNavigate();
@@ -14,7 +15,7 @@ export function DashboardLayout() {
   const qc = useQueryClient();
   const { user, signout } = useAuth();
   const { theme, toggleTheme } = useTheme();
-  const [syncing, setSyncing] = useState(false);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
 
   // Xero connection status
   const { data: xeroStatus, refetch: refetchXeroStatus } = useQuery({
@@ -56,24 +57,6 @@ export function DashboardLayout() {
     },
   });
 
-  // Xero sync mutation
-  async function handleSync() {
-    setSyncing(true);
-    try {
-      const result = await api.syncXero();
-      toast.success(
-        `Synced! ${result.contacts.created} contacts, ${result.invoices.created} invoices, ${result.payments.created} payments created.`
-      );
-      qc.invalidateQueries({ queryKey: ["customers"] });
-      qc.invalidateQueries({ queryKey: ["invoices"] });
-      qc.invalidateQueries({ queryKey: ["payments"] });
-    } catch (err: any) {
-      toast.error(err.message || "Sync failed");
-    } finally {
-      setSyncing(false);
-    }
-  }
-
   // Xero connect handler
   async function handleConnect() {
     try {
@@ -112,13 +95,12 @@ export function DashboardLayout() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleSync}
-                  disabled={syncing}
+                  onClick={() => setSyncDialogOpen(true)}
                   title="Sync data from Xero"
                   className="gap-1.5"
                 >
-                  <RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
-                  {syncing ? "Syncing..." : "Sync"}
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Sync
                 </Button>
                 <Button
                   variant="ghost"
@@ -166,6 +148,12 @@ export function DashboardLayout() {
       <main className="mx-auto max-w-7xl px-6 py-8">
         <Outlet />
       </main>
+
+      {/* Xero sync dialog */}
+      <XeroSyncDialog
+        open={syncDialogOpen}
+        onClose={() => setSyncDialogOpen(false)}
+      />
     </div>
   );
 }

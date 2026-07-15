@@ -148,4 +148,17 @@ export const api = {
 
   syncXero: () =>
     request<{ success: boolean; contacts: { created: number; updated: number }; invoices: { created: number; updated: number }; payments: { created: number } }>("/xero/sync", { method: "POST" }),
+
+  // Xero selective sync
+  fetchXeroContacts: (contactType: "customers" | "suppliers") =>
+    request<{ contacts: Array<{ id: string; name: string; email: string; isCustomer: boolean; isSupplier: boolean }> }>("/xero/contacts", {
+      method: "POST",
+      body: JSON.stringify({ contactType }),
+    }),
+
+  importXeroContacts: (data: { contactIds: string[]; dateFrom?: string }) =>
+    request<{ success: boolean; contacts: { created: number; updated: number }; invoices: { created: number; updated: number }; payments: { created: number } }>("/xero/import", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
 };

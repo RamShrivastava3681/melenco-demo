@@ -5,10 +5,11 @@ import { ExternalLink, RefreshCw, Unlink, CheckCircle2, XCircle, Cloud } from "l
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { useState } from "react";
+import { XeroSyncDialog } from "./XeroSyncDialog";
 
 export function XeroConnectCard() {
   const qc = useQueryClient();
-  const [syncing, setSyncing] = useState(false);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
 
   const { data: xeroStatus, refetch: refetchXeroStatus } = useQuery({
     queryKey: ["xero-status"],
@@ -37,23 +38,6 @@ export function XeroConnectCard() {
       window.location.href = url;
     } catch (err: any) {
       toast.error(err.message || "Failed to initiate Xero connection");
-    }
-  }
-
-  async function handleSync() {
-    setSyncing(true);
-    try {
-      const result = await api.syncXero();
-      toast.success(
-        `Synced! ${result.contacts.created} contacts, ${result.invoices.created} invoices, ${result.payments.created} payments created.`
-      );
-      qc.invalidateQueries({ queryKey: ["customers"] });
-      qc.invalidateQueries({ queryKey: ["invoices"] });
-      qc.invalidateQueries({ queryKey: ["payments"] });
-    } catch (err: any) {
-      toast.error(err.message || "Sync failed");
-    } finally {
-      setSyncing(false);
     }
   }
 
@@ -104,12 +88,12 @@ export function XeroConnectCard() {
             <Button
               variant="default"
               size="sm"
-              onClick={handleSync}
-              disabled={syncing || isExpired}
+              onClick={() => setSyncDialogOpen(true)}
+              disabled={isExpired}
               className="gap-1.5"
             >
-              <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
-              {syncing ? "Syncing..." : "Sync Now"}
+              <RefreshCw className="h-4 w-4" />
+              Sync Contacts
             </Button>
             <Button
               variant="outline"
@@ -134,6 +118,12 @@ export function XeroConnectCard() {
           </Button>
         )}
       </CardContent>
+
+      {/* Sync dialog */}
+      <XeroSyncDialog
+        open={syncDialogOpen}
+        onClose={() => setSyncDialogOpen(false)}
+      />
     </Card>
   );
 }
