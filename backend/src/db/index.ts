@@ -277,6 +277,47 @@ function migrateConstraintsForNegatives(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Backfill: compute payment_days & late_payment_days for existing closed
+// invoices that have NULL values (e.g. Xero imports before the fix).
+// ---------------------------------------------------------------------------
+function backfillPaymentDays(): void {
+  const MIGRATION_NAME = "v3_backfill_payment_days";
+
+  if (isMigrationApplied(MIGRATION_NAME)) {
+    console.log("  ↳ Already applied, skipping.");
+    return;
+  }
+
+  console.log("  → Backfilling payment_days / late_payment_days for closed invoices...");
+
+  // Count how many need backfilling first
+  const countResult = exec(`
+    SELECT COUNT(*) as cnt FROM invoices
+    WHERE status = 'closed'
+      AND closed_date IS NOT NULL
+      AND (payment_days IS NULL OR late_payment_days IS NULL)
+  `);
+  const affected = countResult?.[0]?.values?.[0]?.[0] ?? 0;
+
+  if (Number(affected) > 0) {
+    exec(`
+      UPDATE invoices SET
+        payment_days = CAST(julianday(closed_date) - julianday(issue_date) AS INTEGER),
+        late_payment_days = MAX(0, CAST(julianday(closed_date) - julianday(due_date) AS INTEGER))
+      WHERE
+        status = 'closed'
+        AND closed_date IS NOT NULL
+        AND (payment_days IS NULL OR late_payment_days IS NULL)
+    `);
+    console.log(`  ✅ Backfilled ${affected} invoice(s).`);
+  } else {
+    console.log("  ↳ No invoices need backfilling.");
+  }
+
+  markMigrationApplied(MIGRATION_NAME);
+}
+
+// ---------------------------------------------------------------------------
 // Repair: fix broken FK refs in payment_allocations caused by earlier buggy
 // migrations (where ALTER TABLE RENAME caused SQLite to auto-update FKs
 // to point to the old renamed table name).
@@ -440,6 +481,7 @@ export async function initializeDatabase(): Promise<void> {
   // FK is still OFF so DROP TABLE won't be blocked by dependent FK refs
   console.log("📋 Running schema migrations...");
   migrateConstraintsForNegatives();
+  backfillPaymentDays();
   console.log("✅ Schema migrations complete.");
 
   // Seed admin user if configured

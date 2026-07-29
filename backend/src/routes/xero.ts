@@ -277,6 +277,11 @@ async function getValidToken(userId: string): Promise<{ accessToken: string; ten
   return { accessToken: connection.access_token, tenantId: connection.tenant_id };
 }
 
+function daysBetween(a: string, b: string): number {
+  const ms = new Date(b).getTime() - new Date(a).getTime();
+  return Math.round(ms / 86400000);
+}
+
 // Helper to format dates from Xero objects (could be Date, string, or null)
 function formatDate(d: any): string {
   if (!d) return new Date().toISOString().split("T")[0];
@@ -592,6 +597,14 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       const amountDue = xeroInv.amountDue ? Number(xeroInv.amountDue) : amount;
       const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
 
+      // Compute payment_days & late_payment_days for closed invoices
+      let payDays: number | null = null;
+      let lateDays: number | null = null;
+      if (ourStatus === "closed" && closedDate) {
+        payDays = daysBetween(issueDate, closedDate);
+        lateDays = Math.max(0, daysBetween(dueDate, closedDate));
+      }
+
       // Check if invoice exists
       const existing = db.prepare(
         "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
@@ -601,16 +614,16 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
         db.prepare(`
           UPDATE invoices SET
             issue_date = ?, due_date = ?, amount = ?, balance = ?,
-            status = ?, closed_date = ?
+            status = ?, closed_date = ?, payment_days = ?, late_payment_days = ?
           WHERE id = ?
-        `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, existing.id);
+        `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays, existing.id);
         invoicesUpdated++;
       } else {
         const id = uuidv4();
         db.prepare(`
-          INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(id, req.user!.userId, customerId, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate);
+          INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date, payment_days, late_payment_days)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, req.user!.userId, customerId, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays);
         invoicesCreated++;
       }
     }
@@ -762,6 +775,14 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         const amountDue = xeroInv.amountDue ? Number(xeroInv.amountDue) : amount;
         const closedDate = ourStatus === "closed" ? formatDate(xeroInv.fullyPaidOnDate) : null;
 
+        // Compute payment_days & late_payment_days for closed invoices
+        let payDays: number | null = null;
+        let lateDays: number | null = null;
+        if (ourStatus === "closed" && closedDate) {
+          payDays = daysBetween(issueDate, closedDate);
+          lateDays = Math.max(0, daysBetween(dueDate, closedDate));
+        }
+
         // Check if invoice exists
         const existing = db.prepare(
           "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
@@ -771,16 +792,16 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
           db.prepare(`
             UPDATE invoices SET
               issue_date = ?, due_date = ?, amount = ?, balance = ?,
-              status = ?, closed_date = ?
+              status = ?, closed_date = ?, payment_days = ?, late_payment_days = ?
             WHERE id = ?
-          `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, existing.id);
+          `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays, existing.id);
           invoicesUpdated++;
         } else {
           const id = uuidv4();
           db.prepare(`
-            INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(id, req.user!.userId, customer.id, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate);
+            INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date, payment_days, late_payment_days)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(id, req.user!.userId, customer.id, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays);
           invoicesCreated++;
         }
       }
