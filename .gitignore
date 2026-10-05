@@ -31,3 +31,7 @@ frontend/.env
 *.swo
 *~
 .DS_Store
+
+# Windows reserved NUL files
+/nul
+/backend/nul

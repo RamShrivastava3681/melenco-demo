@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
+import { ensureTallySchema } from "./tallySchema.js";
+import { ensureWhizunikSchema } from "../integrations/tally/whizunik/schema.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -61,7 +63,12 @@ function exec(sql: string): QueryExecResult[] {
   return db.exec(sql);
 }
 
-export { prepare, exec };
+/** Execute raw SQL without parameters (CREATE TABLE, UPDATE, DELETE, ...). */
+function run(sql: string): void {
+  db.run(sql);
+}
+
+export { prepare, exec, run };
 
 export function transaction(fn: () => void): () => void {
   return () => {
@@ -89,7 +96,101 @@ function getDbPath(): string {
   return path.join(dataDir, "ledgerly.db");
 }
 
-// ---------------------------------------------------------------------------
+/**
+ * Initialize an isolated in-memory database (used by the test suite).
+ * Safe to call repeatedly — each call returns a fresh database instance
+ * wrapped in the same prepare/exec/transaction API as the main db module.
+ */
+export async function createTestDatabase(): Promise<void> {
+  SQL = await initSqlJs();
+  db = new SQL.Database(); // empty constructor = in-memory database
+  db.run("PRAGMA foreign_keys = OFF");
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (user_id, name)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      invoice_number TEXT NOT NULL,
+      issue_date TEXT NOT NULL,
+      due_date TEXT NOT NULL,
+      amount REAL NOT NULL CHECK (amount != 0),
+      balance REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+      closed_date TEXT,
+      payment_days INTEGER,
+      late_payment_days INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (user_id, customer_id, invoice_number)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      payment_date TEXT NOT NULL,
+      amount REAL NOT NULL CHECK (amount != 0),
+      applied_amount REAL NOT NULL DEFAULT 0,
+      remaining REAL NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS payment_allocations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+      invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      amount_applied REAL NOT NULL CHECK (amount_applied != 0),
+      applied_date TEXT NOT NULL,
+      closed_invoice INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS xero_connections (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      xero_user_id TEXT,
+      tenant_id TEXT,
+      tenant_name TEXT,
+      access_token TEXT,
+      refresh_token TEXT,
+      token_expires_at TEXT,
+      session_state TEXT,
+      connected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (user_id)
+    )
+  `);
+
+  ensureMigrationsTable();
+  ensureTallySchema();
+  ensureWhizunikSchema();
+  db.run("PRAGMA foreign_keys = ON");
+}
+
+ // ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
 
@@ -482,6 +583,11 @@ export async function initializeDatabase(): Promise<void> {
   console.log("📋 Running schema migrations...");
   migrateConstraintsForNegatives();
   backfillPaymentDays();
+
+  // TallyPrime cloud integration schema (idempotent)
+  ensureTallySchema();
+  ensureWhizunikSchema();
+
   console.log("✅ Schema migrations complete.");
 
   // Seed admin user if configured
@@ -556,4 +662,4 @@ async function seedAdminUser(): Promise<void> {
 }
 
 // Make prepare/exec available as default export for convenience
-export default { prepare, exec, transaction, saveDb, initializeDatabase };
+export default { prepare, exec, run, transaction, saveDb, initializeDatabase };

@@ -4,6 +4,7 @@ import { InvoicesPanel } from "@/components/app/InvoicesPanel";
 import { PaymentsPanel } from "@/components/app/PaymentsPanel";
 import { ApplyPaymentPanel } from "@/components/app/ApplyPaymentPanel";
 import { XeroConnectCard } from "@/components/app/XeroConnectCard";
+import { TallyConnectCard } from "@/components/app/TallyConnectCard";
 
 export function Dashboard() {
   return (
@@ -13,8 +14,9 @@ export function Dashboard() {
         <p className="text-sm text-muted-foreground">Manage customers, invoices, and reconcile bulk payments.</p>
       </div>
 
-      {/* Xero integration card */}
+      {/* Integrations */}
       <XeroConnectCard />
+      <TallyConnectCard />
 
       <Tabs defaultValue="apply" className="w-full">
         <TabsList>

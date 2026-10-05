@@ -1,5 +1,9 @@
 import { getToken } from "./auth";
 
+/** Canonical WhizUnik Cloud API base URL (the URL, not the default). */
+export const WHIZUNIK_API_URL =
+  import.meta.env.VITE_WHIZUNIK_API_URL || "https://api.whizunik.com";
+
 const API_BASE = import.meta.env.VITE_URL
   ? `${import.meta.env.VITE_URL}/api`
   : "/api";
@@ -171,6 +175,147 @@ export const api = {
 
   importXeroContacts: (data: { contactIds: string[]; dateFrom?: string; dateTo?: string; paymentTerms: Record<string, number> }) =>
     request<{ success: boolean; contacts: { created: number; updated: number }; invoices: { created: number; updated: number }; payments: { created: number } }>("/xero/import", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  // ── Tally integration (frontend) ─────────────────────────────
+  createTallyPairingCode: () =>
+    request<{ success: boolean; code: string; expiresAt: string; expiresInMinutes: number }>(
+      "/integrations/tally/pairing-code",
+      { method: "POST", body: JSON.stringify({}) }
+    ),
+
+  getTallyStatus: () =>
+    request<{
+      success: boolean;
+      apiBaseUrl?: string;
+      connected: boolean;
+      pairingCodeTtlMinutes: number;
+      connectors: Array<{
+        id: string;
+        connectorId: string;
+        name: string;
+        status: string;
+        online: boolean;
+        deviceName: string | null;
+        appVersion: string | null;
+        lastHeartbeat: string | null;
+        lastSync: string | null;
+        lastSuccessfulSync: string | null;
+        createdAt: string;
+      }>;
+      companies: Array<{ id: string; tallyCompanyGuid: string; tallyCompanyName: string }>;
+      currentSync: {
+        syncId: string;
+        entityType: string;
+        syncType: string;
+        status: string;
+        totalRecords: number;
+        processedRecords: number;
+        totalBatches: number;
+        processedBatches: number;
+        failedRecords: number;
+        duplicateRecords: number;
+        startedAt: string;
+      } | null;
+      lastSync: {
+        syncId: string;
+        entityType: string;
+        status: string;
+        completedAt: string | null;
+        successfulRecords: number;
+        failedRecords: number;
+        duplicateRecords: number;
+      } | null;
+    }>("/integrations/tally/status"),
+
+  getTallySyncHistory: (params?: { connectorId?: string; status?: string; limit?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.connectorId) search.set("connectorId", params.connectorId);
+    if (params?.status) search.set("status", params.status);
+    if (params?.limit) search.set("limit", String(params.limit));
+    const qs = search.toString();
+    return request<{ success: boolean; sessions: any[] }>(
+      `/integrations/tally/sync-history${qs ? `?${qs}` : ""}`
+    );
+  },
+
+  disconnectTallyConnector: (connectorId: string) =>
+    request<{ success: boolean }>("/integrations/tally/disconnect", {
+      method: "POST",
+      body: JSON.stringify({ connectorId }),
+    }),
+
+  // ── WhizUnik Cloud API info (points at https://api.whizunik.com) ──
+  getTallyInfo: () =>
+    request<{
+      apiBaseUrl: string;
+      protocolVersion: string;
+      heartbeatIntervalSeconds: number;
+      endpoints: Record<string, string>;
+    }>("/integrations/tally/info"),
+
+  // ── Receive: what the platform got from connectors ──
+  getTallyBatches: (params?: { companyId?: string; entityType?: string; limit?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.companyId) search.set("companyId", params.companyId);
+    if (params?.entityType) search.set("entityType", params.entityType);
+    if (params?.limit) search.set("limit", String(params.limit));
+    const qs = search.toString();
+    return request<{
+      batches: Array<{
+        batch_id: string;
+        request_id: string;
+        sync_id: string;
+        connector_id: string;
+        company_id: string;
+        entity_type: string;
+        received_count: number;
+        duplicate: number;
+        created_at: string;
+      }>;
+    }>(`/integrations/tally/sync/batches${qs ? `?${qs}` : ""}`);
+  },
+
+  getReceivedRecords: (params?: { companyId?: string; entityType?: string; limit?: number; offset?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.companyId) search.set("companyId", params.companyId);
+    if (params?.entityType) search.set("entityType", params.entityType);
+    if (params?.limit) search.set("limit", String(params.limit));
+    if (params?.offset) search.set("offset", String(params.offset));
+    const qs = search.toString();
+    return request<{
+      records: Array<{
+        id: string;
+        batch_id: string;
+        company_id: string;
+        entity_type: string;
+        source_object_id: string | null;
+        source_voucher_number: string | null;
+        source_voucher_date: string | null;
+        payload: unknown;
+        created_at: string;
+      }>;
+      limit: number;
+      offset: number;
+    }>(`/integrations/tally/received${qs ? `?${qs}` : ""}`);
+  },
+
+  // ── Push: queue a cloud→connector command (connector polls outbound) ──
+  pushTallyCommand: (data: {
+    connectorId: string;
+    command: "REQUEST_SYNC" | "PAUSE_SYNC" | "RESUME_SYNC" | "UPDATE_CONFIG";
+    payload?: Record<string, unknown>;
+  }) =>
+    request<{
+      id: string;
+      connectorId: string;
+      command: string;
+      payload: unknown;
+      status: string;
+      createdAt: string;
+    }>("/integrations/tally/commands", {
       method: "POST",
       body: JSON.stringify(data),
     }),

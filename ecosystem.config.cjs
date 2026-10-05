@@ -12,6 +12,8 @@ module.exports = {
         JWT_SECRET: "", // ← Set this to a strong random value!
         DATABASE_URL: "./data/ledgerly.db",
         FRONTEND_URL: "https://excel.frillchills.com",
+        PUBLIC_API_BASE_URL: "https://api.whizunik.com",
+        XERO_REDIRECT_URI: "https://excel.frillchills.com/api/xero/callback",
       },
       error_file: "../logs/backend-error.log",
       out_file: "../logs/backend-out.log",
