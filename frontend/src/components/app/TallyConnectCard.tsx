@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,6 +50,14 @@ interface TallyStatus {
   companies: Array<{ id: string; tallyCompanyGuid: string; tallyCompanyName: string }>;
   currentSync: CurrentSync | null;
   lastSync: { syncId: string; entityType: string; status: string; completedAt: string | null; successfulRecords: number; failedRecords: number } | null;
+  lastConnection: {
+    connectorId: string;
+    connectorName: string;
+    connectedAt: string;
+    deviceName: string | null;
+    appVersion: string | null;
+  } | null;
+  pendingPairing?: { active: boolean; expiresAt: string | null } | null;
 }
 
 function timeAgo(iso: string | null): string {
@@ -69,11 +77,16 @@ export function TallyConnectCard() {
   const [expiresAt, setExpiresAt] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [pushEntity, setPushEntity] = useState("sales_voucher");
+  const [justConnectedId, setJustConnectedId] = useState<string | null>(null);
+  const prevConnectorIds = useRef<string>("");
+  const prevConnected = useRef(false);
 
   const { data: status, isLoading, refetch } = useQuery({
     queryKey: ["tally-status"],
     queryFn: () => api.getTallyStatus(),
-    refetchInterval: 15_000,
+    // While a pairing code is on screen, poll fast so the success banner
+    // appears within seconds of the connector pairing. Otherwise 15s.
+    refetchInterval: pairingCode ? 3_000 : 15_000,
     refetchOnWindowFocus: false,
   });
 
@@ -138,6 +151,31 @@ export function TallyConnectCard() {
   const connectors = status?.connectors ?? [];
   const currentSync = status?.currentSync ?? null;
 
+  // Success response: when a new connector appears (or disconnected → connected),
+  // show a toast + success banner and dismiss the pairing code UI.
+  useEffect(() => {
+    const ids = connectors.map((c) => c.connectorId).sort().join(",");
+    const wasConnected = prevConnected.current;
+    const prevIds = prevConnectorIds.current;
+    prevConnectorIds.current = ids;
+    prevConnected.current = connected;
+    if (!status || !connected || !ids) return;
+    // Skip the very first load (no baseline yet) — only fire on transitions.
+    if (!prevIds) return;
+    const prevSet = new Set(prevIds ? prevIds.split(",") : []);
+    const fresh = connectors.find((c) => !prevSet.has(c.connectorId));
+    if (fresh || !wasConnected) {
+      const name = fresh?.name ?? status.lastConnection?.connectorName ?? "Tally connector";
+      setJustConnectedId(fresh?.connectorId ?? status.lastConnection?.connectorId ?? "connected");
+      setPairingCode(null);
+      setExpiresAt(null);
+      toast.success(`Connected to ${name} — sync is live`, {
+        description: "Your Tally connector paired successfully. Invoices can now flow both ways.",
+      });
+      refetch();
+    }
+  }, [status?.connectors?.length, connected]);
+
   return (
     <Card className="overflow-hidden border-primary/10">
       <CardHeader className="pb-3">
@@ -174,6 +212,35 @@ export function TallyConnectCard() {
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {/* Success response — shown right after a connector pairs */}
+        {(justConnectedId || status?.lastConnection) && connected && (
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3.5 space-y-1">
+            <p className="flex items-center gap-1.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              {justConnectedId ? "Successfully connected to Tally" : "Tally connected"}
+              {justConnectedId && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto h-6 px-2 text-xs"
+                  onClick={() => setJustConnectedId(null)}
+                >
+                  Dismiss
+                </Button>
+              )}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {status?.lastConnection
+                ? `${status.lastConnection.connectorName}${
+                    status.lastConnection.deviceName ? ` (${status.lastConnection.deviceName})` : ""
+                  } · paired ${timeAgo(status.lastConnection.connectedAt)}`
+                : "Connector paired and syncing."}
+              {status?.lastSync
+                ? ` · Last sync: ${status.lastSync.successfulRecords} records (${status.lastSync.status})`
+                : ""}
+            </p>
+          </div>
+        )}
         {/* Canonical Cloud API address — the connector talks to this URL */}
         <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-xs">
           <Globe className="h-3.5 w-3.5 text-muted-foreground" />

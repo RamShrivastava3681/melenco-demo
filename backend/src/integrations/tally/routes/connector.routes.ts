@@ -6,7 +6,7 @@ import { rateLimiters } from "../middleware/rateLimiter.js";
 import { sendError, errorHandler } from "../errors.js";
 import { formatZodError } from "../validators/schemas.js";
 import { consumePairingCode } from "../services/pairing.service.js";
-import { registerConnector } from "../services/connector.service.js";
+import { registerConnector, touchHeartbeat } from "../services/connector.service.js";
 import { ensureCompany } from "../services/company.service.js";
 import { startSession, requireSessionForConnector, completeSession, failSession } from "../services/syncSession.service.js";
 import { processBatch } from "../services/batch.service.js";
@@ -89,6 +89,7 @@ import { connectSchema } from "../validators/schemas.js";
 router.use("/heartbeat", requireConnectorAuth, rateLimiters.default);
 router.use("/config", requireConnectorAuth, rateLimiters.default);
 router.use("/sync", requireConnectorAuth, rateLimiters.default);
+router.use("/commands", requireConnectorAuth, rateLimiters.default);
 
 /**
  * POST /heartbeat — liveness + pending command pickup.
@@ -97,6 +98,9 @@ router.post("/heartbeat", rateLimiters.heartbeat, (req: Request, res: Response) 
   try {
     const input = parseBody(heartbeatSchema, req.body);
     const connector = req.connector!;
+
+    // Record liveness so the platform Online badge + lastConnection stay fresh.
+    touchHeartbeat(connector.rowId);
 
     // Deliver any pending cloud→connector commands (FIFO, mark delivered)
     const commands = db_allPendingCommands(connector.rowId);
@@ -108,6 +112,36 @@ router.post("/heartbeat", rateLimiters.heartbeat, (req: Request, res: Response) 
       commands,
       configVersion: null,
     });
+  } catch (err) {
+    errorHandler(err, req, res);
+  }
+});
+
+/**
+ * POST /commands/ack — connector acknowledges a pushed command (e.g.
+ * PUSH_VOUCHERS written to Tally). Marks DONE/CANCELLED so the platform UI
+ * can show Queued → Delivered → Done.
+ */
+router.post("/commands/ack", (req: Request, res: Response) => {
+  try {
+    const input = parseBody(commandAckSchema, req.body);
+    const connector = req.connector!;
+    const row = db.prepare(`SELECT id, connector_id, status FROM tally_sync_commands WHERE id = ?`).get(
+      input.commandId
+    ) as { id: string; connector_id: string; status: string } | undefined;
+    if (!row || row.connector_id !== connector.rowId) {
+      return sendError(res, "INVALID_PAYLOAD", "Unknown command for this connector", undefined, req.requestId);
+    }
+    db.prepare(
+      `UPDATE tally_sync_commands SET status = ?, completed_at = datetime('now') WHERE id = ?`
+    ).run(input.status, row.id);
+    audit("BATCH_ACCEPTED", {
+      userId: connector.userId,
+      connectorId: connector.connectorId,
+      requestId: req.requestId,
+      detail: { commandId: row.id, status: input.status },
+    });
+    res.json({ success: true, id: row.id, status: input.status });
   } catch (err) {
     errorHandler(err, req, res);
   }
@@ -248,7 +282,7 @@ router.post("/sync/error", (req: Request, res: Response) => {
 // ---- small db helpers (keep route bodies readable) -------------------------
 
 import db from "../../../db/index.js";
-import { heartbeatSchema, syncStartSchema, batchSchema, syncCompleteSchema, syncErrorSchema } from "../validators/schemas.js";
+import { heartbeatSchema, syncStartSchema, batchSchema, syncCompleteSchema, syncErrorSchema, commandAckSchema } from "../validators/schemas.js";
 import { declareSessionTotals as declareTotals, getSessionBySyncId } from "../services/syncSession.service.js";
 import { config } from "../utils/env.js";
 

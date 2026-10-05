@@ -78,12 +78,20 @@ export const wzAdminPairingSchema = z.object({
 });
 
 // Platform push: POST /api/integrations/tally/commands (JWT)
-export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG"] as const;
+export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS"] as const;
 
 export const wzPushCommandSchema = z.object({
   connectorId: z.string().trim().min(1).max(120),
   command: z.enum(WZ_COMMANDS),
   payload: z.record(z.string(), z.unknown()).optional(),
+});
+
+// Platform push: POST /api/integrations/tally/invoices/push (JWT)
+// Queues selected platform invoices as PUSH_VOUCHERS for the connector.
+export const wzPushInvoicesSchema = z.object({
+  connectorId: z.string().trim().min(1).max(120),
+  companyId: z.string().trim().min(1).max(128),
+  invoiceIds: z.array(z.string().trim().min(1).max(128)).min(1).max(200),
 });
 
 // Connector ack: POST /api/integrations/tally/commands/ack (Bearer)

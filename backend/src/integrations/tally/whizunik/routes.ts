@@ -11,6 +11,7 @@ import {
   wzAdminPairingSchema,
   wzPushCommandSchema,
   wzAckCommandSchema,
+  wzPushInvoicesSchema,
   formatWzIssues,
 } from "./validate.js";
 import {
@@ -213,6 +214,18 @@ router.post(
       ).run(uuidv4(), connectorId, input.deviceId, input.deviceName, found.tenantId, input.appVersion, input.protocolVersion);
 
       consumePairingCode(input.pairingCode, found);
+
+      try {
+        db.prepare(
+          `INSERT INTO tally_audit_logs (id, user_id, connector_id, event, detail)
+           VALUES (?, ?, ?, 'CONNECTOR_CONNECTED', ?)`
+        ).run(
+          uuidv4(),
+          found.tenantId,
+          connectorId,
+          JSON.stringify({ deviceName: input.deviceName, appVersion: input.appVersion, protocol: "whizunik" })
+        );
+      } catch { /* audit must never break connect */ }
 
       res.status(200).json(connectResponse(connectorId, input.deviceId, found.tenantId, company));
     } catch (err) {
@@ -632,6 +645,243 @@ router.post("/commands", (req: Request, res: Response) => {
       });
     } catch (err) {
       console.error("[whizunik][commands] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+/**
+ * POST /invoices/push — queue selected platform invoices for Tally (JWT auth).
+ * Loads invoices + customer names for this tenant, builds connector-ready
+ * voucher payloads, and queues a single PUSH_VOUCHERS command. The connector
+ * picks it up via GET /commands/pending and writes to Tally locally.
+ */
+router.post("/invoices/push", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    const parsed = wzPushInvoicesSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
+      return;
+    }
+    try {
+      const userId = req.user!.userId;
+      const { connectorId, companyId, invoiceIds } = parsed.data;
+
+      // Resolve connector: new-spec first, legacy tc_* as fallback.
+      let pushTarget: { kind: "whizunik"; connectorId: string } | { kind: "legacy"; rowId: string; connectorId: string } | null = null;
+      const conn = db.prepare(`SELECT connector_id, tenant_id FROM connectors WHERE connector_id = ?`).get(
+        connectorId
+      ) as { connector_id: string; tenant_id: string } | undefined;
+      if (conn && conn.tenant_id === userId) {
+        pushTarget = { kind: "whizunik", connectorId: conn.connector_id };
+      } else {
+        try {
+          const legacy = db.prepare(
+            `SELECT id, connector_id, user_id FROM tally_connectors WHERE connector_id = ?`
+          ).get(connectorId) as { id: string; connector_id: string; user_id: string } | undefined;
+          if (legacy && legacy.user_id === userId) {
+            pushTarget = { kind: "legacy", rowId: legacy.id, connectorId: legacy.connector_id };
+          }
+        } catch { /* legacy table may not exist */ }
+      }
+      if (!pushTarget) {
+        sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+        return;
+      }
+      const company = db.prepare(`SELECT id, name, tally_guid FROM companies WHERE id = ?`).get(
+        companyId
+      ) as { id: string; name: string; tally_guid: string | null } | undefined;
+      if (!company) {
+        // Fall back to legacy tally_companies for old connectors.
+        try {
+          const legacyCo = db.prepare(`SELECT id, tally_company_guid, tally_company_name FROM tally_companies WHERE id = ? AND user_id = ?`).get(
+            companyId, userId
+          ) as { id: string; tally_company_guid: string; tally_company_name: string } | undefined;
+          if (!legacyCo) {
+            sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+            return;
+          }
+        } catch {
+          sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+          return;
+        }
+      }
+
+      const uniqueIds = [...new Set(invoiceIds)];
+      const placeholders = uniqueIds.map(() => "?").join(",");
+      const rows = db.prepare(
+        `SELECT i.id, i.invoice_number, i.issue_date, i.due_date, i.amount, i.balance, i.status,
+                c.name AS customer_name
+         FROM invoices i LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = i.user_id
+         WHERE i.user_id = ? AND i.id IN (${placeholders})`
+      ).all(userId, ...uniqueIds) as Array<{
+        id: string; invoice_number: string; issue_date: string; due_date: string;
+        amount: number; balance: number; status: string; customer_name: string | null;
+      }>;
+      if (rows.length === 0) {
+        sendWzError(res, "INVALID_PAYLOAD", "No matching invoices for this account");
+        return;
+      }
+      const foundIds = new Set(rows.map((r) => r.id));
+      const missing = uniqueIds.filter((id) => !foundIds.has(id));
+
+      const vouchers = rows.map((r) => ({
+        invoiceId: r.id,
+        invoiceNumber: r.invoice_number,
+        partyName: r.customer_name ?? "Unknown",
+        amount: Number(r.amount),
+        balance: Number(r.balance),
+        issueDate: r.issue_date,
+        dueDate: r.due_date,
+        tallyDate: String(r.issue_date).slice(0, 10).replace(/-/g, ""),
+        voucherType: "Sales",
+        narration: `WhizUnik ${r.invoice_number} due ${r.due_date}`,
+      }));
+
+      const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+      const payload = {
+        companyId,
+        companyName: company?.name ?? "",
+        tallyCompanyGuid: company?.tally_guid ?? null,
+        vouchers,
+      };
+      const payloadJson = JSON.stringify(payload);
+      if (pushTarget.kind === "whizunik") {
+        db.prepare(
+          `INSERT INTO connector_commands (id, tenant_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_VOUCHERS', ?)`
+        ).run(id, userId, pushTarget.connectorId, payloadJson);
+      } else {
+        db.prepare(
+          `INSERT INTO tally_sync_commands (id, user_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_VOUCHERS', ?)`
+        ).run(id, userId, pushTarget.rowId, payloadJson);
+      }
+      res.status(201).json({
+        id,
+        connectorId: pushTarget.connectorId,
+        command: "PUSH_VOUCHERS",
+        status: "PENDING",
+        createdAt: new Date().toISOString(),
+        voucherCount: vouchers.length,
+        missingInvoiceIds: missing,
+        vouchers,
+      });
+    } catch (err) {
+      console.error("[whizunik][invoices/push] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+/**
+ * GET /commands — recent push commands for this tenant (JWT auth).
+ * Used by the platform UI to show Queued → Delivered → Done/Cancelled.
+ */
+router.get("/commands", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    try {
+      const userId = req.user!.userId;
+      const { connectorId, limit } = req.query as Record<string, string | undefined>;
+      const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
+      let sql = `SELECT id, connector_id, command, payload, status, created_at, delivered_at, completed_at
+                 FROM connector_commands WHERE tenant_id = ?`;
+      const params: unknown[] = [userId];
+      if (connectorId) {
+        sql += ` AND connector_id = ?`;
+        params.push(connectorId);
+      }
+      sql += ` ORDER BY created_at DESC LIMIT ?`;
+      params.push(take);
+      const rows = db.prepare(sql).all(...params) as Array<{
+        id: string; connector_id: string; command: string; payload: string;
+        status: string; created_at: string; delivered_at: string | null; completed_at: string | null;
+      }>;
+      // Merge legacy tally_sync_commands so old connectors' pushes show too.
+      try {
+        let legacySql = `SELECT tc.id, tcc.connector_id AS public_id, tc.command, tc.payload, tc.status, tc.created_at, tc.delivered_at, tc.completed_at
+                         FROM tally_sync_commands tc JOIN tally_connectors tcc ON tcc.id = tc.connector_id
+                         WHERE tc.user_id = ?`;
+        const legacyParams: unknown[] = [userId];
+        if (connectorId) {
+          legacySql += ` AND tcc.connector_id = ?`;
+          legacyParams.push(connectorId);
+        }
+        legacySql += ` ORDER BY tc.created_at DESC LIMIT ?`;
+        legacyParams.push(take);
+        const legacyRows = db.prepare(legacySql).all(...legacyParams) as Array<{
+          id: string; public_id: string; command: string; payload: string;
+          status: string; created_at: string; delivered_at: string | null; completed_at: string | null;
+        }>;
+        for (const lr of legacyRows) {
+          rows.push({
+            id: lr.id, connector_id: lr.public_id, command: lr.command, payload: lr.payload,
+            status: lr.status, created_at: lr.created_at, delivered_at: lr.delivered_at, completed_at: lr.completed_at,
+          });
+        }
+      } catch { /* legacy table may not exist */ }
+      rows.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+      const page = rows.slice(0, take);
+      res.status(200).json({
+        commands: page.map((r) => {
+          let payload: unknown = {};
+          try { payload = JSON.parse(r.payload); } catch { payload = {}; }
+          const voucherCount = Array.isArray((payload as { vouchers?: unknown[] })?.vouchers)
+            ? ((payload as { vouchers: unknown[] }).vouchers.length)
+            : undefined;
+          return {
+            id: r.id, connectorId: r.connector_id, command: r.command,
+            status: r.status, createdAt: r.created_at,
+            deliveredAt: r.delivered_at, completedAt: r.completed_at,
+            voucherCount,
+          };
+        }),
+      });
+    } catch (err) {
+      console.error("[whizunik][commands/list] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+/**
+ * GET /commands/status/:id — single push command status (JWT auth).
+ * (Path avoids colliding with /commands/pending below.)
+ */
+router.get("/commands/status/:id", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    try {
+      const userId = req.user!.userId;
+      let row = db.prepare(
+        `SELECT id, connector_id, command, payload, status, created_at, delivered_at, completed_at
+         FROM connector_commands WHERE id = ? AND tenant_id = ?`
+      ).get(req.params.id, userId) as
+        | { id: string; connector_id: string; command: string; payload: string; status: string; created_at: string; delivered_at: string | null; completed_at: string | null }
+        | undefined;
+      if (!row) {
+        // Legacy fallback: tally_sync_commands keyed by connector row id.
+        try {
+          const lr = db.prepare(
+            `SELECT tc.id, tcc.connector_id AS connector_id, tc.command, tc.payload, tc.status, tc.created_at, tc.delivered_at, tc.completed_at
+             FROM tally_sync_commands tc JOIN tally_connectors tcc ON tcc.id = tc.connector_id
+             WHERE tc.id = ? AND tc.user_id = ?`
+          ).get(req.params.id, userId) as
+            | { id: string; connector_id: string; command: string; payload: string; status: string; created_at: string; delivered_at: string | null; completed_at: string | null }
+            | undefined;
+          if (lr) row = lr;
+        } catch { /* ignore */ }
+      }
+      if (!row) {
+        sendWzError(res, "INVALID_PAYLOAD", "Command not found for this account");
+        return;
+      }
+      let payload: unknown = {};
+      try { payload = JSON.parse(row.payload); } catch { payload = {}; }
+      res.status(200).json({
+        id: row.id, connectorId: row.connector_id, command: row.command,
+        payload, status: row.status, createdAt: row.created_at,
+        deliveredAt: row.delivered_at, completedAt: row.completed_at,
+      });
+    } catch (err) {
+      console.error("[whizunik][commands/get] failed:", err);
       sendWzError(res, "SERVER_ERROR", "An internal error occurred");
     }
   });

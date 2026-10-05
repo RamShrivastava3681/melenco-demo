@@ -194,7 +194,75 @@ export function buildStatusPayload(userId: string) {
     companies,
     currentSync,
     lastSync,
+    lastConnection: buildLastConnection(userId, connectors),
+    pendingPairing: getPendingPairing(userId),
   };
+}
+
+/** Most recent successful connect for this tenant — drives the "Connected ✓" banner. */
+export function buildLastConnection(
+  userId: string,
+  connectors: ConnectorStatus[]
+): {
+  connectorId: string;
+  connectorName: string;
+  connectedAt: string;
+  deviceName: string | null;
+  appVersion: string | null;
+} | null {
+  try {
+    // Prefer the audit trail (covers legacy connects); fall back to newest
+    // connector row (covers new-spec wz connects that predate audit writes).
+    const evt = db
+      .prepare(
+        `SELECT connector_id, created_at FROM tally_audit_logs
+         WHERE user_id = ? AND event = 'CONNECTOR_CONNECTED'
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(userId) as { connector_id: string | null; created_at: string } | undefined;
+    if (evt) {
+      const match = evt.connector_id
+        ? connectors.find((c) => c.connectorId === evt.connector_id)
+        : undefined;
+      return {
+        connectorId: evt.connector_id ?? match?.connectorId ?? "",
+        connectorName: match?.name ?? "Tally Connector",
+        connectedAt: evt.created_at,
+        deviceName: match?.deviceName ?? null,
+        appVersion: match?.appVersion ?? null,
+      };
+    }
+  } catch {
+    // audit table may not exist in isolation — fall through to row fallback
+  }
+  if (connectors.length === 0) return null;
+  const newest = [...connectors].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : -1
+  )[0];
+  return {
+    connectorId: newest.connectorId,
+    connectorName: newest.name,
+    connectedAt: newest.createdAt,
+    deviceName: newest.deviceName,
+    appVersion: newest.appVersion,
+  };
+}
+
+/** Whether the user has an unused, unexpired pairing code (legacy table). */
+export function getPendingPairing(userId: string): { active: boolean; expiresAt: string | null } {
+  try {
+    const row = db
+      .prepare(
+        `SELECT expires_at FROM tally_pairing_codes
+         WHERE user_id = ? AND used_at IS NULL AND expires_at > datetime('now')
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(userId) as { expires_at: string } | undefined;
+    if (row) return { active: true, expiresAt: row.expires_at };
+  } catch {
+    // ignore — legacy table may not exist
+  }
+  return { active: false, expiresAt: null };
 }
 
 /** Freshness check for WhizUnik Cloud API connector heartbeats. */

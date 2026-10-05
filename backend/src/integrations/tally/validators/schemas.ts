@@ -86,6 +86,11 @@ export const batchSchema = batchRequestSchema;
 export const syncCompleteSchema = syncCompleteRequestSchema;
 export const syncErrorSchema = syncErrorRequestSchema;
 
+export const commandAckSchema = z.object({
+  commandId: z.string().trim().min(1).max(128),
+  status: z.enum(["DONE", "CANCELLED"]),
+});
+
 export function formatZodError(err: z.ZodError): { issues: Array<{ path: string; message: string }> } {
   return {
     issues: err.issues.map((i) => ({

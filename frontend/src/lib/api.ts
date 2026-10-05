@@ -228,6 +228,14 @@ export const api = {
         failedRecords: number;
         duplicateRecords: number;
       } | null;
+      lastConnection: {
+        connectorId: string;
+        connectorName: string;
+        connectedAt: string;
+        deviceName: string | null;
+        appVersion: string | null;
+      } | null;
+      pendingPairing: { active: boolean; expiresAt: string | null } | null;
     }>("/integrations/tally/status"),
 
   getTallySyncHistory: (params?: { connectorId?: string; status?: string; limit?: number }) => {
@@ -305,7 +313,7 @@ export const api = {
   // ── Push: queue a cloud→connector command (connector polls outbound) ──
   pushTallyCommand: (data: {
     connectorId: string;
-    command: "REQUEST_SYNC" | "PAUSE_SYNC" | "RESUME_SYNC" | "UPDATE_CONFIG";
+    command: "REQUEST_SYNC" | "PAUSE_SYNC" | "RESUME_SYNC" | "UPDATE_CONFIG" | "PUSH_VOUCHERS";
     payload?: Record<string, unknown>;
   }) =>
     request<{
@@ -319,4 +327,58 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+
+  // ── Push invoices to Tally: select platform invoices → PUSH_VOUCHERS command ──
+  pushTallyInvoices: (data: { connectorId: string; companyId: string; invoiceIds: string[] }) =>
+    request<{
+      id: string;
+      connectorId: string;
+      command: string;
+      status: string;
+      createdAt: string;
+      voucherCount: number;
+      missingInvoiceIds: string[];
+      vouchers: Array<{
+        invoiceId: string;
+        invoiceNumber: string;
+        partyName: string;
+        amount: number;
+        issueDate: string;
+        dueDate: string;
+      }>;
+    }>("/integrations/tally/invoices/push", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getTallyCommands: (params?: { connectorId?: string; limit?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.connectorId) search.set("connectorId", params.connectorId);
+    if (params?.limit) search.set("limit", String(params.limit));
+    const qs = search.toString();
+    return request<{
+      commands: Array<{
+        id: string;
+        connectorId: string;
+        command: string;
+        status: string;
+        createdAt: string;
+        deliveredAt: string | null;
+        completedAt: string | null;
+        voucherCount?: number;
+      }>;
+    }>(`/integrations/tally/commands${qs ? `?${qs}` : ""}`);
+  },
+
+  getTallyCommandStatus: (id: string) =>
+    request<{
+      id: string;
+      connectorId: string;
+      command: string;
+      payload: unknown;
+      status: string;
+      createdAt: string;
+      deliveredAt: string | null;
+      completedAt: string | null;
+    }>(`/integrations/tally/commands/status/${id}`),
 };
