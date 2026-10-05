@@ -235,7 +235,7 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
     for (const p of ["/api/integrations/tally/connect", "/api/integrations/tally/token", "/api/integrations/tally/sync/batch", "/api/integrations/tally/heartbeat", "/api/integrations/tally/updates"]) {
       expect(res.body.paths[p]?.post).toBeTruthy();
     }
-    expect(res.body.servers?.[0]?.url).toMatch(/api\.whizunik\.com/);
+    expect(res.body.servers?.[0]?.url).toMatch(/excel\.frillchills\.com\/api/);
   });
 
   it("accepts X-Request-Id for tracing on all endpoints", async () => {
@@ -247,10 +247,10 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
     expect(res.headers["x-request-id"]).toBe("trace-123");
   });
 
-  it("GET /info advertises the whizunik URL, not the default", async () => {
+  it("GET /info advertises the excel URL, not the default", async () => {
     const res = await request(app).get("/api/integrations/tally/info");
     expect(res.status).toBe(200);
-    expect(res.body.apiBaseUrl).toBe("https://api.whizunik.com");
+    expect(res.body.apiBaseUrl).toBe("https://excel.frillchills.com/api");
     expect(res.body.protocolVersion).toBe("1.0");
     expect(res.body.endpoints.connect).toBe("/api/integrations/tally/connect");
   });
@@ -297,7 +297,7 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
     // Status merges the new-spec connector/company so the platform shows it
     const status = await request(app).get("/api/integrations/tally/status").set("Authorization", `Bearer ${user.token}`);
     expect(status.status).toBe(200);
-    expect(status.body.apiBaseUrl).toBe("https://api.whizunik.com");
+    expect(status.body.apiBaseUrl).toBe("https://excel.frillchills.com/api");
     expect(status.body.connected).toBe(true);
     expect(status.body.connectors.some((x: { connectorId: string }) => x.connectorId === c.body.connectorId)).toBe(true);
   });

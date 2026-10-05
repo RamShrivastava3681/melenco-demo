@@ -2,7 +2,7 @@ import db from "../../../db/index.js";
 
 /**
  * WhizUnik Cloud API schema — exact-spec tables for the TallyPrime
- * desktop connector (outbound HTTPS only, base URL https://api.whizunik.com).
+ * desktop connector (outbound HTTPS only, base URL https://excel.frillchills.com/api).
  *
  * Tables (exact names requested):
  *  - tenants(id, name, created_at)

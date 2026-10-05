@@ -1,8 +1,8 @@
 import { getToken } from "./auth";
 
-/** Canonical WhizUnik Cloud API base URL (the URL, not the default). */
+/** Canonical Tally Cloud API base URL (the URL, not the default). */
 export const WHIZUNIK_API_URL =
-  import.meta.env.VITE_WHIZUNIK_API_URL || "https://api.whizunik.com";
+  import.meta.env.VITE_WHIZUNIK_API_URL || "https://excel.frillchills.com/api";
 
 const API_BASE = import.meta.env.VITE_URL
   ? `${import.meta.env.VITE_URL}/api`
@@ -247,7 +247,7 @@ export const api = {
       body: JSON.stringify({ connectorId }),
     }),
 
-  // ── WhizUnik Cloud API info (points at https://api.whizunik.com) ──
+  // ── Tally Cloud API info (points at https://excel.frillchills.com/api) ──
   getTallyInfo: () =>
     request<{
       apiBaseUrl: string;

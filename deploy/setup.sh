@@ -28,7 +28,7 @@ sudo chown -R "$USER:$USER" "$APP_DIR"
 
 echo "==> 5. Setting up backend..."
 cd "$APP_DIR/backend"
-npm ci --omit=dev
+npm ci
 npm run build
 mkdir -p "$APP_DIR/data" "$APP_DIR/logs"
 

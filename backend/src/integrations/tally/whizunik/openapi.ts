@@ -1,18 +1,18 @@
 /**
- * Swagger / OpenAPI 3.0 document for the WhizUnik Cloud API (TallyPrime).
- * Base URL: https://api.whizunik.com
+ * Swagger / OpenAPI 3.0 document for the Tally API.
+ * Base URL: https://excel.frillchills.com/api
  * Served as JSON at GET /api/integrations/tally/openapi.json
  */
 export const whizunikOpenApi = {
   openapi: "3.0.3",
   info: {
-    title: "WhizUnik Cloud API — TallyPrime Integration",
+    title: "Tally API — TallyPrime Integration",
     version: "1.0.0",
     description:
-      "Cloud API for the whizunik-tally-connector desktop agent (outbound HTTPS only; the connector never exposes ports). " +
-      "Base URL: https://api.whizunik.com. All endpoints return JSON. Send X-Request-Id for tracing. HTTPS is required in production.",
+      "Cloud API for the tally-connector desktop agent (outbound HTTPS only; the connector never exposes ports). " +
+      "Base URL: https://excel.frillchills.com/api. All endpoints return JSON. Send X-Request-Id for tracing. HTTPS is required in production.",
   },
-  servers: [{ url: "https://api.whizunik.com", description: "Production" }],
+  servers: [{ url: "https://excel.frillchills.com/api", description: "Production" }],
   security: [],
   paths: {
     "/api/integrations/tally/connect": {
@@ -247,13 +247,13 @@ export const whizunikOpenApi = {
         summary: "Public discovery: canonical API base URL + endpoint map",
         responses: {
           "200": {
-            description: "API info (always points at https://api.whizunik.com)",
+            description: "API info (always points at https://excel.frillchills.com/api)",
             content: {
               "application/json": {
                 schema: {
                   type: "object",
                   properties: {
-                    apiBaseUrl: { type: "string", example: "https://api.whizunik.com" },
+                    apiBaseUrl: { type: "string", example: "https://excel.frillchills.com/api" },
                     protocolVersion: { type: "string", example: "1.0" },
                     heartbeatIntervalSeconds: { type: "integer", example: 120 },
                     endpoints: { type: "object", additionalProperties: { type: "string" } },

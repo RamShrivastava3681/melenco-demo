@@ -3,6 +3,7 @@ import db from "../../../db/index.js";
 import { generateToken, sha256 } from "../utils/crypto.js";
 import { ApiError } from "../errors.js";
 import { config } from "../utils/env.js";
+import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
 import { audit } from "./audit.service.js";
 
 export interface ConnectorRow {
@@ -95,7 +96,7 @@ export function registerConnector(params: {
       connectorId,
       accessToken,
       hmacSecret,
-      apiBaseUrl: process.env.PUBLIC_API_BASE_URL || "",
+      apiBaseUrl: publicApiBaseUrl(),
       heartbeatIntervalSeconds: Math.max(30, Math.floor(config.heartbeatStaleMinutes * 60 / 3)),
     },
   };
