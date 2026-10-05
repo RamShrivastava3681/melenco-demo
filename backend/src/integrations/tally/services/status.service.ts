@@ -187,8 +187,11 @@ export function buildStatusPayload(userId: string) {
     }
   }
 
+  const hasOnlineConnector = connectors.some(
+    (c) => c.status === "ONLINE" && c.online
+  );
   return {
-    connected: connectors.length > 0,
+    connected: hasOnlineConnector,
     pairingCodeTtlMinutes: config.pairingCodeTtlMinutes,
     connectors,
     companies,
