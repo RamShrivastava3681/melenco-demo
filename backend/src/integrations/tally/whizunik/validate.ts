@@ -11,7 +11,9 @@ export const wzConnectSchema = z.object({
   protocolVersion: z.string().trim().min(1).max(40),
   company: z.object({
     name: z.string().trim().min(1).max(200),
-    tallyGuid: z.string().trim().max(200).optional(),
+    // Connector may send `tallyGuid: undefined` (dropped by JSON) or
+    // explicit null when no GUID is known — accept both.
+    tallyGuid: z.string().trim().max(200).nullish(),
   }),
 });
 
@@ -26,11 +28,14 @@ export const wzTokenSchema = z.object({
 export const wzBatchRecordSchema = z
   .object({
     source: z.string().trim().min(1).max(40).optional().default("tally"),
-    sourceCompanyId: z.string().trim().max(200).optional(),
+    // Master records (groups, ledgers, units, …) have no voucher number or
+    // date, so the connector sends explicit nulls. `.optional()` alone
+    // rejects null — accept both null and undefined (missing).
+    sourceCompanyId: z.string().trim().max(200).nullish(),
     entityType: z.string().trim().min(1).max(64),
-    sourceObjectId: z.string().trim().max(200).optional(),
-    sourceVoucherNumber: z.string().trim().max(100).optional(),
-    sourceVoucherDate: z.string().trim().max(30).optional(),
+    sourceObjectId: z.string().trim().max(200).nullish(),
+    sourceVoucherNumber: z.string().trim().max(100).nullish(),
+    sourceVoucherDate: z.string().trim().max(30).nullish(),
     data: z.record(z.string(), z.unknown()).optional().default({}),
   })
   .passthrough();
@@ -53,8 +58,10 @@ export const wzHeartbeatSchema = z.object({
   deviceId: z.string().trim().min(1).max(120),
   appVersion: z.string().trim().min(1).max(40),
   protocolVersion: z.string().trim().min(1).max(40),
-  tallyVersion: z.string().trim().max(80).optional(),
-  company: z.string().trim().max(200).optional(),
+  // The connector sends explicit null when Tally is offline or no company
+  // is selected yet — accept null as "unknown", not a validation error.
+  tallyVersion: z.string().trim().max(80).nullish(),
+  company: z.string().trim().max(200).nullish(),
   lastSync: z.string().trim().max(40).nullable().optional(),
   currentSync: z.unknown().nullable().optional(),
   status: z.enum(["idle", "running", "paused", "error"]),

@@ -2,8 +2,25 @@ import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
 
+const DEFAULT_JWT_SECRET = "change-me-to-a-random-secret-in-production";
+
 function jwtSecret(): string {
-  return process.env.JWT_SECRET || "change-me-to-a-random-secret-in-production";
+  const configured = (process.env.JWT_SECRET || "").trim();
+  if (!configured || configured === DEFAULT_JWT_SECRET) {
+    if (process.env.NODE_ENV === "production") {
+      // Fail fast: running production on the default/empty secret silently
+      // invalidates every connector token on each deploy and is a security
+      // hole. Set JWT_SECRET to a strong random value (openssl rand -hex 32).
+      throw new Error(
+        "JWT_SECRET is not set (or is the default placeholder). Set a strong random JWT_SECRET in production — see ecosystem.config.cjs."
+      );
+    }
+    if (!configured) {
+      console.warn("[whizunik][auth] JWT_SECRET not set — using the insecure development default. Never use this in production.");
+    }
+    return DEFAULT_JWT_SECRET;
+  }
+  return configured;
 }
 
 export interface AccessClaims {

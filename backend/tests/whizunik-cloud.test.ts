@@ -192,6 +192,95 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
     expect(bad.body.error.code).toBe("INVALID_COMPANY");
   });
 
+  it("3. POST /sync/batch accepts master records with null identity fields", async () => {
+    const pc = await createPairingCode(user.token, { tenantId: "tenant-batch-nulls" });
+    const c = await request(app).post("/api/integrations/tally/connect").send(connectBody(pc.body.pairingCode));
+    const auth = `Bearer ${c.body.accessToken}`;
+    const companyId = c.body.companyMapping.whizunikCompanyId as string;
+
+    // Exact wire shape the connector used to send for masters (group/ledger):
+    // explicit nulls where there is no voucher number or date.
+    const res = await request(app).post("/api/integrations/tally/sync/batch").set("Authorization", auth).send({
+      batchId: "nulls_batch_001",
+      requestId: "nulls_req_001",
+      syncId: "nulls_sync_1",
+      deviceId: DEVICE_ID,
+      companyId,
+      entityType: "group",
+      batchNumber: 1,
+      totalBatches: 1,
+      records: [
+        {
+          source: "tally",
+          sourceCompanyId: "tally-guid-1",
+          entityType: "group",
+          sourceObjectId: "group-guid-1",
+          sourceVoucherNumber: null,
+          sourceVoucherDate: null,
+          data: { NAME: "Mock Group" },
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ acked: true, batchId: "nulls_batch_001", duplicate: false, receivedCount: 1 });
+  });
+
+  it("3. POST /sync/batch accepts legacy Tally GUID / name as companyId", async () => {
+    const pc = await createPairingCode(user.token, { tenantId: "tenant-batch-legacy-co" });
+    const c = await request(app).post("/api/integrations/tally/connect").send(connectBody(pc.body.pairingCode));
+    const auth = `Bearer ${c.body.accessToken}`;
+
+    const payloadFor = (companyId: string, batchId: string, requestId: string) => ({
+      batchId,
+      requestId,
+      syncId: "legacy_co_sync",
+      deviceId: DEVICE_ID,
+      companyId,
+      entityType: "ledger",
+      batchNumber: 1,
+      totalBatches: 1,
+      records: [
+        { source: "tally", entityType: "ledger", sourceObjectId: "l-1", data: { NAME: "L1" } },
+      ],
+    });
+
+    // Tally GUID fallback (old connectors never persisted the mapping).
+    const byGuid = await request(app)
+      .post("/api/integrations/tally/sync/batch")
+      .set("Authorization", auth)
+      .send(payloadFor("tally-guid-1", "legacy_co_batch_guid", "legacy_co_req_guid"));
+    expect(byGuid.status).toBe(200);
+    expect(byGuid.body.acked).toBe(true);
+
+    // Tally company-name fallback.
+    const byName = await request(app)
+      .post("/api/integrations/tally/sync/batch")
+      .set("Authorization", auth)
+      .send(payloadFor("Demo Company", "legacy_co_batch_name", "legacy_co_req_name"));
+    expect(byName.status).toBe(200);
+    expect(byName.body.acked).toBe(true);
+  });
+
+  it("4. POST /heartbeat accepts null tallyVersion/company (Tally offline)", async () => {
+    const pc = await createPairingCode(user.token, { tenantId: "tenant-hb-nulls" });
+    const c = await request(app).post("/api/integrations/tally/connect").send(connectBody(pc.body.pairingCode));
+    const res = await request(app)
+      .post("/api/integrations/tally/heartbeat")
+      .set("Authorization", `Bearer ${c.body.accessToken}`)
+      .send({
+        connectorId: c.body.connectorId,
+        deviceId: DEVICE_ID,
+        appVersion: "1.0.0",
+        protocolVersion: "1.0",
+        tallyVersion: null,
+        company: null,
+        lastSync: null,
+        currentSync: null,
+        status: "idle",
+      });
+    expect(res.status).toBe(204);
+  });
+
   it("4. POST /heartbeat returns 204 with Bearer auth (401 without)", async () => {
     const noAuth = await request(app).post("/api/integrations/tally/heartbeat").send({
       connectorId: "x",

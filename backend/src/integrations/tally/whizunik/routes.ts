@@ -66,7 +66,7 @@ function tenantNameFor(tenantId: string): string {
   return "Tenant Name";
 }
 
-function ensureCompany(tenantId: string, name: string, tallyGuid?: string): { id: string; tallyGuid: string | null } {
+function ensureCompany(tenantId: string, name: string, tallyGuid?: string | null): { id: string; tallyGuid: string | null } {
   const guid = tallyGuid?.trim() ? tallyGuid.trim() : null;
   if (guid) {
     const byGuid = db.prepare(`SELECT id, tally_guid FROM companies WHERE tenant_id = ? AND tally_guid = ?`).get(
@@ -89,6 +89,38 @@ function ensureCompany(tenantId: string, name: string, tallyGuid?: string): { id
     id, guid, tenantId, name
   );
   return { id, tallyGuid: guid };
+}
+
+/**
+ * Resolve the batch `companyId` to a real company row for this tenant.
+ *
+ * New connectors send the WhizUnik company id from the pairing response
+ * (`companyMapping.whizunikCompanyId`). Older connectors send the Tally
+ * GUID or the Tally company name instead (they never persisted the
+ * mapping). Accept all three so upgrades never strand queued batches:
+ *   1. exact companies.id match (new-spec)
+ *   2. tally_guid match (legacy guid)
+ *   3. name match (legacy name, incl. rows whose tally_guid IS NULL)
+ */
+function resolveBatchCompany(tenantId: string, companyIdInput: string): { id: string; tenant_id: string } | null {
+  const byId = db.prepare(`SELECT id, tenant_id FROM companies WHERE id = ?`).get(companyIdInput) as
+    | { id: string; tenant_id: string }
+    | undefined;
+  if (byId && byId.tenant_id === tenantId) return byId;
+
+  const trimmed = companyIdInput.trim();
+  if (trimmed) {
+    const byGuid = db.prepare(`SELECT id, tenant_id FROM companies WHERE tenant_id = ? AND tally_guid = ?`).get(
+      tenantId, trimmed
+    ) as { id: string; tenant_id: string } | undefined;
+    if (byGuid) return byGuid;
+
+    const byName = db.prepare(`SELECT id, tenant_id FROM companies WHERE tenant_id = ? AND name = ?`).get(
+      tenantId, trimmed
+    ) as { id: string; tenant_id: string } | undefined;
+    if (byName) return byName;
+  }
+  return null;
 }
 
 function issuePair(connectorId: string, deviceId: string, tenantId: string) {
@@ -320,11 +352,10 @@ router.post(
       const input = parsed.data;
       const claims = (req as Request & { wzClaims?: AccessClaims }).wzClaims!;
       try {
-        // Company must belong to the connector's tenant (tenant from token, never payload)
-        const company = db.prepare(`SELECT id, tenant_id FROM companies WHERE id = ?`).get(input.companyId) as
-          | { id: string; tenant_id: string }
-          | undefined;
-        if (!company || company.tenant_id !== claims.tenantId) {
+        // Company must belong to the connector's tenant (tenant from token, never payload).
+        // Accept the WhizUnik company id plus legacy Tally GUID / name fallbacks.
+        const company = resolveBatchCompany(claims.tenantId, input.companyId);
+        if (!company) {
           sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
           return;
         }
@@ -339,10 +370,13 @@ router.post(
         }
 
         const receivedCount = input.records.length;
+        // Store the canonical company id so legacy GUID/name uploads land on
+        // the same company row the platform shows (not the raw input string).
+        const canonicalCompanyId = company.id;
         db.prepare(
           `INSERT INTO sync_batches (id, batch_id, request_id, sync_id, tenant_id, connector_id, company_id, entity_type, received_count, duplicate)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-        ).run(uuidv4(), input.batchId, input.requestId, input.syncId, claims.tenantId, claims.connectorId, input.companyId, input.entityType, receivedCount);
+        ).run(uuidv4(), input.batchId, input.requestId, input.syncId, claims.tenantId, claims.connectorId, canonicalCompanyId, input.entityType, receivedCount);
 
         // Receive path: persist every record so the platform can show and
         // reconcile exactly what the connector pushed (per-record storage).
@@ -355,7 +389,7 @@ router.post(
             uuidv4(),
             input.batchId,
             claims.tenantId,
-            input.companyId,
+            canonicalCompanyId,
             r.entityType || input.entityType,
             r.sourceObjectId ?? null,
             r.sourceVoucherNumber ?? null,

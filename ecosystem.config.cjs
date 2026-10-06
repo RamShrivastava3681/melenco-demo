@@ -9,7 +9,10 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: "3004",
-        JWT_SECRET: "", // ← Set this to a strong random value!
+        // REQUIRED: generate with `openssl rand -hex 32` and paste here.
+        // The backend refuses to boot in production without a real secret
+        // (empty/default silently invalidates every connector token).
+        JWT_SECRET: "REPLACE_WITH_STRONG_RANDOM_SECRET", // ← Set this to a strong random value!
         DATABASE_URL: "./data/ledgerly.db",
         ADMIN_EMAIL: "", // ← Set to seed an admin user on first boot (e.g. "admin@example.com")
         ADMIN_PASSWORD: "", // ← Set alongside ADMIN_EMAIL (min 6 chars)
