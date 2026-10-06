@@ -14,7 +14,6 @@ import {
   KeyRound,
   Timer,
   Globe,
-  Send,
   Database,
 } from "lucide-react";
 
@@ -76,9 +75,8 @@ export function TallyConnectCard() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [expiresAt, setExpiresAt] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
-  const [pushEntity, setPushEntity] = useState("sales_voucher");
   const [justConnectedId, setJustConnectedId] = useState<string | null>(null);
-  const prevConnectorIds = useRef<string>("");
+  const prevConnectorIds = useRef<string | null>(null);
   const prevConnected = useRef(false);
 
   const { data: status, isLoading, refetch } = useQuery({
@@ -124,14 +122,6 @@ export function TallyConnectCard() {
     onError: (err: any) => toast.error(err.message || "Failed to disconnect connector"),
   });
 
-  // Push: queue a cloud→connector command (connector polls it outbound)
-  const pushMut = useMutation({
-    mutationFn: (connectorId: string) =>
-      api.pushTallyCommand({ connectorId, command: "REQUEST_SYNC", payload: { entityType: pushEntity } }),
-    onSuccess: () => toast.success("Sync requested — the connector picks it up on its next poll"),
-    onError: (err: any) => toast.error(err.message || "Failed to queue sync request"),
-  });
-
   // Countdown for the pairing code
   useEffect(() => {
     if (!expiresAt) return;
@@ -152,27 +142,34 @@ export function TallyConnectCard() {
   const currentSync = status?.currentSync ?? null;
 
   // Success response: when a new connector appears (or disconnected → connected),
-  // show a toast + success banner and dismiss the pairing code UI.
+  // show a toast + success banner and dismiss the pairing code UI so the card
+  // flips to "Connected" instead of still showing the pairing key.
   useEffect(() => {
     const ids = connectors.map((c) => c.connectorId).sort().join(",");
     const wasConnected = prevConnected.current;
     const prevIds = prevConnectorIds.current;
     prevConnectorIds.current = ids;
     prevConnected.current = connected;
-    if (!status || !connected || !ids) return;
-    // Skip the very first load (no baseline yet) — only fire on transitions.
-    if (!prevIds) return;
+    if (!status) return;
+    // First load: establish a baseline without toasting.
+    if (prevIds === null) return;
+    if (!connected || !ids) return;
     const prevSet = new Set(prevIds ? prevIds.split(",") : []);
     const fresh = connectors.find((c) => !prevSet.has(c.connectorId));
     if (fresh || !wasConnected) {
       const name = fresh?.name ?? status.lastConnection?.connectorName ?? "Tally connector";
       setJustConnectedId(fresh?.connectorId ?? status.lastConnection?.connectorId ?? "connected");
+      // Dismiss the pairing key — the connection is now live.
       setPairingCode(null);
       setExpiresAt(null);
       toast.success(`Connected to ${name} — sync is live`, {
-        description: "Your Tally connector paired successfully. Invoices can now flow both ways.",
+        description: "Your Tally connector paired successfully.",
       });
       refetch();
+    } else if (pairingCode) {
+      // Paired but no "fresh" diff (e.g. polling caught up) — still hide the key.
+      setPairingCode(null);
+      setExpiresAt(null);
     }
   }, [status?.connectors?.length, connected]);
 
@@ -340,17 +337,6 @@ export function TallyConnectCard() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => pushMut.mutate(c.connectorId)}
-                  disabled={pushMut.isPending}
-                  className="gap-1.5"
-                  title="Queue a sync request — the connector polls it outbound"
-                >
-                  {pushMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  Request sync
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
                   onClick={() => disconnectMut.mutate(c.connectorId)}
                   disabled={disconnectMut.isPending}
                   className="gap-1.5 text-muted-foreground"
@@ -359,21 +345,9 @@ export function TallyConnectCard() {
                 </Button>
               </div>
             ))}
-            {/* Push: entity to request on the next sync */}
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-muted-foreground">Sync entity:</span>
-              <select
-                value={pushEntity}
-                onChange={(e) => setPushEntity(e.target.value)}
-                className="rounded-md border bg-background px-2 py-1 text-xs"
-              >
-                {["sales_voucher", "purchase_voucher", "ledger", "stock_item", "receipt_voucher", "payment_voucher", "journal_voucher", "day_book"].map((e) => (
-                  <option key={e} value={e}>{e}</option>
-                ))}
-              </select>
-              <span className="text-muted-foreground">— queued in the cloud, picked up on the connector's next outbound poll.</span>
-            </div>
-            {/* Receive: what the platform got from connectors */}
+            {/* Receive: what the platform got from connectors. Sending to the
+                connector is paused for now — see the "Tally data" tab for
+                incoming data. */}
             {batches.length > 0 && (
               <div className="rounded-lg border bg-muted/30 p-3 space-y-1.5">
                 <p className="flex items-center gap-1.5 text-xs font-medium">

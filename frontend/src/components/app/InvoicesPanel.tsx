@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { fmtMoney, type Customer, type Invoice } from "@/lib/ledger";
-import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle, Send, Loader2 } from "lucide-react";
+import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -79,47 +79,7 @@ export function InvoicesPanel() {
 
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
 
-  // ── Send to Tally: select invoices → PUSH_VOUCHERS command ──
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [tallyConnectorId, setTallyConnectorId] = useState<string>("");
-  const [tallyCompanyId, setTallyCompanyId] = useState<string>("");
-  const [lastPushId, setLastPushId] = useState<string | null>(null);
-
-  const { data: tallyStatus } = useQuery({
-    queryKey: ["tally-status"],
-    queryFn: () => api.getTallyStatus(),
-    refetchOnWindowFocus: false,
-    staleTime: 30_000,
-  });
-  const tallyConnectors = tallyStatus?.connectors ?? [];
-  const tallyCompanies = tallyStatus?.companies ?? [];
-
-  const { data: pushStatus } = useQuery({
-    queryKey: ["tally-push-status", lastPushId],
-    queryFn: () => api.getTallyCommandStatus(lastPushId!),
-    enabled: !!lastPushId,
-    refetchInterval: (query) =>
-      query.state.data?.status === "PENDING" || query.state.data?.status === "DELIVERED" ? 5_000 : false,
-    refetchOnWindowFocus: false,
-  });
-
-  const pushMut = useMutation({
-    mutationFn: () =>
-      api.pushTallyInvoices({ connectorId: tallyConnectorId, companyId: tallyCompanyId, invoiceIds: selectedIds }),
-    onSuccess: (res) => {
-      setLastPushId(res.id);
-      setSelectedIds([]);
-      toast.success(`Queued ${res.voucherCount} invoice${res.voucherCount === 1 ? "" : "s"} for Tally`, {
-        description: "The connector picks it up on its next poll and writes the vouchers locally.",
-      });
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  const allSelected = invoices.length > 0 && selectedIds.length === invoices.length;
-  const toggleOne = (id: string) =>
-    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]));
-  const toggleAll = () => setSelectedIds((prev) => (prev.length === invoices.length ? [] : invoices.map((i) => i.id)));
+  // NOTE: sending invoices to Tally is paused for now (receive-only mode).
 
   const importMut = useMutation({
     mutationFn: async (rows: Row[]) => {
@@ -307,62 +267,6 @@ export function InvoicesPanel() {
           </div>
         </div>
 
-        {/* Send to Tally toolbar */}
-        <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2">
-          <Send className="h-4 w-4 text-muted-foreground" />
-          <span className="text-xs font-medium">
-            {selectedIds.length > 0 ? `${selectedIds.length} selected` : "Select invoices to send to Tally"}
-          </span>
-          {tallyConnectors.length === 0 ? (
-            <span className="text-xs text-muted-foreground">Connect Tally first (Settings → Integrations → Tally).</span>
-          ) : (
-            <>
-              <select
-                value={tallyConnectorId}
-                onChange={(e) => setTallyConnectorId(e.target.value)}
-                className="rounded-md border bg-background px-2 py-1 text-xs"
-              >
-                <option value="">Connector…</option>
-                {tallyConnectors.map((c) => (
-                  <option key={c.connectorId} value={c.connectorId}>
-                    {c.name}{c.online ? " · online" : ""}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={tallyCompanyId}
-                onChange={(e) => setTallyCompanyId(e.target.value)}
-                className="rounded-md border bg-background px-2 py-1 text-xs"
-              >
-                <option value="">Company…</option>
-                {tallyCompanies.map((co) => (
-                  <option key={co.id} value={co.id}>{co.tallyCompanyName}</option>
-                ))}
-              </select>
-              <Button
-                size="sm"
-                disabled={selectedIds.length === 0 || !tallyConnectorId || !tallyCompanyId || pushMut.isPending}
-                onClick={() => pushMut.mutate()}
-              >
-                {pushMut.isPending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}
-                Send to Tally
-              </Button>
-              {selectedIds.length > 0 && (
-                <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setSelectedIds([])}>
-                  Clear
-                </Button>
-              )}
-            </>
-          )}
-          {lastPushId && (
-            <span className="ml-auto text-xs text-muted-foreground">
-              Last push: <span className="font-mono">{lastPushId}</span>
-              {pushStatus ? ` · ${pushStatus.status}` : " · queued…"}
-              {pushStatus?.status === "DONE" && <CheckCircle2 className="ml-1 inline h-3.5 w-3.5 text-emerald-500" />}
-            </span>
-          )}
-        </div>
-
         {/* Import Result Panel */}
         {importResult && (
           <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
@@ -451,9 +355,6 @@ export function InvoicesPanel() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-8">
-                  <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="Select all" />
-                </TableHead>
                 <TableHead>Invoice #</TableHead>
                 <TableHead>Customer</TableHead>
                 <TableHead>Issued</TableHead>
@@ -472,14 +373,6 @@ export function InvoicesPanel() {
                 <TableRow><TableCell colSpan={12} className="text-center text-sm text-muted-foreground">No invoices</TableCell></TableRow>
               ) : invoices.map((i) => (
                 <TableRow key={i.id}>
-                  <TableCell>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.includes(i.id)}
-                      onChange={() => toggleOne(i.id)}
-                      aria-label={`Select ${i.invoice_number}`}
-                    />
-                  </TableCell>
                   <TableCell className="font-medium">{i.invoice_number}</TableCell>
                   <TableCell>{customerName(i.customer_id)}</TableCell>
                   <TableCell>{i.issue_date}</TableCell>

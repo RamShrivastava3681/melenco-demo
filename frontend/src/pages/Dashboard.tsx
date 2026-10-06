@@ -3,6 +3,7 @@ import { CustomersPanel } from "@/components/app/CustomersPanel";
 import { InvoicesPanel } from "@/components/app/InvoicesPanel";
 import { PaymentsPanel } from "@/components/app/PaymentsPanel";
 import { ApplyPaymentPanel } from "@/components/app/ApplyPaymentPanel";
+import { TallyDataPanel } from "@/components/app/TallyDataPanel";
 import { XeroConnectCard } from "@/components/app/XeroConnectCard";
 import { TallyConnectCard } from "@/components/app/TallyConnectCard";
 
@@ -24,11 +25,13 @@ export function Dashboard() {
           <TabsTrigger value="invoices">Invoices</TabsTrigger>
           <TabsTrigger value="payments">Payments</TabsTrigger>
           <TabsTrigger value="customers">Customers</TabsTrigger>
+          <TabsTrigger value="tally">Tally data</TabsTrigger>
         </TabsList>
         <TabsContent value="apply" className="mt-6"><ApplyPaymentPanel /></TabsContent>
         <TabsContent value="invoices" className="mt-6"><InvoicesPanel /></TabsContent>
         <TabsContent value="payments" className="mt-6"><PaymentsPanel /></TabsContent>
         <TabsContent value="customers" className="mt-6"><CustomersPanel /></TabsContent>
+        <TabsContent value="tally" className="mt-6"><TallyDataPanel /></TabsContent>
       </Tabs>
     </div>
   );
