@@ -12,14 +12,16 @@ export function requestIdOf(req: Request): string {
   return (req.headers["x-request-id"] as string) || (req as any).requestId || "-";
 }
 
-export function logInfo(scope: string, req: Request | null, message: string): void {
+export function logInfo(scope: string, req: Request | null, message: string, meta?: unknown): void {
   const rid = req ? requestIdOf(req) : "-";
-  console.log(`[tally][${scope}][${rid}] ${message}`);
+  const suffix = meta !== undefined ? ` ${JSON.stringify(meta)}` : "";
+  console.log(`[tally][${scope}][${rid}] ${message}${suffix}`);
 }
 
-export function logWarn(scope: string, req: Request | null, message: string): void {
+export function logWarn(scope: string, req: Request | null, message: string, meta?: unknown): void {
   const rid = req ? requestIdOf(req) : "-";
-  console.warn(`[tally][${scope}][${rid}] ${message}`);
+  const suffix = meta !== undefined ? ` ${JSON.stringify(meta)}` : "";
+  console.warn(`[tally][${scope}][${rid}] ${message}${suffix}`);
 }
 
 export function logError(scope: string, req: Request | null, message: string, err?: unknown): void {

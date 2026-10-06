@@ -13,8 +13,8 @@ import { processBatch } from "../services/batch.service.js";
 import { buildConnectorConfig } from "../services/config.service.js";
 import { audit } from "../services/audit.service.js";
 import { logInfo, logError } from "../utils/logger.js";
-import { AuthManager } from "../auth/auth-manager";
-import { getAccessToken, resetAccessTokenCache } from "../token-cache";
+import { AuthManager } from "../auth/auth-manager.js";
+import { getAccessToken, resetAccessTokenCache } from "../token-cache.js";
 import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
 
 const router = Router();
@@ -312,8 +312,10 @@ router.post("/sync/batch", rateLimiters.batch, async (req: Request, res: Respons
         // Success (or no auth error) - break out of retry loop
         break;
       } catch (processErr: any) {
-        const processError = processErr instanceof ApiError ? processErr : new Error(String(processErr));
-        const errCode = processError.code;
+        const errCode: string | undefined =
+          processErr instanceof ApiError
+            ? processErr.code
+            : (processErr as Error & { code?: string })?.code;
 
         // If we got an authentication error, try to refresh the token and retry
         if ((errCode === "AUTHENTICATION_FAILED" || errCode === "TOKEN_EXPIRED") && retryCount < maxRetries) {
@@ -345,7 +347,7 @@ router.post("/sync/batch", rateLimiters.batch, async (req: Request, res: Respons
             const fresh = await auth.refreshAccessToken(
               connectorRow.refresh_token_hash,
               connectorRow.device_id,
-              connectorRow.connectorId!
+              connectorRow.connector_id!
             );
 
             // Reset the token cache with the fresh token

@@ -1,7 +1,4 @@
-import { verifyAccessToken, verifyRefreshToken, WzErrorCode, sendWzError, type Request } from "../../whizunik/auth.js";
-import { sendError, ApiError, ERROR_CODES } from "../errors.js";
 import db from "../../../db/index.js";
-import type { Response } from "express";
 
 /**
  * AuthManager handles access token management for the WhizUnik connector.
