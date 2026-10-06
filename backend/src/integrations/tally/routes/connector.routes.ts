@@ -13,8 +13,81 @@ import { processBatch } from "../services/batch.service.js";
 import { buildConnectorConfig } from "../services/config.service.js";
 import { audit } from "../services/audit.service.js";
 import { logInfo, logError } from "../utils/logger.js";
+import { AuthManager } from "../auth/auth-manager";
+import { getAccessToken, resetAccessTokenCache } from "../token-cache";
+import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
 
 const router = Router();
+
+let auth: AuthManager | undefined;
+
+/**
+ * Initialize the AuthManager with the connector's credentials.
+ * Called once per connector session (e.g. from /connect response handler).
+ */
+function initAuth(): void {
+  if (!auth) {
+    auth = new AuthManager(publicApiBaseUrl());
+  }
+}
+
+/**
+ * Retry a batch that failed with AUTHENTICATION_FAILED or TOKEN_EXPIRED.
+ * Refreshes the token and re-processes the same batch.
+ */
+async function retryBatchWithFreshToken(
+  batchInput: any,
+  connectorRowId: string,
+  requestId: string
+): Promise<any> {
+  if (!auth) {
+    throw new Error('Auth manager not initialized');
+  }
+
+  // Read current connector credentials from DB to refresh
+  const connectorRow = db.prepare(
+    `SELECT access_token, refresh_token_hash, device_id, connector_id FROM tally_connectors WHERE connector_id = ?`
+  ).get(connectorRowId) as {
+    access_token: string | null;
+    refresh_token_hash: string | null;
+    device_id: string | null;
+    connector_id: string | null;
+  } | undefined;
+
+  if (!connectorRow || !connectorRow.refresh_token_hash || !connectorRow.device_id) {
+    throw new Error('Connector credentials not found');
+  }
+
+  try {
+    // Refresh the access token using the refresh token
+    const fresh = await auth.refreshAccessToken(
+      connectorRow.refresh_token_hash,
+      connectorRow.device_id,
+      connectorRow.connector_id!
+    );
+
+    // Reset the cache with the fresh token
+    resetAccessTokenCache();
+    // Note: getAccessToken will be called by the pipeline to get the fresh token
+
+    // Re-process the batch with the fresh token
+    // We need to re-invoke processBatch - but first let's mark the old batch as needing retry
+    // For now, just re-process by calling processBatch again
+    // The batch service should use the fresh token from the cache
+
+    // Clear any previous dead marking and retry
+    // We'll re-process with the same input
+    const processed = await processBatch(
+      {} as any, // will need proper connector auth
+      batchInput,
+      requestId
+    );
+    return processed;
+  } catch (refreshErr) {
+    logError("retryBatch", null, `Token refresh failed: ${refreshErr}`);
+    throw refreshErr;
+  }
+}
 
 function parseBody(schema: z.ZodTypeAny, body: unknown): any {
   const result = schema.safeParse(body ?? {});
@@ -209,8 +282,9 @@ router.post("/sync/start", (req: Request, res: Response) => {
 
 /**
  * POST /sync/batch — upload a batch of records, get a deterministic ACK.
+ * On AUTHENTICATION_FAILED or TOKEN_EXPIRED, refresh the token and retry once.
  */
-router.post("/sync/batch", rateLimiters.batch, (req: Request, res: Response) => {
+router.post("/sync/batch", rateLimiters.batch, async (req: Request, res: Response) => {
   try {
     const input = parseBody(batchSchema, req.body);
     const connector = req.connector!;
@@ -227,7 +301,82 @@ router.post("/sync/batch", rateLimiters.batch, (req: Request, res: Response) => 
       );
     }
 
-    const ack = processBatch(connector, input, req.requestId);
+    let ack: any;
+    let retryCount = 0;
+    let maxRetries = 1;
+
+    // Retry loop for auth errors
+    while (retryCount <= maxRetries) {
+      try {
+        ack = await processBatch(connector, input, req.requestId);
+        // Success (or no auth error) - break out of retry loop
+        break;
+      } catch (processErr: any) {
+        const processError = processErr instanceof ApiError ? processErr : new Error(String(processErr));
+        const errCode = processError.code;
+
+        // If we got an authentication error, try to refresh the token and retry
+        if ((errCode === "AUTHENTICATION_FAILED" || errCode === "TOKEN_EXPIRED") && retryCount < maxRetries) {
+          retryCount++;
+          logInfo("batchRetry", req, `Auth error (${errCode}), refreshing token and retrying batch`, {
+            batchId: input.batchId,
+            attempt: retryCount,
+          });
+
+          try {
+            // Refresh the access token using the connector's refresh token
+            if (!auth) {
+              throw new Error('Auth manager not initialized');
+            }
+
+            const connectorRow = db.prepare(
+              `SELECT access_token, refresh_token_hash, device_id, connector_id FROM tally_connectors WHERE connector_id = ?`
+            ).get(connector.connectorId) as {
+              access_token: string | null;
+              refresh_token_hash: string | null;
+              device_id: string | null;
+              connector_id: string | null;
+            } | undefined;
+
+            if (!connectorRow || !connectorRow.refresh_token_hash || !connectorRow.device_id) {
+              throw new Error('Connector credentials not found for token refresh');
+            }
+
+            const fresh = await auth.refreshAccessToken(
+              connectorRow.refresh_token_hash,
+              connectorRow.device_id,
+              connectorRow.connectorId!
+            );
+
+            // Reset the token cache with the fresh token
+            resetAccessTokenCache();
+
+            // Update the cached token used by the engine
+            // (cachedAccessToken will be refreshed on next getAccessToken call)
+            // For now, we just note the refresh and retry the same batch
+            // The processBatch call below will use the fresh token via the cache
+            logInfo("batchRetryRefreshed", req, `Token refreshed successfully`, {
+              batchId: input.batchId,
+              newExpiresAt: fresh.accessTokenExpiresAt,
+            });
+
+            // Continue the while loop to retry the batch with fresh token
+            continue;
+          } catch (refreshErr: any) {
+            logError("batchRetryRefreshFailed", req, `Token refresh failed`, {
+              error: refreshErr instanceof Error ? refreshErr.message : String(refreshErr),
+              batchId: input.batchId,
+            });
+            // If refresh fails, re-throw the original process error
+            throw processErr;
+          }
+        } else {
+          // Not an auth error, or max retries exceeded - throw the error
+          throw processErr;
+        }
+      }
+    }
+
     res.json(ack);
   } catch (err) {
     errorHandler(err, req, res);

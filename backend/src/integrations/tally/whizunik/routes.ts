@@ -418,6 +418,8 @@ router.post(
       }
       const input = parsed.data;
       const claims = (req as Request & { wzClaims?: AccessClaims }).wzClaims!;
+      // Ensure tallyVersion is always a string (never null) for the DB column
+      const tallyVersion = input.tallyVersion ?? '';
       if (input.connectorId !== claims.connectorId) {
         sendWzError(res, "AUTHENTICATION_FAILED", "Connector mismatch");
         return;
@@ -426,7 +428,7 @@ router.post(
         db.prepare(
           `UPDATE connectors SET last_heartbeat = datetime('now'), app_version = ?, protocol_version = ?, tally_version = ?, status = 'active', updated_at = datetime('now')
            WHERE connector_id = ?`
-        ).run(input.appVersion, input.protocolVersion, input.tallyVersion ?? null, claims.connectorId);
+        ).run(input.appVersion, input.protocolVersion, tallyVersion, claims.connectorId);
         if (input.status === "running" && input.currentSync) {
           db.prepare(`UPDATE connectors SET last_sync = datetime('now') WHERE connector_id = ?`).run(claims.connectorId);
         }
