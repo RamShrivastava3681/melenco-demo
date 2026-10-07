@@ -556,6 +556,9 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
       db.prepare(`INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)`).run(
         cid("cust-nogst"), userId, "Phase3 No GSTIN"
       );
+      db.prepare(`INSERT INTO customers (id, user_id, name, gstin) VALUES (?, ?, ?, ?)`).run(
+        cid("cust-badgst"), userId, "Phase3 Bad GSTIN", "BOGUS"
+      );
       db.prepare(`INSERT INTO suppliers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         cid("supp-1"), userId, "Phase3 Supplier One", "27ABCDE1234F2Z3", "ABCDE1234G",
         "7 Supply Lane", "Maharashtra", "400001", "9123456780", "supp@example.com", "Net 15"
@@ -600,6 +603,7 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
             { kind: "supplier", id: cid("supp-1") },
             { kind: "sku", id: cid("sku-1") },
             { kind: "customer", id: cid("cust-nogst") },
+            { kind: "customer", id: cid("cust-badgst") },
             { kind: "sku", id: cid("sku-badrate") },
             { kind: "sku", id: cid("sku-nounit") },
             { kind: "customer", id: cid("cust-1") },
@@ -607,10 +611,11 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
           ],
         });
       expect(push.status).toBe(201);
-      expect(push.body.queuedCount).toBe(3);
+      // GSTIN is optional (B2C / unregistered): cust-nogst queues fine.
+      expect(push.body.queuedCount).toBe(4);
       expect(push.body.rejectedCount).toBe(5);
       const reasons = Object.fromEntries(push.body.rejected.map((r: { id: string; reason: string }) => [r.id, r.reason]));
-      expect(reasons[cid("cust-nogst")]).toMatch(/gstin/i);
+      expect(reasons[cid("cust-badgst")]).toMatch(/gstin/i);
       expect(reasons[cid("sku-badrate")]).toMatch(/gstRate/i);
       expect(reasons[cid("sku-nounit")]).toMatch(/unit/i);
       expect(reasons["t1-does-not-exist"]).toMatch(/not found/i);
@@ -626,7 +631,8 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
       expect(byId[cid("cust-1")]).toBe("QUEUED");
       expect(byId[cid("supp-1")]).toBe("QUEUED");
       expect(byId[cid("sku-1")]).toBe("QUEUED");
-      expect(byId[cid("cust-nogst")]).toBe("FAILED");
+      expect(byId[cid("cust-nogst")]).toBe("QUEUED");
+      expect(byId[cid("cust-badgst")]).toBe("FAILED");
       expect(byId[cid("sku-badrate")]).toBe("FAILED");
       expect(byId[cid("sku-nounit")]).toBe("FAILED");
     });

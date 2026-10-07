@@ -139,16 +139,32 @@ export const VALID_GST_RATES = [0, 5, 12, 18, 28] as const;
 
 export const MASTER_KINDS = ["customer", "supplier", "sku"] as const;
 
+// Empty strings from the DB/client mean "not provided" — normalize to
+// undefined before validation so optional fields accept "", null and missing.
+// GSTIN itself is optional: B2C / unregistered dealers have no GSTIN and
+// Tally accepts ledgers without one (only validated when present).
+const emptyToUndef = (v: unknown): unknown =>
+  typeof v === "string" && v.trim() === "" ? undefined : v;
+
 const masterPartyFields = {
   name: z.string().trim().min(1).max(200),
-  gstin: z.string().trim().toUpperCase().regex(GSTIN_REGEX, "gstin must be a valid 15-character GSTIN"),
-  pan: z.string().trim().toUpperCase().regex(PAN_REGEX, "pan must match ABCDE1234F").nullish(),
-  address: z.string().trim().max(500).nullish(),
-  state: z.string().trim().max(100).nullish(),
-  pin: z.string().trim().max(20).nullish(),
-  phone: z.string().trim().max(40).nullish(),
-  email: z.string().trim().email("email must be a valid email address").max(200).nullish(),
-  paymentTerms: z.string().trim().max(200).nullish(),
+  gstin: z.preprocess(
+    emptyToUndef,
+    z.string().trim().toUpperCase().regex(GSTIN_REGEX, "gstin must be a valid 15-character GSTIN").nullish()
+  ),
+  pan: z.preprocess(
+    emptyToUndef,
+    z.string().trim().toUpperCase().regex(PAN_REGEX, "pan must match ABCDE1234F").nullish()
+  ),
+  address: z.preprocess(emptyToUndef, z.string().trim().max(500).nullish()),
+  state: z.preprocess(emptyToUndef, z.string().trim().max(100).nullish()),
+  pin: z.preprocess(emptyToUndef, z.string().trim().max(20).nullish()),
+  phone: z.preprocess(emptyToUndef, z.string().trim().max(40).nullish()),
+  email: z.preprocess(
+    emptyToUndef,
+    z.string().trim().email("email must be a valid email address").max(200).nullish()
+  ),
+  paymentTerms: z.preprocess(emptyToUndef, z.string().trim().max(200).nullish()),
 };
 
 export const wzMasterCustomerSchema = z.object({ ...masterPartyFields });
@@ -158,7 +174,10 @@ export const wzMasterSupplierSchema = z.object({ ...masterPartyFields });
 export const wzMasterSkuSchema = z.object({
   skuCode: z.string().trim().min(1).max(100),
   name: z.string().trim().min(1).max(200),
-  hsn: z.string().trim().regex(/^\d{4,8}$/, "hsn must be 4–8 digits").nullish(),
+  hsn: z.preprocess(
+    emptyToUndef,
+    z.string().trim().regex(/^\d{4,8}$/, "hsn must be 4–8 digits").nullish()
+  ),
   gstRate: z.number().refine((n) => (VALID_GST_RATES as readonly number[]).includes(n), {
     message: `gstRate must be one of ${VALID_GST_RATES.join(", ")}`,
   }),
