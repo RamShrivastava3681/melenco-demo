@@ -255,6 +255,60 @@ export const api = {
       body: JSON.stringify({ connectorId }),
     }),
 
+  // ── Phase 3: WhizUnik → Tally master sync ──
+  getMasterStatus: (params?: { kind?: string; status?: string; limit?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.kind) search.set("kind", params.kind);
+    if (params?.status) search.set("status", params.status);
+    if (params?.limit) search.set("limit", String(params.limit));
+    const qs = search.toString();
+    return request<{
+      masters: Array<{
+        kind: string;
+        id: string;
+        name: string;
+        displayName: string;
+        version: number;
+        status: string;
+        tallyName: string | null;
+        tallyMasterId: string | null;
+        attempts: number;
+        lastError: string | null;
+        idempotencyKey: string | null;
+        requestId: string | null;
+        updatedAt: string | null;
+      }>;
+    }>(`/integrations/tally/masters/status${qs ? `?${qs}` : ""}`);
+  },
+
+  pushMasters: (data: { connectorId: string; companyId: string; items: Array<{ kind: string; id: string }> }) =>
+    request<{
+      connectorId: string;
+      queued: Array<{ id: string; kind: string; commandId: string; idempotencyKey: string }>;
+      rejected: Array<{ id: string; kind: string; reason: string }>;
+      queuedCount: number;
+      rejectedCount: number;
+    }>("/integrations/tally/masters/push", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getMasterAttempts: (kind: string, id: string) =>
+    request<{
+      attempts: Array<{
+        id: string;
+        connector_id: string;
+        tally_status: string;
+        success: number;
+        error_message: string | null;
+        retry_count: number;
+        requested_at: string;
+        responded_at: string | null;
+        requestPayload: unknown;
+        responsePayload: unknown;
+      }>;
+    }>(`/integrations/tally/masters/attempts?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`),
+
   // ── Tally Cloud API info (points at https://excel.frillchills.com/api) ──
   getTallyInfo: () =>
     request<{

@@ -187,6 +187,8 @@ export async function createTestDatabase(): Promise<void> {
   ensureMigrationsTable();
   ensureTallySchema();
   ensureWhizunikSchema();
+  // Phase 3 master-sync fields (must run after the tally tables exist)
+  migratePhase3MasterFields();
   db.run("PRAGMA foreign_keys = ON");
 }
 
@@ -263,6 +265,59 @@ function migrateTableSafe(
   db.run(`ALTER TABLE ${newName} RENAME TO ${table}`);
 
   console.log(`  ✅ Done: ${label}`);
+}
+
+/** Phase 3: add a column when it does not exist yet (idempotent, FK-safe). */
+function addColumnIfMissing(table: string, column: string, definition: string): void {
+  try {
+    const sets = exec(`PRAGMA table_info(${table})`);
+    const names = new Set<string>();
+    for (const s of sets) {
+      for (const v of (s as { values: unknown[][] }).values) names.add(String(v[1]));
+    }
+    if (names.size === 0) return; // table does not exist (yet)
+    if (!names.has(column)) db.run(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  } catch {
+    // Best-effort: a missing column surfaces clearly at query time.
+  }
+}
+
+/**
+ * Phase 3 (WhizUnik → Tally master sync): extend the master tables with the
+ * synchronised fields. Pure ADD COLUMN — existing rows keep their data and
+ * the UNIQUE(user_id, name) constraints are untouched.
+ */
+function migratePhase3MasterFields(): void {
+  const MIGRATION_NAME = "v6_phase3_master_fields";
+  if (isMigrationApplied(MIGRATION_NAME)) return;
+
+  const partyColumns: Array<[string, string]> = [
+    ["gstin", "gstin TEXT"],
+    ["pan", "pan TEXT"],
+    ["address", "address TEXT"],
+    ["state", "state TEXT"],
+    ["pin", "pin TEXT"],
+    ["phone", "phone TEXT"],
+    ["email", "email TEXT"],
+    ["payment_terms", "payment_terms TEXT"],
+    ["version", "version INTEGER NOT NULL DEFAULT 1"],
+  ];
+  for (const [table, ,] of [["customers"], ["suppliers"]] as Array<[string]>) {
+    for (const [column, definition] of partyColumns) addColumnIfMissing(table, column, definition);
+  }
+  const productColumns: Array<[string, string]> = [
+    ["sku_code", "sku_code TEXT"],
+    ["hsn", "hsn TEXT"],
+    ["gst_rate", "gst_rate REAL"],
+    ["version", "version INTEGER NOT NULL DEFAULT 1"],
+  ];
+  for (const [column, definition] of productColumns) addColumnIfMissing("products", column, definition);
+
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_customers_gstin ON customers(user_id, gstin)"); } catch {}
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_suppliers_gstin ON suppliers(user_id, gstin)"); } catch {}
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_products_sku ON products(user_id, sku_code)"); } catch {}
+
+  markMigrationApplied(MIGRATION_NAME);
 }
 
 /** Migrate CHECK constraints on invoices, payments, and payment_allocations
@@ -587,6 +642,9 @@ export async function initializeDatabase(): Promise<void> {
   // TallyPrime cloud integration schema (idempotent)
   ensureTallySchema();
   ensureWhizunikSchema();
+
+  // Phase 3 master-sync fields (must run after the tally tables exist)
+  migratePhase3MasterFields();
 
   console.log("✅ Schema migrations complete.");
 

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
+import db from "../../../db/index.js";
 
 const DEFAULT_JWT_SECRET = "change-me-to-a-random-secret-in-production";
 
@@ -143,6 +144,20 @@ export function wzAuthMiddleware(req: Request, res: Response, next: NextFunction
   }
   try {
     const claims = verifyAccessToken(token);
+    // Disconnected devices stop here: a revoked connector's JWT is dead
+    // immediately, not just at the next refresh.
+    try {
+      const row = db.prepare(`SELECT status FROM connectors WHERE connector_id = ?`).get(claims.connectorId) as
+        | { status: string }
+        | undefined;
+      if (!row || row.status !== "active") {
+        sendWzError(res, "AUTHENTICATION_FAILED", "Connector has been revoked");
+        return;
+      }
+    } catch {
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      return;
+    }
     (req as Request & { wzClaims?: AccessClaims }).wzClaims = claims;
     next();
   } catch (e: unknown) {

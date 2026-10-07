@@ -351,7 +351,7 @@ export const whizunikOpenApi = {
                 required: ["connectorId", "command"],
                 properties: {
                   connectorId: { type: "string" },
-                  command: { type: "string", enum: ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG"] },
+                  command: { type: "string", enum: ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS", "PUSH_MASTERS"] },
                   payload: { type: "object", additionalProperties: true },
                 },
               },
@@ -427,7 +427,21 @@ export const whizunikOpenApi = {
               schema: {
                 type: "object",
                 required: ["commandId", "status"],
-                properties: { commandId: { type: "string" }, status: { type: "string", enum: ["DONE", "CANCELLED"] } },
+                properties: {
+                  commandId: { type: "string" },
+                  status: { type: "string", enum: ["DONE", "CANCELLED"] },
+                  result: {
+                    type: "object",
+                    description: "Phase 3 master result: outcome drives the per-master link status",
+                    properties: {
+                      outcome: { type: "string", enum: ["synced", "linked", "failed", "needs_review"] },
+                      tallyName: { type: "string" },
+                      tallyMasterId: { type: "string" },
+                      error: { type: "string" },
+                    },
+                    additionalProperties: true,
+                  },
+                },
               },
             },
           },
@@ -440,6 +454,107 @@ export const whizunikOpenApi = {
                 schema: {
                   type: "object",
                   properties: { id: { type: "string" }, status: { type: "string" } },
+                },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/Error400" },
+          "401": { $ref: "#/components/responses/Error401" },
+        },
+      },
+    },
+    "/api/integrations/tally/masters/push": {
+      post: {
+        summary: "Phase 3: queue WhizUnik masters (customers, suppliers, SKUs) for Tally",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["connectorId", "companyId", "items"],
+                properties: {
+                  connectorId: { type: "string" },
+                  companyId: { type: "string" },
+                  items: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["kind", "id"],
+                      properties: {
+                        kind: { type: "string", enum: ["customer", "supplier", "sku"] },
+                        id: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
+              example: {
+                connectorId: "wz-connector-001",
+                companyId: "whiz-company-1",
+                items: [{ kind: "customer", id: "cust-001" }, { kind: "sku", id: "sku-001" }],
+              },
+            },
+          },
+        },
+        responses: {
+          "201": {
+            description: "Queued (one PUSH_MASTERS command per valid item; invalid items reported)",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    connectorId: { type: "string" },
+                    queued: { type: "array", items: { type: "object", additionalProperties: true } },
+                    rejected: { type: "array", items: { type: "object", additionalProperties: true } },
+                    queuedCount: { type: "integer" },
+                    rejectedCount: { type: "integer" },
+                  },
+                },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/Error400" },
+          "401": { $ref: "#/components/responses/Error401" },
+          "404": { $ref: "#/components/responses/Error404" },
+        },
+      },
+    },
+    "/api/integrations/tally/masters/status": {
+      get: {
+        summary: "Phase 3: per-master sync state (NOT_SYNCED, QUEUED, SENDING, SYNCED, FAILED, NEEDS_REVIEW)",
+        responses: {
+          "200": {
+            description: "Master states",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    masters: { type: "array", items: { type: "object", additionalProperties: true } },
+                  },
+                },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Error401" },
+        },
+      },
+    },
+    "/api/integrations/tally/masters/attempts": {
+      get: {
+        summary: "Phase 3: sync attempt evidence for one master (request/response payloads)",
+        responses: {
+          "200": {
+            description: "Attempt evidence, newest first",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    attempts: { type: "array", items: { type: "object", additionalProperties: true } },
+                  },
                 },
               },
             },

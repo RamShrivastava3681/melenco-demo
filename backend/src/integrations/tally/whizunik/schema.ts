@@ -128,6 +128,58 @@ export function ensureWhizunikSchema(): void {
   `);
   try { db.run("CREATE INDEX IF NOT EXISTS idx_connector_commands_pending ON connector_commands(connector_id, status)"); } catch { /* noop */ }
 
+  // Phase 3 (WhizUnik → Tally master sync): per-master sync state, one row
+  // per (tenant, kind, whizunik record). Absence of a row means NOT_SYNCED.
+  // Status lifecycle: QUEUED → SENDING → SYNCED, with FAILED / NEEDS_REVIEW
+  // as terminal-until-retried states. Direction is always 'outbound' here.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS master_sync_links (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('customer','supplier','sku')),
+      whizunik_id TEXT NOT NULL,
+      tally_name TEXT,
+      tally_master_id TEXT,
+      version INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED','SENDING','SYNCED','FAILED','NEEDS_REVIEW')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      idempotency_key TEXT,
+      direction TEXT NOT NULL DEFAULT 'outbound',
+      request_id TEXT,
+      approved_by TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (tenant_id, kind, whizunik_id)
+    )
+  `);
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_master_links_status ON master_sync_links(tenant_id, status)"); } catch { /* noop */ }
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_master_links_idem ON master_sync_links(idempotency_key)"); } catch { /* noop */ }
+
+  // Phase 3 evidence log: every master sync attempt with request/response.
+  // Never stores secrets — request/response hold master fields + Tally XML only.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS master_sync_attempts (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      connector_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      whizunik_id TEXT NOT NULL,
+      company_id TEXT,
+      request_id TEXT,
+      idempotency_key TEXT,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      responded_at TEXT,
+      http_status INTEGER,
+      tally_status TEXT,
+      success INTEGER NOT NULL DEFAULT 0,
+      error_message TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      request_payload TEXT,
+      response_payload TEXT
+    )
+  `);
+  try { db.run("CREATE INDEX IF NOT EXISTS idx_master_attempts_lookup ON master_sync_attempts(tenant_id, kind, whizunik_id, requested_at)"); } catch { /* noop */ }
+
   markApplied();
 }
 

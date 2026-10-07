@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import db from "../../../db/index.js";
 import { requireAuth } from "../../../middleware/auth.js";
 import { rateLimiters } from "../middleware/rateLimiter.js";
 import { sendError, errorHandler } from "../errors.js";
@@ -99,7 +100,12 @@ router.get("/audit", requireAuth, (req: Request, res: Response) => {
 
 /**
  * POST /disconnect — revoke a connector (by public connector id or row id).
- * Active sessions are cancelled; the connector can no longer authenticate.
+ * Handles both connector generations:
+ *  - legacy tc_* rows in tally_connectors (revoked via revokeConnector)
+ *  - new-spec wz-connector-* rows in connectors (status → revoked,
+ *    refresh hash cleared, pending pushes cancelled)
+ * Active sessions are cancelled; the connector can no longer authenticate and
+ * disappears from the device list.
  */
 router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
   try {
@@ -108,22 +114,50 @@ router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
       return sendError(res, "INVALID_PAYLOAD", "connectorId is required", undefined, req.requestId);
     }
 
-    // Resolve public id → row id within this tenant only
+    // Resolve public id → row id within this tenant only (legacy table first)
     const row = listConnectorsForUser(req.user!.userId).find(
       (c) => c.connector_id === connectorId || c.id === connectorId
     );
-    if (!row) {
-      return sendError(res, "AUTHORIZATION_FAILED", "Connector not found for this account", undefined, req.requestId);
+    if (row) {
+      revokeConnector(req.user!.userId, row.id, req.requestId);
+      cancelActiveSessionsForConnector(row.id);
+      audit("CONNECTOR_DISCONNECTED", {
+        userId: req.user!.userId,
+        connectorId: row.connector_id,
+        requestId: req.requestId,
+      });
+      logInfo("disconnect", req, `Connector ${row.connector_id} revoked`);
+      res.json({ success: true });
+      return;
     }
 
-    revokeConnector(req.user!.userId, row.id, req.requestId);
-    cancelActiveSessionsForConnector(row.id);
-    audit("CONNECTOR_DISCONNECTED", {
-      userId: req.user!.userId,
-      connectorId: row.connector_id,
-      requestId: req.requestId,
-    });
-    logInfo("disconnect", req, `Connector ${row.connector_id} revoked`);
+    // New-spec (WhizUnik Cloud API) connector for this tenant?
+    const wz = db.prepare(
+      `SELECT id, connector_id, status FROM connectors WHERE tenant_id = ? AND (connector_id = ? OR id = ?)`
+    ).get(req.user!.userId, connectorId, connectorId) as
+      | { id: string; connector_id: string; status: string }
+      | undefined;
+    if (!wz) {
+      return sendError(res, "AUTHORIZATION_FAILED", "Connector not found for this account", undefined, req.requestId);
+    }
+    db.prepare(
+      `UPDATE connectors SET status = 'revoked', refresh_token_hash = NULL, updated_at = datetime('now') WHERE id = ?`
+    ).run(wz.id);
+    // Stale queued pushes for a dead device must not linger as PENDING.
+    try {
+      db.prepare(
+        `UPDATE connector_commands SET status = 'CANCELLED', completed_at = datetime('now')
+         WHERE connector_id = ? AND status IN ('PENDING', 'DELIVERED')`
+      ).run(wz.connector_id);
+    } catch { /* commands table always exists with the whizunik schema; ignore */ }
+    try {
+      audit("CONNECTOR_DISCONNECTED", {
+        userId: req.user!.userId,
+        connectorId: wz.connector_id,
+        requestId: req.requestId,
+      });
+    } catch { /* audit must never break disconnect */ }
+    logInfo("disconnect", req, `Connector ${wz.connector_id} revoked`);
     res.json({ success: true });
   } catch (err) {
     errorHandler(err, req, res);

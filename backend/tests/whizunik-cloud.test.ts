@@ -4,6 +4,7 @@ import { createApp } from "../src/app.js";
 import { initTestDb } from "./setup.js";
 import { signupUser, freshRateLimits, type UserCtx } from "./helpers.js";
 import { resetWzRateLimits } from "../src/integrations/tally/whizunik/auth.js";
+import db from "../src/db/index.js";
 
 let app: ReturnType<typeof createApp>;
 let user: UserCtx;
@@ -438,5 +439,282 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
       .set("Authorization", `Bearer ${user.token}`)
       .send({ connectorId: "wz-connector-nope", command: "REBOOT_PC" });
     expect(bad.status).toBe(400);
+  });
+
+  it("disconnect revokes a new-spec connector: device vanishes, tokens die", async () => {
+    // Fresh user → isolated tenant, so the device list has no leftovers
+    // from other tests in this file.
+    const u = await signupUser(app, "disconnect-wz@example.com");
+    // Pair without an explicit tenantId so the tenant equals this user's id
+    // (the /disconnect lookup is tenant-scoped to the JWT user).
+    const pcRes = await request(app)
+      .post("/api/integrations/tally/admin/pairing-codes")
+      .set("Authorization", `Bearer ${u.token}`)
+      .send({ companyName: "Disconnect Co" });
+    expect(pcRes.status).toBe(201);
+    const c = await request(app).post("/api/integrations/tally/connect").send(connectBody(pcRes.body.pairingCode));
+    expect(c.status).toBe(200);
+    const connectorAuth = `Bearer ${c.body.accessToken}`;
+
+    // Sanity: device is listed and usable before disconnect.
+    const before = await request(app).get("/api/integrations/tally/status").set("Authorization", `Bearer ${u.token}`);
+    expect(before.body.connected).toBe(true);
+    expect(before.body.connectors.some((x: { connectorId: string }) => x.connectorId === c.body.connectorId)).toBe(true);
+
+    const disc = await request(app)
+      .post("/api/integrations/tally/disconnect")
+      .set("Authorization", `Bearer ${u.token}`)
+      .send({ connectorId: c.body.connectorId });
+    expect(disc.status).toBe(200);
+    expect(disc.body.success).toBe(true);
+
+    // Device is gone from the list; tenant shows disconnected with no stale banner.
+    const after = await request(app).get("/api/integrations/tally/status").set("Authorization", `Bearer ${u.token}`);
+    expect(after.body.connectors).toEqual([]);
+    expect(after.body.connected).toBe(false);
+    expect(after.body.lastConnection).toBeNull();
+
+    // Live access token is dead immediately (not just at refresh).
+    const batch = await request(app).post("/api/integrations/tally/sync/batch").set("Authorization", connectorAuth).send({
+      batchId: "dead_batch_001",
+      requestId: "dead_req_001",
+      syncId: "dead_sync_1",
+      deviceId: DEVICE_ID,
+      companyId: c.body.companyMapping.whizunikCompanyId,
+      entityType: "ledger",
+      batchNumber: 1,
+      totalBatches: 1,
+      records: [],
+    });
+    expect(batch.status).toBe(401);
+    expect(batch.body.error.code).toBe("AUTHENTICATION_FAILED");
+
+    const hb = await request(app).post("/api/integrations/tally/heartbeat").set("Authorization", connectorAuth).send({
+      connectorId: c.body.connectorId,
+      deviceId: DEVICE_ID,
+      appVersion: "1.0.0",
+      protocolVersion: "1.0",
+      status: "idle",
+    });
+    expect(hb.status).toBe(401);
+
+    // Refresh is dead too.
+    const token = await request(app).post("/api/integrations/tally/token").send({
+      refreshToken: c.body.refreshToken,
+      deviceId: DEVICE_ID,
+      connectorId: c.body.connectorId,
+    });
+    expect(token.status).toBe(401);
+
+    // Disconnecting an unknown connector is a 403, not a crash.
+    const unknown = await request(app)
+      .post("/api/integrations/tally/disconnect")
+      .set("Authorization", `Bearer ${u.token}`)
+      .send({ connectorId: "wz-connector-nope" });
+    expect(unknown.status).toBe(403);
+  });
+
+  it("re-pairing the same device supersedes the old connector (no ghost devices)", async () => {
+    const u = await signupUser(app, "supersede-wz@example.com");
+    const pc1 = await request(app)
+      .post("/api/integrations/tally/admin/pairing-codes")
+      .set("Authorization", `Bearer ${u.token}`)
+      .send({ companyName: "Supersede Co" });
+    const first = await request(app).post("/api/integrations/tally/connect").send(connectBody(pc1.body.pairingCode));
+    expect(first.status).toBe(200);
+
+    const pc2 = await request(app)
+      .post("/api/integrations/tally/admin/pairing-codes")
+      .set("Authorization", `Bearer ${u.token}`)
+      .send({ companyName: "Supersede Co" });
+    const second = await request(app).post("/api/integrations/tally/connect").send(connectBody(pc2.body.pairingCode));
+    expect(second.status).toBe(200);
+    expect(second.body.connectorId).not.toBe(first.body.connectorId);
+
+    // Only the newest device row for this tenant is listed…
+    const status = await request(app).get("/api/integrations/tally/status").set("Authorization", `Bearer ${u.token}`);
+    expect(status.body.connectors.map((x: { connectorId: string }) => x.connectorId)).toEqual([
+      second.body.connectorId,
+    ]);
+
+    // …and the old token no longer authenticates.
+    const stale = await request(app)
+      .get("/api/integrations/tally/commands/pending")
+      .set("Authorization", `Bearer ${first.body.accessToken}`);
+    expect(stale.status).toBe(401);
+  });
+
+  describe("phase 3: WhizUnik → Tally master sync", () => {
+    // NOTE: the in-memory DB is shared across tests in this file, so every
+    // seeded id is prefixed per test.
+    async function seedPhase3Tenant(userId: string, p: string) {
+      const cid = (s: string) => `${p}-${s}`;
+      db.prepare(`INSERT INTO customers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cid("cust-1"), userId, "Phase3 Customer One", "29ABCDE1234F1Z5", "ABCDE1234F",
+        "42 Test Street", "Karnataka", "560001", "9876543210", "one@example.com", "Net 30"
+      );
+      db.prepare(`INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)`).run(
+        cid("cust-nogst"), userId, "Phase3 No GSTIN"
+      );
+      db.prepare(`INSERT INTO suppliers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cid("supp-1"), userId, "Phase3 Supplier One", "27ABCDE1234F2Z3", "ABCDE1234G",
+        "7 Supply Lane", "Maharashtra", "400001", "9123456780", "supp@example.com", "Net 15"
+      );
+      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cid("sku-1"), userId, "Phase3 Widget", "P3-WIDGET-001", "8471", 18, "Nos", "Phase3 Goods"
+      );
+      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cid("sku-badrate"), userId, "Phase3 Bad Rate", "P3-BADRATE-001", "8471", 99, "Nos", "Phase3 Goods"
+      );
+      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        cid("sku-nounit"), userId, "Phase3 No Unit", "P3-NOUNIT-001", "8471", 12, null, "Phase3 Goods"
+      );
+      return cid;
+    }
+
+    async function pairPhase3Tenant(userToken: string) {
+      const pcRes = await request(app)
+        .post("/api/integrations/tally/admin/pairing-codes")
+        .set("Authorization", `Bearer ${userToken}`)
+        .send({ companyName: "Phase3 Co" });
+      expect(pcRes.status).toBe(201);
+      const c = await request(app).post("/api/integrations/tally/connect").send(connectBody(pcRes.body.pairingCode));
+      expect(c.status).toBe(200);
+      return c.body as { connectorId: string; accessToken: string; refreshToken: string; companyMapping: { whizunikCompanyId: string } };
+    }
+
+    it("queues valid masters, rejects invalid ones with reasons", async () => {
+      const u = await signupUser(app, "masters-p3@example.com");
+      const cid = await seedPhase3Tenant(u.userId, "t1");
+      const c = await pairPhase3Tenant(u.token);
+      const companyId = c.companyMapping.whizunikCompanyId;
+
+      const push = await request(app)
+        .post("/api/integrations/tally/masters/push")
+        .set("Authorization", `Bearer ${u.token}`)
+        .send({
+          connectorId: c.connectorId,
+          companyId,
+          items: [
+            { kind: "customer", id: cid("cust-1") },
+            { kind: "supplier", id: cid("supp-1") },
+            { kind: "sku", id: cid("sku-1") },
+            { kind: "customer", id: cid("cust-nogst") },
+            { kind: "sku", id: cid("sku-badrate") },
+            { kind: "sku", id: cid("sku-nounit") },
+            { kind: "customer", id: cid("cust-1") },
+            { kind: "customer", id: "t1-does-not-exist" },
+          ],
+        });
+      expect(push.status).toBe(201);
+      expect(push.body.queuedCount).toBe(3);
+      expect(push.body.rejectedCount).toBe(5);
+      const reasons = Object.fromEntries(push.body.rejected.map((r: { id: string; reason: string }) => [r.id, r.reason]));
+      expect(reasons[cid("cust-nogst")]).toMatch(/gstin/i);
+      expect(reasons[cid("sku-badrate")]).toMatch(/gstRate/i);
+      expect(reasons[cid("sku-nounit")]).toMatch(/unit/i);
+      expect(reasons["t1-does-not-exist"]).toMatch(/not found/i);
+      // Idempotency keys follow the spec format.
+      for (const q of push.body.queued) {
+        expect(q.idempotencyKey).toMatch(/^(customer|supplier|sku):t1-.+:1$/);
+      }
+
+      // Status endpoint: QUEUED for valid, FAILED for invalid.
+      const st = await request(app).get("/api/integrations/tally/masters/status").set("Authorization", `Bearer ${u.token}`);
+      expect(st.status).toBe(200);
+      const byId = Object.fromEntries(st.body.masters.map((m: { id: string; status: string }) => [m.id, m.status]));
+      expect(byId[cid("cust-1")]).toBe("QUEUED");
+      expect(byId[cid("supp-1")]).toBe("QUEUED");
+      expect(byId[cid("sku-1")]).toBe("QUEUED");
+      expect(byId[cid("cust-nogst")]).toBe("FAILED");
+      expect(byId[cid("sku-badrate")]).toBe("FAILED");
+      expect(byId[cid("sku-nounit")]).toBe("FAILED");
+    });
+
+    it("poll → SENDING → ack drives SYNCED / NEEDS_REVIEW / FAILED + evidence", async () => {
+      const u = await signupUser(app, "masters-p3-flow@example.com");
+      const cid = await seedPhase3Tenant(u.userId, "t2");
+      const c = await pairPhase3Tenant(u.token);
+      const companyId = c.companyMapping.whizunikCompanyId;
+
+      await request(app).post("/api/integrations/tally/masters/push").set("Authorization", `Bearer ${u.token}`).send({
+        connectorId: c.connectorId,
+        companyId,
+        items: [{ kind: "customer", id: cid("cust-1") }, { kind: "supplier", id: cid("supp-1") }, { kind: "sku", id: cid("sku-1") }],
+      });
+
+      // Connector polls: 3 PUSH_MASTERS commands, links flip to SENDING.
+      const pending = await request(app).get("/api/integrations/tally/commands/pending").set("Authorization", `Bearer ${c.accessToken}`);
+      expect(pending.status).toBe(200);
+      const masters = pending.body.commands.filter((x: { command: string }) => x.command === "PUSH_MASTERS");
+      expect(masters.length).toBe(3);
+      expect(masters[0].payload.master.idempotencyKey).toMatch(/^customer:t2-cust-1:1$/);
+      expect(masters[0].payload.master.fields.gstin).toBe("29ABCDE1234F1Z5");
+
+      const sending = await request(app).get("/api/integrations/tally/masters/status?status=SENDING").set("Authorization", `Bearer ${u.token}`);
+      expect(sending.body.masters.length).toBe(3);
+
+      const cmdFor = (id: string) => masters.find((x: { payload: { master: { id: string } } }) => x.payload.master.id === id).id as string;
+
+      // Ack synced + linked.
+      const ack1 = await request(app).post("/api/integrations/tally/commands/ack").set("Authorization", `Bearer ${c.accessToken}`).send({
+        commandId: cmdFor(cid("cust-1")),
+        status: "DONE",
+        result: { outcome: "synced", tallyName: "Phase3 Customer One", tallyMasterId: "tally-ledger-1", responsePayload: "<ENVELOPE>ok</ENVELOPE>" },
+      });
+      expect(ack1.status).toBe(200);
+
+      // Ack needs_review (name match suggested).
+      const ack2 = await request(app).post("/api/integrations/tally/commands/ack").set("Authorization", `Bearer ${c.accessToken}`).send({
+        commandId: cmdFor(cid("supp-1")),
+        status: "DONE",
+        result: { outcome: "needs_review", error: "Name match suggested: Phase3 Supplier One", match: { tallyName: "Phase3 Supplier One" } },
+      });
+      expect(ack2.status).toBe(200);
+
+      // Ack failed (Tally LINEERROR).
+      const ack3 = await request(app).post("/api/integrations/tally/commands/ack").set("Authorization", `Bearer ${c.accessToken}`).send({
+        commandId: cmdFor(cid("sku-1")),
+        status: "CANCELLED",
+        result: { outcome: "failed", error: "Tally rejected unit", retryCount: 2 },
+      });
+      expect(ack3.status).toBe(200);
+
+      const st = await request(app).get("/api/integrations/tally/masters/status").set("Authorization", `Bearer ${u.token}`);
+      const byId = Object.fromEntries(st.body.masters.map((m: { id: string; status: string }) => [m.id, m]));
+      expect(byId[cid("cust-1")].status).toBe("SYNCED");
+      expect(byId[cid("cust-1")].tallyName).toBe("Phase3 Customer One");
+      expect(byId[cid("cust-1")].tallyMasterId).toBe("tally-ledger-1");
+      expect(byId[cid("supp-1")].status).toBe("NEEDS_REVIEW");
+      expect(byId[cid("sku-1")].status).toBe("FAILED");
+      expect(byId[cid("sku-1")].lastError).toBe("Tally rejected unit");
+
+      // Evidence log carries request/response per attempt.
+      const att = await request(app).get(`/api/integrations/tally/masters/attempts?kind=customer&id=${cid("cust-1")}`).set("Authorization", `Bearer ${u.token}`);
+      expect(att.status).toBe(200);
+      expect(att.body.attempts.length).toBe(1);
+      expect(att.body.attempts[0].success).toBe(1);
+      expect(att.body.attempts[0].requestPayload.master.fields.name).toBe("Phase3 Customer One");
+    });
+
+    it("rejects pushes for unknown connectors, companies and masters", async () => {
+      const u = await signupUser(app, "masters-p3-neg@example.com");
+      const cid = await seedPhase3Tenant(u.userId, "t3");
+      const c = await pairPhase3Tenant(u.token);
+
+      const badConn = await request(app).post("/api/integrations/tally/masters/push").set("Authorization", `Bearer ${u.token}`).send({
+        connectorId: "wz-connector-nope",
+        companyId: c.companyMapping.whizunikCompanyId,
+        items: [{ kind: "customer", id: cid("cust-1") }],
+      });
+      expect(badConn.status).toBe(404);
+
+      const badCo = await request(app).post("/api/integrations/tally/masters/push").set("Authorization", `Bearer ${u.token}`).send({
+        connectorId: c.connectorId,
+        companyId: "whiz-company-nope",
+        items: [{ kind: "customer", id: cid("cust-1") }],
+      });
+      expect(badCo.status).toBe(404);
+    });
   });
 });

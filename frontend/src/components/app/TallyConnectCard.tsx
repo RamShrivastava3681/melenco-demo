@@ -115,6 +115,9 @@ export function TallyConnectCard() {
   const disconnectMut = useMutation({
     mutationFn: (connectorId: string) => api.disconnectTallyConnector(connectorId),
     onSuccess: () => {
+      // Drop the "Successfully connected" banner immediately — the backend
+      // no longer reports the device or its last connection once revoked.
+      setJustConnectedId(null);
       refetch();
       qc.invalidateQueries({ queryKey: ["tally-batches"] });
       toast.success("Connector revoked");

@@ -59,12 +59,14 @@ export function buildStatusPayload(userId: string) {
 
   // Merge in WhizUnik Cloud API (new-spec) connectors/companies for this
   // tenant so the platform shows everything it has received, regardless of
-  // which connector protocol paired the device.
+  // which connector protocol paired the device. Only live ('active')
+  // connectors are listed — disconnected / superseded devices disappear
+  // from the dashboard instead of lingering as ghosts.
   try {
     const wzConnectors = db
       .prepare(
         `SELECT id, connector_id, device_name, status, app_version, last_heartbeat, last_sync, created_at
-         FROM connectors WHERE tenant_id = ? ORDER BY created_at DESC`
+         FROM connectors WHERE tenant_id = ? AND status = 'active' ORDER BY created_at DESC`
       )
       .all(userId) as Array<{
         id: string;
@@ -214,6 +216,9 @@ export function buildLastConnection(
   try {
     // Prefer the audit trail (covers legacy connects); fall back to newest
     // connector row (covers new-spec wz connects that predate audit writes).
+    // `connectors` here holds only live devices — if the audited connect
+    // belongs to a device that has since been disconnected, ignore it so the
+    // "Connected" banner disappears instead of going stale.
     const evt = db
       .prepare(
         `SELECT connector_id, created_at FROM tally_audit_logs
@@ -225,13 +230,17 @@ export function buildLastConnection(
       const match = evt.connector_id
         ? connectors.find((c) => c.connectorId === evt.connector_id)
         : undefined;
-      return {
-        connectorId: evt.connector_id ?? match?.connectorId ?? "",
-        connectorName: match?.name ?? "Tally Connector",
-        connectedAt: evt.created_at,
-        deviceName: match?.deviceName ?? null,
-        appVersion: match?.appVersion ?? null,
-      };
+      if (match) {
+        return {
+          connectorId: evt.connector_id ?? match.connectorId,
+          connectorName: match.name,
+          connectedAt: evt.created_at,
+          deviceName: match.deviceName,
+          appVersion: match.appVersion,
+        };
+      }
+      // Stale audit for a disconnected device — fall through to newest live
+      // device below (or null when none remain).
     }
   } catch {
     // audit table may not exist in isolation — fall through to row fallback

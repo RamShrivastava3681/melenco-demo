@@ -85,7 +85,7 @@ export const wzAdminPairingSchema = z.object({
 });
 
 // Platform push: POST /api/integrations/tally/commands (JWT)
-export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS"] as const;
+export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS", "PUSH_MASTERS"] as const;
 
 export const wzPushCommandSchema = z.object({
   connectorId: z.string().trim().min(1).max(120),
@@ -105,6 +105,116 @@ export const wzPushInvoicesSchema = z.object({
 export const wzAckCommandSchema = z.object({
   commandId: z.string().trim().min(1).max(128),
   status: z.enum(["DONE", "CANCELLED"]),
+  // Phase 3 master result (passthrough): outcome drives the per-master
+  // link status (SYNCED / FAILED / NEEDS_REVIEW); evidence fields are
+  // stored verbatim for the dashboard and audit trail.
+  result: z
+    .object({
+      outcome: z.enum(["synced", "linked", "failed", "needs_review"]).optional(),
+      tallyName: z.string().trim().max(200).optional(),
+      tallyMasterId: z.string().trim().max(200).optional(),
+      error: z.string().trim().max(1000).optional(),
+      match: z.record(z.string(), z.unknown()).optional(),
+      fieldDiff: z.array(z.record(z.string(), z.unknown())).optional(),
+      requestPayload: z.unknown().optional(),
+      responsePayload: z.unknown().optional(),
+      retryCount: z.number().int().min(0).max(1000).optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: WhizUnik → Tally master sync (customers, suppliers, SKUs)
+// ---------------------------------------------------------------------------
+
+/** GSTIN: 2-digit state + 10-char PAN + entity code + 'Z' + checksum. */
+export const GSTIN_REGEX = /^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$/;
+
+/** PAN: 5 letters + 4 digits + 1 letter. */
+export const PAN_REGEX = /^[A-Z]{5}\d{4}[A-Z]$/;
+
+/** GST rates Tally accepts for stock items in Phase 3. */
+export const VALID_GST_RATES = [0, 5, 12, 18, 28] as const;
+
+export const MASTER_KINDS = ["customer", "supplier", "sku"] as const;
+
+const masterPartyFields = {
+  name: z.string().trim().min(1).max(200),
+  gstin: z.string().trim().toUpperCase().regex(GSTIN_REGEX, "gstin must be a valid 15-character GSTIN"),
+  pan: z.string().trim().toUpperCase().regex(PAN_REGEX, "pan must match ABCDE1234F").nullish(),
+  address: z.string().trim().max(500).nullish(),
+  state: z.string().trim().max(100).nullish(),
+  pin: z.string().trim().max(20).nullish(),
+  phone: z.string().trim().max(40).nullish(),
+  email: z.string().trim().email("email must be a valid email address").max(200).nullish(),
+  paymentTerms: z.string().trim().max(200).nullish(),
+};
+
+export const wzMasterCustomerSchema = z.object({ ...masterPartyFields });
+
+export const wzMasterSupplierSchema = z.object({ ...masterPartyFields });
+
+export const wzMasterSkuSchema = z.object({
+  skuCode: z.string().trim().min(1).max(100),
+  name: z.string().trim().min(1).max(200),
+  hsn: z.string().trim().regex(/^\d{4,8}$/, "hsn must be 4–8 digits").nullish(),
+  gstRate: z.number().refine((n) => (VALID_GST_RATES as readonly number[]).includes(n), {
+    message: `gstRate must be one of ${VALID_GST_RATES.join(", ")}`,
+  }),
+  unit: z.string().trim().min(1).max(40),
+  category: z.string().trim().max(200).nullish(),
+});
+
+export const wzMasterItemSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("customer"),
+    id: z.string().trim().min(1).max(128),
+    version: z.number().int().positive().max(1_000_000_000).optional().default(1),
+    fields: wzMasterCustomerSchema,
+  }),
+  z.object({
+    kind: z.literal("supplier"),
+    id: z.string().trim().min(1).max(128),
+    version: z.number().int().positive().max(1_000_000_000).optional().default(1),
+    fields: wzMasterSupplierSchema,
+  }),
+  z.object({
+    kind: z.literal("sku"),
+    id: z.string().trim().min(1).max(128),
+    version: z.number().int().positive().max(1_000_000_000).optional().default(1),
+    fields: wzMasterSkuSchema,
+  }),
+]);
+
+/** Idempotency key: customer:{id}:{version} | supplier:{id}:{version} | sku:{id}:{version} */
+export function masterIdempotencyKey(kind: string, id: string, version: number): string {
+  return `${kind}:${id}:${version}`;
+}
+
+// Platform: POST /api/integrations/tally/masters/push (JWT) — queue masters
+// for the connector, one PUSH_MASTERS command per item (spec §6: one at a time).
+// The request carries kind + WhizUnik id only; the server loads and validates
+// the Phase 3 fields from the tenant's own tables (record lineage guaranteed).
+export const wzPushMastersSchema = z.object({
+  connectorId: z.string().trim().min(1).max(120),
+  companyId: z.string().trim().min(1).max(128),
+  items: z
+    .array(
+      z.object({
+        kind: z.enum(MASTER_KINDS),
+        id: z.string().trim().min(1).max(128),
+      })
+    )
+    .min(1)
+    .max(100),
+});
+
+// Platform: GET /api/integrations/tally/masters/status (JWT) — per-master state.
+export const wzMasterStatusQuerySchema = z.object({
+  kind: z.enum(MASTER_KINDS).optional(),
+  status: z.enum(["NOT_SYNCED", "QUEUED", "SENDING", "SYNCED", "FAILED", "NEEDS_REVIEW"]).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional().default(50),
 });
 
 export function formatWzIssues(error: z.ZodError): string {

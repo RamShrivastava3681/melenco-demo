@@ -12,6 +12,12 @@ import {
   wzPushCommandSchema,
   wzAckCommandSchema,
   wzPushInvoicesSchema,
+  wzPushMastersSchema,
+  wzMasterStatusQuerySchema,
+  wzMasterCustomerSchema,
+  wzMasterSupplierSchema,
+  wzMasterSkuSchema,
+  masterIdempotencyKey,
   formatWzIssues,
 } from "./validate.js";
 import {
@@ -245,6 +251,31 @@ router.post(
          VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`
       ).run(uuidv4(), connectorId, input.deviceId, input.deviceName, found.tenantId, input.appVersion, input.protocolVersion);
 
+      // Re-pairing the same device must not pile up ghost devices in the
+      // dashboard: older live connectors for this (tenant, device) are
+      // superseded — hidden from the device list and unable to refresh.
+      // (Their access tokens die at the auth check; refresh hashes cleared.)
+      try {
+        const stale = db.prepare(
+          `SELECT connector_id FROM connectors
+           WHERE tenant_id = ? AND device_id = ? AND connector_id != ? AND status = 'active'`
+        ).all(found.tenantId, input.deviceId, connectorId) as Array<{ connector_id: string }>;
+        if (stale.length > 0) {
+          db.prepare(
+            `UPDATE connectors SET status = 'replaced', refresh_token_hash = NULL, updated_at = datetime('now')
+             WHERE tenant_id = ? AND device_id = ? AND connector_id != ? AND status = 'active'`
+          ).run(found.tenantId, input.deviceId, connectorId);
+          for (const s of stale) {
+            try {
+              db.prepare(
+                `UPDATE connector_commands SET status = 'CANCELLED', completed_at = datetime('now')
+                 WHERE connector_id = ? AND status IN ('PENDING', 'DELIVERED')`
+              ).run(s.connector_id);
+            } catch { /* ignore per-device cleanup failures */ }
+          }
+        }
+      } catch { /* supersede is best-effort; the new pairing already succeeded */ }
+
       consumePairingCode(input.pairingCode, found);
 
       try {
@@ -294,10 +325,14 @@ router.post(
         sendWzError(res, "AUTHENTICATION_FAILED", "Refresh token does not match connector or device");
         return;
       }
-      const row = db.prepare(`SELECT connector_id, device_id, tenant_id, refresh_token_hash FROM connectors WHERE connector_id = ?`).get(
+      const row = db.prepare(`SELECT connector_id, device_id, tenant_id, status, refresh_token_hash FROM connectors WHERE connector_id = ?`).get(
         input.connectorId
-      ) as { connector_id: string; device_id: string | null; tenant_id: string; refresh_token_hash: string | null } | undefined;
-      if (!row || !row.refresh_token_hash || row.refresh_token_hash !== sha256(input.refreshToken)) {
+      ) as { connector_id: string; device_id: string | null; tenant_id: string; status: string; refresh_token_hash: string | null } | undefined;
+      if (!row || row.status !== "active") {
+        sendWzError(res, "AUTHENTICATION_FAILED", "Connector has been revoked");
+        return;
+      }
+      if (!row.refresh_token_hash || row.refresh_token_hash !== sha256(input.refreshToken)) {
         sendWzError(res, "AUTHENTICATION_FAILED", "Invalid refresh token");
         return;
       }
@@ -563,6 +598,9 @@ router.get("/info", (_req: Request, res: Response) => {
       updates: "/api/integrations/tally/updates",
       pendingCommands: "/api/integrations/tally/commands/pending",
       ackCommand: "/api/integrations/tally/commands/ack",
+      mastersPush: "/api/integrations/tally/masters/push",
+      mastersStatus: "/api/integrations/tally/masters/status",
+      mastersAttempts: "/api/integrations/tally/masters/attempts",
     },
   });
 });
@@ -940,6 +978,8 @@ router.get("/commands/pending", (req: Request, res: Response) => {
         db.prepare(
           `UPDATE connector_commands SET status = 'DELIVERED', delivered_at = datetime('now') WHERE id IN (${ids})`
         ).run();
+        // Phase 3: delivered master pushes move QUEUED links to SENDING.
+        markDeliveredMastersSending(claims.tenantId, rows);
       }
       res.status(200).json({
         commands: rows.map((r) => {
@@ -969,9 +1009,9 @@ router.post("/commands/ack", (req: Request, res: Response) => {
     }
     try {
       const claims = (req as Request & { wzClaims?: AccessClaims }).wzClaims!;
-      const row = db.prepare(`SELECT id, connector_id, status FROM connector_commands WHERE id = ?`).get(
+      const row = db.prepare(`SELECT id, connector_id, command, payload, status, created_at FROM connector_commands WHERE id = ?`).get(
         parsed.data.commandId
-      ) as { id: string; connector_id: string; status: string } | undefined;
+      ) as { id: string; connector_id: string; command: string; payload: string | null; status: string; created_at: string } | undefined;
       if (!row || row.connector_id !== claims.connectorId) {
         sendWzError(res, "INVALID_PAYLOAD", "Unknown command for this connector");
         return;
@@ -979,9 +1019,423 @@ router.post("/commands/ack", (req: Request, res: Response) => {
       db.prepare(
         `UPDATE connector_commands SET status = ?, completed_at = datetime('now') WHERE id = ?`
       ).run(parsed.data.status, row.id);
+      // Phase 3: master results update the per-master link + evidence log.
+      if (row.command === "PUSH_MASTERS") {
+        applyMasterAck(claims.tenantId, claims.connectorId, row, parsed.data.status, parsed.data.result);
+      }
       res.status(200).json({ id: row.id, status: parsed.data.status });
     } catch (err) {
       console.error("[whizunik][commands/ack] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+// ===========================================================================
+// Phase 3: WhizUnik → Tally master sync (customers, suppliers, SKUs)
+// One PUSH_MASTERS command per master item (spec §6: one master at a time).
+// Per-master state lives in master_sync_links; every attempt is logged in
+// master_sync_attempts for dashboard evidence and audit.
+// ===========================================================================
+
+type MasterKind = "customer" | "supplier" | "sku";
+
+const MASTER_TABLE: Record<MasterKind, string> = {
+  customer: "customers",
+  supplier: "suppliers",
+  sku: "products",
+};
+
+function loadMasterRow(tenantId: string, kind: MasterKind, id: string): Record<string, unknown> | null {
+  try {
+    const row = db.prepare(
+      `SELECT * FROM ${MASTER_TABLE[kind]} WHERE id = ? AND user_id = ?`
+    ).get(id, tenantId) as Record<string, unknown> | undefined;
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Map a master DB row to the validated connector payload fields. */
+function masterFieldsFor(kind: MasterKind, row: Record<string, unknown>): Record<string, unknown> {
+  if (kind === "sku") {
+    return {
+      skuCode: row.sku_code ?? null,
+      name: row.name ?? null,
+      hsn: row.hsn ?? null,
+      gstRate: row.gst_rate ?? null,
+      unit: row.base_unit ?? null,
+      category: row.group_name ?? row.category ?? null,
+    };
+  }
+  return {
+    name: row.name ?? null,
+    gstin: row.gstin ?? null,
+    pan: row.pan ?? null,
+    address: row.address ?? null,
+    state: row.state ?? null,
+    pin: row.pin ?? null,
+    phone: row.phone ?? null,
+    email: row.email ?? null,
+    paymentTerms: row.payment_terms ?? null,
+  };
+}
+
+function validateMasterFields(kind: MasterKind, fields: Record<string, unknown>): { ok: boolean; reason?: string } {
+  const schema = kind === "customer" ? wzMasterCustomerSchema : kind === "supplier" ? wzMasterSupplierSchema : wzMasterSkuSchema;
+  const parsed = schema.safeParse(fields);
+  if (parsed.success) return { ok: true };
+  return { ok: false, reason: formatWzIssues(parsed.error) };
+}
+
+/** Upsert the QUEUED link for a master being pushed (attempts accumulate). */
+function queueMasterLink(
+  tenantId: string,
+  kind: MasterKind,
+  whizunikId: string,
+  version: number,
+  idempotencyKey: string,
+  requestId: string,
+  approvedBy: string,
+): void {
+  const existing = db.prepare(
+    `SELECT attempts FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
+  ).get(tenantId, kind, whizunikId) as { attempts: number } | undefined;
+  if (existing) {
+    db.prepare(
+      `UPDATE master_sync_links
+       SET status = 'QUEUED', version = ?, attempts = ?, last_error = NULL,
+           idempotency_key = ?, request_id = ?, approved_by = ?, updated_at = datetime('now')
+       WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
+    ).run(version, (existing.attempts ?? 0) + 1, idempotencyKey, requestId, approvedBy, tenantId, kind, whizunikId);
+  } else {
+    db.prepare(
+      `INSERT INTO master_sync_links
+         (tenant_id, kind, whizunik_id, version, status, attempts, idempotency_key, direction, request_id, approved_by)
+       VALUES (?, ?, ?, ?, 'QUEUED', 1, ?, 'outbound', ?, ?)`
+    ).run(tenantId, kind, whizunikId, version, idempotencyKey, requestId, approvedBy);
+  }
+}
+
+/** Delivered PUSH_MASTERS commands move their QUEUED links to SENDING. */
+function markDeliveredMastersSending(
+  tenantId: string,
+  rows: Array<{ command: string; payload: string }>,
+): void {
+  try {
+    const stmt = db.prepare(
+      `UPDATE master_sync_links SET status = 'SENDING', updated_at = datetime('now')
+       WHERE tenant_id = ? AND kind = ? AND whizunik_id = ? AND status = 'QUEUED'`
+    );
+    for (const r of rows) {
+      if (r.command !== "PUSH_MASTERS") continue;
+      try {
+        const p = JSON.parse(r.payload) as { master?: { kind?: string; id?: string } };
+        const kind = p.master?.kind;
+        const id = p.master?.id;
+        if ((kind === "customer" || kind === "supplier" || kind === "sku") && id) {
+          stmt.run(tenantId, kind, id);
+        }
+      } catch { /* skip unparseable payloads */ }
+    }
+  } catch { /* link tracking must never break delivery */ }
+}
+
+interface MasterAckResult {
+  outcome?: "synced" | "linked" | "failed" | "needs_review";
+  tallyName?: string;
+  tallyMasterId?: string;
+  error?: string;
+  match?: Record<string, unknown>;
+  fieldDiff?: Array<Record<string, unknown>>;
+  requestPayload?: unknown;
+  responsePayload?: unknown;
+  retryCount?: number;
+}
+
+/** Apply a connector ack for a PUSH_MASTERS command to the link + evidence log. */
+function applyMasterAck(
+  tenantId: string,
+  connectorId: string,
+  cmd: { id: string; payload: string | null; created_at: string },
+  ackStatus: string,
+  result: MasterAckResult | undefined,
+): void {
+  try {
+    if (!cmd.payload) return;
+    const p = JSON.parse(cmd.payload) as {
+      master?: { kind?: string; id?: string; version?: number; idempotencyKey?: string };
+      companyId?: string;
+    };
+    const kind = p.master?.kind;
+    const whizunikId = p.master?.id;
+    if ((kind !== "customer" && kind !== "supplier" && kind !== "sku") || !whizunikId) return;
+    const version = typeof p.master?.version === "number" ? p.master.version : 1;
+    const outcome = result?.outcome ?? (ackStatus === "DONE" ? "synced" : "failed");
+
+    let linkStatus: "SYNCED" | "FAILED" | "NEEDS_REVIEW" = "FAILED";
+    if (outcome === "synced" || outcome === "linked") linkStatus = "SYNCED";
+    else if (outcome === "needs_review") linkStatus = "NEEDS_REVIEW";
+
+    const link = db.prepare(
+      `SELECT attempts FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
+    ).get(tenantId, kind, whizunikId) as { attempts: number } | undefined;
+    const attempts = (link?.attempts ?? 0) + (typeof result?.retryCount === "number" ? result.retryCount : 0);
+    db.prepare(
+      `INSERT INTO master_sync_links
+         (tenant_id, kind, whizunik_id, tally_name, tally_master_id, version, status, attempts, last_error,
+          idempotency_key, direction, request_id, approved_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'outbound', ?, NULL, datetime('now'))
+       ON CONFLICT(tenant_id, kind, whizunik_id) DO UPDATE SET
+         tally_name = COALESCE(excluded.tally_name, master_sync_links.tally_name),
+         tally_master_id = COALESCE(excluded.tally_master_id, master_sync_links.tally_master_id),
+         version = excluded.version,
+         status = excluded.status,
+         attempts = excluded.attempts,
+         last_error = excluded.last_error,
+         idempotency_key = excluded.idempotency_key,
+         request_id = excluded.request_id,
+         updated_at = datetime('now')`
+    ).run(
+      tenantId,
+      kind,
+      whizunikId,
+      result?.tallyName ?? null,
+      result?.tallyMasterId ?? null,
+      version,
+      linkStatus,
+      attempts,
+      result?.error ?? (ackStatus === "CANCELLED" ? "Cancelled by connector" : null),
+      p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
+      cmd.id,
+    );
+
+    // Evidence log (§13): one row per attempt with request/response.
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO master_sync_attempts
+         (id, tenant_id, connector_id, kind, whizunik_id, company_id, request_id, idempotency_key,
+          requested_at, responded_at, http_status, tally_status, success, error_message, retry_count,
+          request_payload, response_payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      `att_${uuidv4().replace(/-/g, "").slice(0, 16)}`,
+      tenantId,
+      connectorId,
+      kind,
+      whizunikId,
+      p.companyId ?? null,
+      cmd.id,
+      p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
+      cmd.created_at,
+      now,
+      linkStatus === "SYNCED" ? 200 : 422,
+      linkStatus,
+      linkStatus === "SYNCED" ? 1 : 0,
+      result?.error ?? null,
+      typeof result?.retryCount === "number" ? result.retryCount : 0,
+      JSON.stringify({ master: p.master, companyId: p.companyId ?? null }),
+      result?.responsePayload !== undefined ? JSON.stringify(result.responsePayload) : null,
+    );
+  } catch (err) {
+    console.error("[whizunik][masters/ack] link update failed:", err);
+  }
+}
+
+/**
+ * POST /masters/push — queue WhizUnik masters for Tally (JWT auth).
+ * Loads each master from the tenant's own tables, validates the Phase 3
+ * fields, and queues one PUSH_MASTERS command per item. Invalid items are
+ * reported with reasons and never queued. Dummy/test data only.
+ */
+router.post("/masters/push", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    const parsed = wzPushMastersSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
+      return;
+    }
+    try {
+      const userId = req.user!.userId;
+      const { connectorId, companyId, items } = parsed.data;
+
+      // Resolve connector: new-spec first, legacy tc_* as fallback.
+      let targetConnectorId: string | null = null;
+      const conn = db.prepare(`SELECT connector_id, tenant_id, status FROM connectors WHERE connector_id = ?`).get(
+        connectorId
+      ) as { connector_id: string; tenant_id: string; status: string } | undefined;
+      if (conn && conn.tenant_id === userId && conn.status === "active") {
+        targetConnectorId = conn.connector_id;
+      } else {
+        try {
+          const legacy = db.prepare(
+            `SELECT tcc.connector_id AS connector_id FROM tally_connectors tcc WHERE tcc.connector_id = ? AND tcc.user_id = ? AND tcc.status != 'REVOKED'`
+          ).get(connectorId, userId) as { connector_id: string } | undefined;
+          if (legacy) targetConnectorId = legacy.connector_id;
+        } catch { /* legacy table may not exist */ }
+      }
+      if (!targetConnectorId) {
+        sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+        return;
+      }
+      const company = resolveBatchCompany(userId, companyId);
+      if (!company) {
+        sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+        return;
+      }
+
+      const queued: Array<{ id: string; kind: string; commandId: string; idempotencyKey: string }> = [];
+      const rejected: Array<{ id: string; kind: string; reason: string }> = [];
+      const seen = new Set<string>();
+      for (const item of items) {
+        const key = `${item.kind}:${item.id}`;
+        if (seen.has(key)) {
+          rejected.push({ id: item.id, kind: item.kind, reason: "Duplicate item in this request" });
+          continue;
+        }
+        seen.add(key);
+        const row = loadMasterRow(userId, item.kind, item.id);
+        if (!row) {
+          rejected.push({ id: item.id, kind: item.kind, reason: "Master record not found for this account" });
+          continue;
+        }
+        const version = typeof row.version === "number" && row.version > 0 ? row.version : 1;
+        const fields = masterFieldsFor(item.kind, row);
+        const check = validateMasterFields(item.kind, fields);
+        if (!check.ok) {
+          rejected.push({ id: item.id, kind: item.kind, reason: check.reason ?? "Invalid master fields" });
+          // Record the rejection on the link so the dashboard shows FAILED with cause.
+          queueMasterLink(userId, item.kind, item.id, version, masterIdempotencyKey(item.kind, item.id, version), "rejected", userId);
+          db.prepare(
+            `UPDATE master_sync_links SET status = 'FAILED', last_error = ?, updated_at = datetime('now')
+             WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
+          ).run(check.reason ?? "Invalid master fields", userId, item.kind, item.id);
+          continue;
+        }
+        const idempotencyKey = masterIdempotencyKey(item.kind, item.id, version);
+        const cmdId = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+        const payload = {
+          companyId: company.id,
+          master: { kind: item.kind, id: item.id, version, idempotencyKey, fields },
+        };
+        db.prepare(
+          `INSERT INTO connector_commands (id, tenant_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_MASTERS', ?)`
+        ).run(cmdId, userId, targetConnectorId, JSON.stringify(payload));
+        queueMasterLink(userId, item.kind, item.id, version, idempotencyKey, cmdId, userId);
+        queued.push({ id: item.id, kind: item.kind, commandId: cmdId, idempotencyKey });
+      }
+
+      res.status(201).json({
+        connectorId: targetConnectorId,
+        queued,
+        rejected,
+        queuedCount: queued.length,
+        rejectedCount: rejected.length,
+      });
+    } catch (err) {
+      console.error("[whizunik][masters/push] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+/**
+ * GET /masters/status — per-master sync state for this tenant (JWT auth).
+ * Includes NOT_SYNCED masters (rows with no link yet) so the dashboard can
+ * show every WhizUnik master with one of the six Phase 3 statuses.
+ */
+router.get("/masters/status", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    try {
+      const userId = req.user!.userId;
+      const q = wzMasterStatusQuerySchema.safeParse(req.query ?? {});
+      if (!q.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(q.error));
+        return;
+      }
+      const { kind, status, limit } = q.data;
+      const kinds: MasterKind[] = kind ? [kind] : ["customer", "supplier", "sku"];
+      const out: Array<Record<string, unknown>> = [];
+      for (const k of kinds) {
+        const table = MASTER_TABLE[k];
+        let rows: Array<Record<string, unknown>>;
+        try {
+          rows = db.prepare(`SELECT * FROM ${table} WHERE user_id = ? ORDER BY name LIMIT 500`).all(userId) as Array<Record<string, unknown>>;
+        } catch {
+          continue;
+        }
+        for (const r of rows) {
+          const link = db.prepare(
+            `SELECT tally_name, tally_master_id, version AS link_version, status, attempts, last_error, idempotency_key, request_id, updated_at
+             FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
+          ).get(userId, k, String(r.id)) as
+            | { tally_name: string | null; tally_master_id: string | null; link_version: number; status: string; attempts: number; last_error: string | null; idempotency_key: string | null; request_id: string | null; updated_at: string }
+            | undefined;
+          const st = link?.status ?? "NOT_SYNCED";
+          if (status && st !== status) continue;
+          out.push({
+            kind: k,
+            id: r.id,
+            name: (k === "sku" ? (r.sku_code ?? r.name) : r.name) ?? "",
+            displayName: r.name ?? "",
+            version: r.version ?? 1,
+            status: st,
+            tallyName: link?.tally_name ?? null,
+            tallyMasterId: link?.tally_master_id ?? null,
+            attempts: link?.attempts ?? 0,
+            lastError: link?.last_error ?? null,
+            idempotencyKey: link?.idempotency_key ?? null,
+            requestId: link?.request_id ?? null,
+            updatedAt: link?.updated_at ?? null,
+          });
+          if (out.length >= limit) break;
+        }
+        if (out.length >= limit) break;
+      }
+      res.status(200).json({ masters: out.slice(0, limit) });
+    } catch (err) {
+      console.error("[whizunik][masters/status] failed:", err);
+      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+    }
+  });
+});
+
+/**
+ * GET /masters/attempts — sync attempt evidence for one master (JWT auth).
+ * Newest first; carries request/response payloads for the details view.
+ */
+router.get("/masters/attempts", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    try {
+      const userId = req.user!.userId;
+      const { kind, id, limit } = (req.query ?? {}) as Record<string, string | undefined>;
+      if (kind !== "customer" && kind !== "supplier" && kind !== "sku") {
+        sendWzError(res, "INVALID_PAYLOAD", "kind must be customer, supplier or sku");
+        return;
+      }
+      if (!id) {
+        sendWzError(res, "INVALID_PAYLOAD", "id is required");
+        return;
+      }
+      const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
+      const rows = db.prepare(
+        `SELECT id, connector_id, kind, whizunik_id, company_id, request_id, idempotency_key,
+                requested_at, responded_at, http_status, tally_status, success, error_message,
+                retry_count, request_payload, response_payload
+         FROM master_sync_attempts WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?
+         ORDER BY requested_at DESC LIMIT ?`
+      ).all(userId, kind, id, take) as Array<Record<string, unknown>>;
+      const attempts = rows.map((r) => {
+        let requestPayload: unknown = null;
+        let responsePayload: unknown = null;
+        try { requestPayload = r.request_payload ? JSON.parse(r.request_payload as string) : null; } catch { requestPayload = r.request_payload; }
+        try { responsePayload = r.response_payload ? JSON.parse(r.response_payload as string) : null; } catch { responsePayload = r.response_payload; }
+        return { ...r, request_payload: undefined, response_payload: undefined, requestPayload, responsePayload };
+      });
+      res.status(200).json({ attempts });
+    } catch (err) {
+      console.error("[whizunik][masters/attempts] failed:", err);
       sendWzError(res, "SERVER_ERROR", "An internal error occurred");
     }
   });
