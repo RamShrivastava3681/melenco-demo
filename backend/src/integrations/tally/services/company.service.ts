@@ -1,9 +1,14 @@
-import { v4 as uuidv4 } from "uuid";
-import db from "../../../db/index.js";
+import {
+  getCompany,
+  findCompanyByGuid,
+  listCompanies,
+  createCompany,
+} from "../../../db/storesTally.js";
 import { ApiError } from "../errors.js";
 import { audit } from "./audit.service.js";
+import type { DbItem } from "../../../db/dynamo.js";
 
-export interface CompanyRow {
+export interface CompanyRow extends DbItem {
   id: string;
   user_id: string;
   tally_company_guid: string;
@@ -16,31 +21,21 @@ export interface CompanyRow {
  * Find or create the tally company for a tenant, keyed by Tally's company GUID.
  * Returns the internal company row id used across all tally_* tables.
  */
-export function ensureCompany(params: {
+export async function ensureCompany(params: {
   userId: string;
   tallyCompanyGuid: string;
   tallyCompanyName: string;
   requestId?: string;
-}): CompanyRow {
-  const existing = db
-    .prepare(
-      `SELECT * FROM tally_companies WHERE user_id = ? AND tally_company_guid = ?`
-    )
-    .get(params.userId, params.tallyCompanyGuid) as CompanyRow | undefined;
+}): Promise<CompanyRow> {
+  const existing = (await findCompanyByGuid(params.userId, params.tallyCompanyGuid)) as CompanyRow | undefined;
 
   if (existing) return existing;
 
-  const id = uuidv4();
   try {
-    db.prepare(
-      `INSERT INTO tally_companies (id, user_id, tally_company_guid, tally_company_name)
-       VALUES (?, ?, ?, ?)`
-    ).run(id, params.userId, params.tallyCompanyGuid, params.tallyCompanyName);
+    await createCompany(params.userId, params.tallyCompanyGuid, params.tallyCompanyName);
   } catch {
     // Lost a race — re-read
-    const again = db
-      .prepare(`SELECT * FROM tally_companies WHERE user_id = ? AND tally_company_guid = ?`)
-      .get(params.userId, params.tallyCompanyGuid) as CompanyRow | undefined;
+    const again = (await findCompanyByGuid(params.userId, params.tallyCompanyGuid)) as CompanyRow | undefined;
     if (again) return again;
     throw new ApiError("DATABASE_ERROR", "Failed to register Tally company");
   }
@@ -51,25 +46,19 @@ export function ensureCompany(params: {
     detail: { tallyCompanyGuid: params.tallyCompanyGuid, tallyCompanyName: params.tallyCompanyName },
   });
 
-  const created = db
-    .prepare(`SELECT * FROM tally_companies WHERE id = ?`)
-    .get(id) as CompanyRow;
+  const created = (await findCompanyByGuid(params.userId, params.tallyCompanyGuid)) as CompanyRow;
   return created;
 }
 
 /** Validate that a company row belongs to the tenant; 403 otherwise. */
-export function requireCompanyAccess(userId: string, companyRowId: string): CompanyRow {
-  const row = db
-    .prepare(`SELECT * FROM tally_companies WHERE id = ? AND user_id = ?`)
-    .get(companyRowId, userId) as CompanyRow | undefined;
+export async function requireCompanyAccess(userId: string, companyRowId: string): Promise<CompanyRow> {
+  const row = (await getCompany(userId, companyRowId)) as CompanyRow | undefined;
   if (!row) {
     throw new ApiError("INVALID_COMPANY", "Company not found for this account");
   }
   return row;
 }
 
-export function listCompaniesForUser(userId: string): CompanyRow[] {
-  return db
-    .prepare(`SELECT * FROM tally_companies WHERE user_id = ? ORDER BY created_at`)
-    .all(userId) as CompanyRow[];
+export async function listCompaniesForUser(userId: string): Promise<CompanyRow[]> {
+  return (await listCompanies(userId)) as CompanyRow[];
 }

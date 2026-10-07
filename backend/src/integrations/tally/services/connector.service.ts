@@ -1,12 +1,20 @@
 import { v4 as uuidv4 } from "uuid";
-import db from "../../../db/index.js";
+import {
+  getConnectorByRowId as getByRow,
+  getConnectorByPublicId as getByPublic,
+  listConnectorsForUser as listForUser,
+  connectorPublicIdExists,
+  createConnectorRow,
+  updateConnectorByRowId,
+} from "../../../db/storesTally.js";
 import { generateToken, sha256 } from "../utils/crypto.js";
 import { ApiError } from "../errors.js";
 import { config } from "../utils/env.js";
 import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
 import { audit } from "./audit.service.js";
+import type { DbItem } from "../../../db/dynamo.js";
 
-export interface ConnectorRow {
+export interface ConnectorRow extends DbItem {
   id: string;
   user_id: string;
   connector_id: string;
@@ -42,7 +50,7 @@ function newConnectorId(): string {
  * Register a new connector for a tenant after successful pairing.
  * Plaintext credentials are returned exactly once; only hashes are stored.
  */
-export function registerConnector(params: {
+export async function registerConnector(params: {
   userId: string;
   pairingCodeId: string;
   connectorName?: string;
@@ -50,38 +58,34 @@ export function registerConnector(params: {
   deviceId?: string;
   appVersion?: string;
   requestId?: string;
-}): { connector: ConnectorRow; credentials: ConnectorCredentials } {
+}): Promise<{ connector: ConnectorRow; credentials: ConnectorCredentials }> {
   const accessToken = generateToken(32);
   const hmacSecret = generateToken(24);
 
   // Public connector id must be globally unique — retry on collision (paranoid).
   let connectorId = newConnectorId();
   for (let i = 0; i < 3; i++) {
-    const clash = db.prepare(`SELECT id FROM tally_connectors WHERE connector_id = ?`).get(connectorId);
+    const clash = await connectorPublicIdExists(connectorId);
     if (!clash) break;
     connectorId = newConnectorId();
   }
 
   const id = uuidv4();
-  db.prepare(
-    `INSERT INTO tally_connectors
-       (id, user_id, connector_id, connector_name, status, device_name, device_id, app_version,
-        token_hash, hmac_secret_hash, pairing_code_id)
-     VALUES (?, ?, ?, ?, 'ONLINE', ?, ?, ?, ?, ?, ?)`
-  ).run(
+  await createConnectorRow({
     id,
-    params.userId,
-    connectorId,
-    params.connectorName || "Tally Connector",
-    params.deviceName || null,
-    params.deviceId || null,
-    params.appVersion || null,
-    sha256(accessToken),
-    sha256(hmacSecret),
-    params.pairingCodeId
-  );
+    user_id: params.userId,
+    connector_id: connectorId,
+    connector_name: params.connectorName || "Tally Connector",
+    status: "ONLINE",
+    device_name: params.deviceName || null,
+    device_id: params.deviceId || null,
+    app_version: params.appVersion || null,
+    token_hash: sha256(accessToken),
+    hmac_secret_hash: sha256(hmacSecret),
+    pairing_code_id: params.pairingCodeId,
+  });
 
-  const connector = getConnectorByRowId(id)!;
+  const connector = (await getByRow(id)) as ConnectorRow;
 
   audit("CONNECTOR_CONNECTED", {
     userId: params.userId,
@@ -102,66 +106,50 @@ export function registerConnector(params: {
   };
 }
 
-export function getConnectorByRowId(rowId: string): ConnectorRow | undefined {
-  return db
-    .prepare(`SELECT * FROM tally_connectors WHERE id = ?`)
-    .get(rowId) as ConnectorRow | undefined;
+export async function getConnectorByRowId(rowId: string): Promise<ConnectorRow | undefined> {
+  return (await getByRow(rowId)) as ConnectorRow | undefined;
 }
 
-export function getConnectorByPublicId(connectorId: string): ConnectorRow | undefined {
-  return db
-    .prepare(`SELECT * FROM tally_connectors WHERE connector_id = ?`)
-    .get(connectorId) as ConnectorRow | undefined;
+export async function getConnectorByPublicId(connectorId: string): Promise<ConnectorRow | undefined> {
+  return (await getByPublic(connectorId)) as ConnectorRow | undefined;
 }
 
-export function listConnectorsForUser(userId: string): ConnectorRow[] {
-  return db
-    .prepare(
-      `SELECT * FROM tally_connectors WHERE user_id = ? AND status != 'REVOKED' ORDER BY created_at DESC`
-    )
-    .all(userId) as ConnectorRow[];
+export async function listConnectorsForUser(userId: string): Promise<ConnectorRow[]> {
+  return (await listForUser(userId)) as ConnectorRow[];
 }
 
 /** Record a heartbeat; keeps the connector ONLINE. */
-export function touchHeartbeat(rowId: string, appVersion?: string): void {
-  db.prepare(
-    `UPDATE tally_connectors
-     SET last_heartbeat = datetime('now'),
-         app_version = COALESCE(?, app_version),
-         status = 'ONLINE',
-         updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(appVersion || null, rowId);
+export async function touchHeartbeat(rowId: string, appVersion?: string): Promise<void> {
+  const row = await getByRow(rowId);
+  if (!row) return;
+  await updateConnectorByRowId(rowId, {
+    last_heartbeat: new Date().toISOString(),
+    ...(appVersion ? { app_version: appVersion } : {}),
+    status: "ONLINE",
+  });
 }
 
 /** Update sync timestamps after a session finishes. */
-export function markSync(rowId: string, successful: boolean): void {
+export async function markSync(rowId: string, successful: boolean): Promise<void> {
+  const now = new Date().toISOString();
   if (successful) {
-    db.prepare(
-      `UPDATE tally_connectors
-       SET last_sync = datetime('now'), last_successful_sync = datetime('now'), updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(rowId);
+    await updateConnectorByRowId(rowId, { last_sync: now, last_successful_sync: now });
   } else {
-    db.prepare(
-      `UPDATE tally_connectors SET last_sync = datetime('now'), updated_at = datetime('now') WHERE id = ?`
-    ).run(rowId);
+    await updateConnectorByRowId(rowId, { last_sync: now });
   }
 }
 
 /** Revoke a connector — permanently blocks authentication. */
-export function revokeConnector(userId: string, connectorRowId: string, requestId?: string): void {
-  const connector = db
-    .prepare(`SELECT * FROM tally_connectors WHERE id = ? AND user_id = ?`)
-    .get(connectorRowId, userId) as ConnectorRow | undefined;
+export async function revokeConnector(userId: string, connectorRowId: string, requestId?: string): Promise<void> {
+  const row = await getByRow(connectorRowId);
+  const connector = row && row.user_id === userId ? (row as ConnectorRow) : undefined;
   if (!connector) {
     throw new ApiError("AUTHORIZATION_FAILED", "Connector not found for this account");
   }
-  db.prepare(
-    `UPDATE tally_connectors
-     SET status = 'REVOKED', revoked_at = datetime('now'), updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(connectorRowId);
+  await updateConnectorByRowId(connectorRowId, {
+    status: "REVOKED",
+    revoked_at: new Date().toISOString(),
+  });
   audit("CONNECTOR_REVOKED", { userId, connectorId: connector.connector_id, requestId });
 }
 

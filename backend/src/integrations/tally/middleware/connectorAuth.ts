@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import db from "../../../db/index.js";
+import { getConnectorByPublicId, updateConnectorByRowId } from "../../../db/storesTally.js";
 import { sha256, safeEqual, hmacVerify, canonicalRequest } from "../utils/crypto.js";
 import { ApiError, sendError } from "../errors.js";
 import { config } from "../utils/env.js";
@@ -50,7 +50,7 @@ function isReplayed(connectorId: string, requestId: string): boolean {
  *   X-Signature: HMAC-SHA256 hex (if HMAC enforcement enabled/used)
  * The tenant is derived from the connector record — never from the payload.
  */
-export function requireConnectorAuth(req: Request, res: Response, next: NextFunction): void {
+export async function requireConnectorAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   req.requestId = (req.headers["x-request-id"] as string) || newRequestId();
 
   const connectorId = req.headers["x-connector-id"] as string | undefined;
@@ -77,9 +77,14 @@ export function requireConnectorAuth(req: Request, res: Response, next: NextFunc
     return;
   }
 
-  const row = db
-    .prepare(`SELECT * FROM tally_connectors WHERE connector_id = ?`)
-    .get(connectorId) as any;
+  let row: any;
+  try {
+    row = await getConnectorByPublicId(connectorId);
+  } catch (err) {
+    console.error("[connectorAuth] lookup failed:", err);
+    deny("Authentication service unavailable", "db_unavailable");
+    return;
+  }
 
   if (!row) {
     deny("Unknown connector", "unknown_connector");
@@ -142,9 +147,14 @@ export function requireConnectorAuth(req: Request, res: Response, next: NextFunc
   }
 
   // Touch heartbeat opportunistically on authenticated calls
-  db.prepare(
-    `UPDATE tally_connectors SET last_heartbeat = datetime('now'), status = 'ONLINE', updated_at = datetime('now') WHERE id = ?`
-  ).run(row.id);
+  try {
+    await updateConnectorByRowId(row.id, {
+      last_heartbeat: new Date().toISOString(),
+      status: "ONLINE",
+    });
+  } catch {
+    // Non-fatal — auth already succeeded
+  }
 
   req.connector = {
     rowId: row.id,

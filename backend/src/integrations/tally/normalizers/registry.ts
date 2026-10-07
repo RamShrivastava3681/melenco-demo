@@ -1,6 +1,5 @@
 import { z } from "zod";
-import db from "../../../db/index.js";
-import { v4 as uuidv4 } from "uuid";
+import { putReport } from "../../../db/storesTally.js";
 import { ApiError } from "../errors.js";
 import { normalizeMaster, MASTER_TARGETS } from "./masters.js";
 import { normalizeVoucher, VOUCHER_TARGETS } from "./vouchers.js";
@@ -44,7 +43,7 @@ export interface NormalizeContext {
  * Throws ApiError (TALLY_DATA_INVALID / NORMALIZATION_FAILED) on failure —
  * the batch processor converts that into per-record failure counts.
  */
-export function normalizeRecord(ctx: NormalizeContext): NormalizedResult {
+export async function normalizeRecord(ctx: NormalizeContext): Promise<NormalizedResult> {
   const entityType = ctx.entityType;
 
   if (entityType in MASTER_TARGETS) {
@@ -66,21 +65,16 @@ export function getNormalizedTargetTable(entityType: string): string {
   return "tally_reports";
 }
 
-function storeReportOrOther(ctx: NormalizeContext): NormalizedResult {
+async function storeReportOrOther(ctx: NormalizeContext): Promise<NormalizedResult> {
   if (REPORT_TYPES.has(ctx.entityType)) {
-    const id = uuidv4();
-    db.prepare(
-      `INSERT OR IGNORE INTO tally_reports (id, user_id, company_id, report_type, report_date, payload)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(
-      id,
-      ctx.userId,
-      ctx.companyId,
-      ctx.entityType,
-      (ctx.record.voucherDate as string) || null,
-      JSON.stringify(ctx.record.data ?? ctx.record)
-    );
-    return { table: "tally_reports", recordId: id };
+    const created = await putReport({
+      user_id: ctx.userId,
+      company_id: ctx.companyId,
+      report_type: ctx.entityType,
+      report_date: (ctx.record.voucherDate as string) || null,
+      payload: JSON.stringify(ctx.record.data ?? ctx.record),
+    });
+    return { table: "tally_reports", recordId: created.id as string };
   }
   throw new ApiError("NORMALIZATION_FAILED", `Unsupported entity type ${ctx.entityType}`);
 }

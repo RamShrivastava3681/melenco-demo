@@ -1,4 +1,3 @@
-import db from "../../../db/index.js";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { ApiError } from "../errors.js";
@@ -15,6 +14,7 @@ import {
   getSessionBySyncId,
 } from "./syncSession.service.js";
 import { requireCompanyAccess } from "./company.service.js";
+import { getBatch, createBatch, getSourceRecord, putSourceRecord } from "../../../db/storesTally.js";
 import type { AuthenticatedConnector } from "../middleware/connectorAuth.js";
 import type { BatchInput } from "../normalizers/registry.js";
 
@@ -40,11 +40,11 @@ export interface BatchAck {
  *    counted, never double-inserted.
  *  - Every record is persisted to the raw/staging layer first.
  */
-export function processBatch(
+export async function processBatch(
   connector: AuthenticatedConnector,
   input: BatchInput,
   requestId?: string
-): BatchAck {
+): Promise<BatchAck> {
   // --- Structural validation --------------------------------------------
   if (input.records.length > config.batchMaxRecords) {
     throw new ApiError("INVALID_PAYLOAD", `Batch exceeds maximum of ${config.batchMaxRecords} records`);
@@ -54,17 +54,15 @@ export function processBatch(
   }
 
   // --- Authorization: session must belong to this connector + tenant ------
-  const session = requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
+  const session = await requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
 
   // --- Duplicate batch? Replay stored ACK --------------------------------
   // Checked before the status guard so retries of already-processed batches
   // remain safe even if the session has since been completed.
-  const existingBatch = db
-    .prepare(`SELECT ack_json, status FROM tally_batches WHERE sync_id = ? AND batch_number = ?`)
-    .get(session.id, input.batchNumber) as { ack_json: string; status: string } | undefined;
+  const existingBatch = await getBatch(session.id, input.batchNumber);
 
   if (existingBatch) {
-    const ack = JSON.parse(existingBatch.ack_json || "{}");
+    const ack = JSON.parse((existingBatch.ack_json as string) || "{}");
     audit("BATCH_REPLAYED", {
       userId: connector.userId,
       connectorId: connector.connectorId,
@@ -86,13 +84,13 @@ export function processBatch(
   }
 
   // Company must belong to this tenant
-  const company = requireCompanyAccess(connector.userId, session.company_id);
+  const company = await requireCompanyAccess(connector.userId, session.company_id);
   if (input.companyId && input.companyId !== company.id) {
     throw new ApiError("INVALID_COMPANY", "companyId does not match the sync session");
   }
 
   // --- Store raw payloads first (staging) --------------------------------
-  storeRawRecords({
+  await storeRawRecords({
     userId: connector.userId,
     connectorRowId: connector.rowId,
     companyId: session.company_id,
@@ -109,23 +107,6 @@ export function processBatch(
   let duplicates = 0;
   let failed = 0;
 
-  const recordStmt = db.prepare(
-    `SELECT id, content_hash, whizunik_table, whizunik_record_id FROM tally_source_records
-     WHERE user_id = ? AND company_id = ? AND source = 'tally' AND entity_type = ? AND source_object_id = ?`
-  );
-  const insertSourceStmt = db.prepare(
-    `INSERT INTO tally_source_records
-       (id, user_id, company_id, source, entity_type, source_object_id, source_company_id,
-        source_voucher_number, source_voucher_type, source_voucher_date, content_hash,
-        whizunik_table, whizunik_record_id, sync_id)
-     VALUES (?, ?, ?, 'tally', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  const updateSourceStmt = db.prepare(
-    `UPDATE tally_source_records
-     SET content_hash = ?, whizunik_table = ?, whizunik_record_id = ?, last_seen_at = datetime('now'), sync_id = ?
-     WHERE id = ?`
-  );
-
   for (const raw of input.records) {
     try {
       // 1. Resolve source identity (GUID preferred, deterministic fallback)
@@ -135,12 +116,12 @@ export function processBatch(
       const contentHash = sha256(JSON.stringify(raw.data ?? raw));
 
       // 3. Idempotency check
-      const existing = recordStmt.get(
+      const existing = await getSourceRecord(
         connector.userId,
         session.company_id,
         input.entityType,
         sourceObjectId
-      ) as { id: string; content_hash: string | null } | undefined;
+      );
 
       if (existing && existing.content_hash === contentHash) {
         // Identical retransmission — count as duplicate, no writes
@@ -149,7 +130,7 @@ export function processBatch(
       }
 
       // 4. Normalize into WhizUnik records
-      const result = normalizeRecord({
+      const result = await normalizeRecord({
         userId: connector.userId,
         companyId: session.company_id,
         entityType: input.entityType,
@@ -157,33 +138,35 @@ export function processBatch(
         sourceObjectId,
       });
 
-      // 5. Record source identity (INSERT OR IGNORE guards concurrency)
+      // 5. Record source identity (upsert guards concurrency)
       if (existing) {
-        updateSourceStmt.run(
-          contentHash,
-          result.table,
-          result.recordId,
-          session.sync_id,
-          existing.id
-        );
+        await putSourceRecord({
+          user_id: connector.userId,
+          company_id: session.company_id,
+          entity_type: input.entityType,
+          source_object_id: sourceObjectId,
+          content_hash: contentHash,
+          whizunik_table: result.table,
+          whizunik_record_id: result.recordId,
+          sync_id: session.sync_id,
+        });
         accepted++; // update of changed content
       } else {
         try {
-          insertSourceStmt.run(
-            uuidv4(),
-            connector.userId,
-            session.company_id,
-            input.entityType,
-            sourceObjectId,
-            company.tally_company_guid,
-            raw.voucherNumber ?? null,
-            raw.voucherType ?? null,
-            raw.voucherDate ?? null,
-            contentHash,
-            result.table,
-            result.recordId,
-            session.sync_id
-          );
+          await putSourceRecord({
+            user_id: connector.userId,
+            company_id: session.company_id,
+            entity_type: input.entityType,
+            source_object_id: sourceObjectId,
+            source_company_id: company.tally_company_guid,
+            source_voucher_number: raw.voucherNumber ?? null,
+            source_voucher_type: raw.voucherType ?? null,
+            source_voucher_date: raw.voucherDate ?? null,
+            content_hash: contentHash,
+            whizunik_table: result.table,
+            whizunik_record_id: result.recordId,
+            sync_id: session.sync_id,
+          });
           accepted++;
         } catch (e: any) {
           const msg = String(e?.message || e);
@@ -214,22 +197,23 @@ export function processBatch(
   };
 
   // --- Persist batch + ACK (idempotency anchor) ---------------------------
-  db.prepare(
-    `INSERT INTO tally_batches (id, sync_id, batch_number, status, accepted, duplicates, failed, ack_json, request_id)
-     VALUES (?, ?, ?, 'ACCEPTED', ?, ?, ?, ?, ?)`
-  ).run(
-    uuidv4(),
-    session.id,
-    input.batchNumber,
+  await createBatch({
+    id: uuidv4(),
+    user_id: connector.userId,
+    sync_row_id: session.id,
+    sync_id: session.sync_id,
+    batch_number: input.batchNumber,
+    status: "ACCEPTED",
     accepted,
     duplicates,
     failed,
-    JSON.stringify(ack),
-    requestId ?? null
-  );
+    ack_json: JSON.stringify(ack),
+    request_id: requestId ?? null,
+  });
 
   // --- Update session counters --------------------------------------------
-  applyBatchCounters(session.id, { accepted, duplicates, failed });
+  const fresh = (await getSessionBySyncId(session.sync_id)) || session;
+  await applyBatchCounters(fresh as any, { accepted, duplicates, failed });
 
   audit("BATCH_ACCEPTED", {
     userId: connector.userId,
@@ -271,6 +255,8 @@ function fallbackIdentity(...parts: (string | null | undefined)[]): string {
 }
 
 /** Read a session by syncId (used by complete/error handlers). */
-export function sessionBySyncId(syncId: string) {
+export async function sessionBySyncId(syncId: string) {
   return getSessionBySyncId(syncId);
 }
+
+export { getNormalizedTargetTable };

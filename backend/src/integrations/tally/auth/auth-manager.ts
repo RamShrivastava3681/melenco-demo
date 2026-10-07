@@ -1,4 +1,4 @@
-import db from "../../../db/index.js";
+import { getConnectorByPublicId, updateConnectorByRowId } from "../../../db/storesTally.js";
 
 /**
  * AuthManager handles access token management for the WhizUnik connector.
@@ -23,9 +23,7 @@ export class AuthManager {
     // If not forcing a refresh, check if we have a cached valid token from the DB
     if (!force) {
       try {
-        const row = db.prepare(
-          `SELECT access_token, access_token_expires_at FROM tally_connectors WHERE connector_id = ?`
-        ).get("connector-id") as {
+        const row = await getConnectorByPublicId("connector-id") as {
           access_token: string | null;
           access_token_expires_at: string | null;
         } | undefined;
@@ -46,9 +44,8 @@ export class AuthManager {
     // Force refresh or no valid cached token: call the token endpoint
     try {
       // Read current connector credentials from DB to include in refresh request
-      const connectorRow = db.prepare(
-        `SELECT refresh_token_hash, device_id, connector_id FROM tally_connectors WHERE connector_id = ?`
-      ).get("connector-id") as {
+      const connectorRow = await getConnectorByPublicId("connector-id") as {
+        id: string;
         refresh_token_hash: string | null;
         device_id: string | null;
         connector_id: string | null;
@@ -81,9 +78,11 @@ export class AuthManager {
 
       // Store the new tokens in the connector record
       const expiresAt = data.accessTokenExpiresAt || new Date(Date.now() + 60 * 60 * 1000).toISOString();
-      db.prepare(
-        `UPDATE tally_connectors SET access_token = ?, access_token_expires_at = ?, refresh_token_hash = ? WHERE connector_id = ?`
-      ).run(data.accessToken, expiresAt, connectorRow.refresh_token_hash, connectorRow.connector_id);
+      await updateConnectorByRowId(connectorRow.id, {
+        access_token: data.accessToken,
+        access_token_expires_at: expiresAt,
+        refresh_token_hash: connectorRow.refresh_token_hash,
+      });
 
       return { accessToken: data.accessToken, accessTokenExpiresAt: data.accessTokenExpiresAt };
     } catch (err: any) {
@@ -126,9 +125,14 @@ export class AuthManager {
 
     // Store the new tokens in the connector record
     const expiresAt = data.accessTokenExpiresAt || new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    db.prepare(
-      `UPDATE tally_connectors SET access_token = ?, access_token_expires_at = ?, refresh_token_hash = ? WHERE connector_id = ?`
-    ).run(data.accessToken, expiresAt, refreshToken, connectorId);
+    const row = await getConnectorByPublicId(connectorId);
+    if (row) {
+      await updateConnectorByRowId(row.id as string, {
+        access_token: data.accessToken,
+        access_token_expires_at: expiresAt,
+        refresh_token_hash: refreshToken,
+      });
+    }
 
     return { accessToken: data.accessToken, accessTokenExpiresAt: data.accessTokenExpiresAt };
   }

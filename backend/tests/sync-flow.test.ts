@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import request from "supertest";
-import db from "../src/db/index.js";
+import { listInvoices, findCustomerByName, findSupplierByName, listPayments, listProducts } from "../src/db/storesCore.js";
+import { getCheckpoint, listRawBySyncId, listAuditForUser, listVouchers } from "../src/db/storesTally.js";
 import { createApp } from "../src/app.js";
 import { initTestDb } from "./setup.js";
 import {
@@ -61,7 +62,7 @@ describe("sync lifecycle end-to-end", () => {
     });
 
     // Records landed in the normalized invoices table
-    const invoices = db.prepare(`SELECT * FROM invoices WHERE user_id = ?`).all(user.userId) as any[];
+    const invoices = await listInvoices(user.userId) as any[];
     expect(invoices.length).toBe(3);
     expect(invoices[0].invoice_number).toContain("INV-");
 
@@ -73,9 +74,7 @@ describe("sync lifecycle end-to-end", () => {
     expect(complete.body.session.status).toBe("COMPLETED");
 
     // Checkpoint persisted
-    const cp = db
-      .prepare(`SELECT * FROM tally_sync_checkpoints WHERE user_id = ? AND entity_type = 'SALES_VOUCHER'`)
-      .get(user.userId) as any;
+    const cp = await getCheckpoint(user.userId, connector.companyId, "SALES_VOUCHER") as any;
     expect(cp).toBeTruthy();
     expect(cp.last_voucher_number).toBe("INV-00003");
   });
@@ -93,10 +92,8 @@ describe("sync lifecycle end-to-end", () => {
     expect(retry.body.duplicates).toBe(1);
 
     // Still exactly one invoice
-    const count = db
-      .prepare(`SELECT COUNT(*) as n FROM invoices WHERE user_id = ? AND invoice_number = 'INV-00010'`)
-      .get(user.userId) as any;
-    expect(Number(count.n)).toBe(1);
+    const matches = (await listInvoices(user.userId)).filter((i) => i.invoice_number === "INV-00010");
+    expect(matches.length).toBe(1);
   });
 
   it("replays the stored ACK for duplicate batches without reprocessing", async () => {
@@ -110,10 +107,10 @@ describe("sync lifecycle end-to-end", () => {
     expect(replay.body).toEqual(first.body);
     expect(replay.body.accepted).toBe(2); // from replayed ACK, not reprocessing
 
-    const count = db
-      .prepare(`SELECT COUNT(*) as n FROM invoices WHERE user_id = ? AND invoice_number LIKE 'INV-0002%'`)
-      .get(user.userId) as any;
-    expect(Number(count.n)).toBe(2);
+    const count = (await listInvoices(user.userId)).filter((i) =>
+      String(i.invoice_number || "").startsWith("INV-0002")
+    );
+    expect(count.length).toBe(2);
   });
 
   it("rejects malformed payloads with INVALID_PAYLOAD", async () => {
@@ -218,12 +215,8 @@ describe("normalization targets", () => {
       });
     expect(res.body.accepted).toBe(3);
 
-    const customer = db
-      .prepare(`SELECT id FROM customers WHERE user_id = ? AND name = 'Delta Debtor'`)
-      .get(user.userId);
-    const supplier = db
-      .prepare(`SELECT id FROM suppliers WHERE user_id = ? AND name = 'Delta Creditor'`)
-      .get(user.userId);
+    const customer = await findCustomerByName(user.userId, "Delta Debtor");
+    const supplier = await findSupplierByName(user.userId, "Delta Creditor");
     expect(customer).toBeTruthy();
     expect(supplier).toBeTruthy();
   });
@@ -269,16 +262,16 @@ describe("normalization targets", () => {
       });
     expect(res.body.accepted).toBe(1);
 
-    const payment = db
-      .prepare(`SELECT * FROM payments WHERE user_id = ? AND note LIKE '%RCPT-001%'`)
-      .get(user.userId) as any;
+    const payment = (await listPayments(user.userId) as any[]).find((p) =>
+      String(p.note || "").includes("RCPT-001")
+    );
     expect(payment).toBeTruthy();
     expect(Number(payment.applied_amount)).toBe(500);
 
     // Invoice closed
-    const invoice = db
-      .prepare(`SELECT status FROM invoices WHERE user_id = ? AND invoice_number = 'INV-00050'`)
-      .get(user.userId) as any;
+    const invoice = (await listInvoices(user.userId) as any[]).find(
+      (i) => i.invoice_number === "INV-00050"
+    );
     expect(invoice.status).toBe("closed");
   });
 
@@ -305,9 +298,9 @@ describe("normalization targets", () => {
         ],
       });
     expect(res.body.accepted).toBe(1);
-    const voucher = db
-      .prepare(`SELECT * FROM tally_vouchers WHERE user_id = ? AND voucher_number = 'PMT-001'`)
-      .get(user.userId) as any;
+    const voucher = (await listVouchers(user.userId) as any[]).find(
+      (v) => v.voucher_number === "PMT-001"
+    );
     expect(voucher).toBeTruthy();
     expect(voucher.voucher_type).toBe("PAYMENT_VOUCHER");
     expect(JSON.parse(voucher.raw_json).narration).toBe("Office rent");
@@ -319,17 +312,13 @@ describe("raw store + audit", () => {
     const syncId = await startSync(user, connector);
     await uploadBatch(syncId, [salesVoucher(60)]);
 
-    const raw = db
-      .prepare(`SELECT * FROM tally_raw_records WHERE sync_id = ?`)
-      .all(syncId) as any[];
+    const raw = (await listRawBySyncId(syncId)) as any[];
     expect(raw.length).toBe(1);
     expect(JSON.parse(raw[0].payload).voucherNumber).toBe("INV-00060");
   });
 
   it("writes audit events for sync lifecycle", async () => {
-    const events = db
-      .prepare(`SELECT event FROM tally_audit_logs WHERE user_id = ?`)
-      .all(user.userId) as any[];
+    const events = (await listAuditForUser(user.userId, 200)) as any[];
     const kinds = new Set(events.map((e) => e.event));
     expect(kinds.has("CONNECTOR_CONNECTED")).toBe(true);
     expect(kinds.has("SYNC_STARTED")).toBe(true);
@@ -419,9 +408,9 @@ describe("concurrent uploads", () => {
       expect(r.body.failed).toBe(0);
     }
 
-    const count = db
-      .prepare(`SELECT COUNT(*) as n FROM products WHERE user_id = ? AND name LIKE 'Widget %'`)
-      .get(user.userId) as any;
-    expect(Number(count.n)).toBe(30);
+    const widgets = (await listProducts(user.userId, 500)).filter((p) =>
+      String(p.name || "").startsWith("Widget ")
+    );
+    expect(widgets.length).toBe(30);
   });
 });

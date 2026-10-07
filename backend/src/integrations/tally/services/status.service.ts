@@ -1,6 +1,9 @@
-import db from "../../../db/index.js";
 import { listConnectorsForUser, isHeartbeatFresh, type ConnectorRow } from "./connector.service.js";
 import { listCompaniesForUser } from "./company.service.js";
+import { listWConnectorsForTenant, listWCompaniesForTenant, listWSyncBatches } from "../../../db/storesWhizunik.js";
+import { listSessionsForUser, latestConnectorEvent, listAuditForUser } from "../../../db/storesTally.js";
+import { dbQueryPk } from "../../../db/dynamo.js";
+import { userPk } from "../../../db/keys.js";
 import { config } from "../utils/env.js";
 
 /** Public (frontend-safe) shape of a connector. No token hashes, no secrets. */
@@ -49,9 +52,13 @@ export function toConnectorStatus(c: ConnectorRow): ConnectorStatus {
 }
 
 /** Aggregate status payload for the WhizUnik frontend Integrations page. */
-export function buildStatusPayload(userId: string) {
-  const connectors: ConnectorStatus[] = listConnectorsForUser(userId).map(toConnectorStatus);
-  const companies = listCompaniesForUser(userId).map((c) => ({
+export async function buildStatusPayload(userId: string) {
+  const [connectorRows, companyRows] = await Promise.all([
+    listConnectorsForUser(userId),
+    listCompaniesForUser(userId),
+  ]);
+  const connectors: ConnectorStatus[] = connectorRows.map(toConnectorStatus);
+  const companies = companyRows.map((c: any) => ({
     id: c.id,
     tallyCompanyGuid: c.tally_company_guid,
     tallyCompanyName: c.tally_company_name,
@@ -63,56 +70,39 @@ export function buildStatusPayload(userId: string) {
   // connectors are listed — disconnected / superseded devices disappear
   // from the dashboard instead of lingering as ghosts.
   try {
-    const wzConnectors = db
-      .prepare(
-        `SELECT id, connector_id, device_name, status, app_version, last_heartbeat, last_sync, created_at
-         FROM connectors WHERE tenant_id = ? AND status = 'active' ORDER BY created_at DESC`
-      )
-      .all(userId) as Array<{
-        id: string;
-        connector_id: string;
-        device_name: string | null;
-        status: string;
-        app_version: string | null;
-        last_heartbeat: string | null;
-        last_sync: string | null;
-        created_at: string;
-      }>;
-    for (const w of wzConnectors) {
+    const wzConnectors = await listWConnectorsForTenant(userId, true);
+    const sorted = [...wzConnectors].sort((a, b) =>
+      String(b.created_at || "").localeCompare(String(a.created_at || ""))
+    );
+    for (const w of sorted) {
       if (connectors.some((c) => c.connectorId === w.connector_id)) continue;
       connectors.push({
-        id: w.id,
-        connectorId: w.connector_id,
-        name: w.device_name || "Tally Connector",
-        status: w.status,
-        online: w.status === "active" && isWzHeartbeatFresh(w.last_heartbeat),
-        deviceName: w.device_name,
-        appVersion: w.app_version,
-        lastHeartbeat: w.last_heartbeat,
-        lastSync: w.last_sync,
-        lastSuccessfulSync: w.last_sync,
-        createdAt: w.created_at,
+        id: w.id as string,
+        connectorId: w.connector_id as string,
+        name: (w.device_name as string) || "Tally Connector",
+        status: w.status as string,
+        online: w.status === "active" && isWzHeartbeatFresh(w.last_heartbeat as string | null),
+        deviceName: (w.device_name as string) || null,
+        appVersion: (w.app_version as string) || null,
+        lastHeartbeat: (w.last_heartbeat as string) || null,
+        lastSync: (w.last_sync as string) || null,
+        lastSuccessfulSync: (w.last_sync as string) || null,
+        createdAt: w.created_at as string,
       });
     }
-    const wzCompanies = db
-      .prepare(`SELECT id, tally_guid, name FROM companies WHERE tenant_id = ? ORDER BY created_at`)
-      .all(userId) as Array<{ id: string; tally_guid: string | null; name: string }>;
+    const wzCompanies = await listWCompaniesForTenant(userId);
     for (const w of wzCompanies) {
       if (companies.some((c) => c.id === w.id)) continue;
-      companies.push({ id: w.id, tallyCompanyGuid: w.tally_guid ?? "", tallyCompanyName: w.name });
+      companies.push({ id: w.id as string, tallyCompanyGuid: (w.tally_guid as string) ?? "", tallyCompanyName: w.name as string });
     }
   } catch {
     // New-spec tables predate this deployment — legacy payload still served.
   }
 
   // Current (active) sync per user — the most recent RUNNING/PENDING session
-  const activeSession = db
-    .prepare(
-      `SELECT * FROM tally_sync_sessions
-       WHERE user_id = ? AND status IN ('PENDING','RUNNING')
-       ORDER BY started_at DESC LIMIT 1`
-    )
-    .get(userId) as any | undefined;
+  const activeSessions = await listSessionsForUser(userId, ["PENDING", "RUNNING"]);
+  activeSessions.sort((a, b) => String(b.started_at || "").localeCompare(String(a.started_at || "")));
+  const activeSession = activeSessions[0] as any | undefined;
 
   const currentSync: CurrentSyncProgress | null = activeSession
     ? {
@@ -131,14 +121,9 @@ export function buildStatusPayload(userId: string) {
     : null;
 
   // Last completed session summary
-  const lastSession = db
-    .prepare(
-      `SELECT sync_id, entity_type, status, completed_at, successful_records, failed_records, duplicate_records
-       FROM tally_sync_sessions
-       WHERE user_id = ? AND status IN ('COMPLETED','PARTIAL','FAILED','CANCELLED')
-       ORDER BY completed_at DESC LIMIT 1`
-    )
-    .get(userId) as any | undefined;
+  const pastSessions = await listSessionsForUser(userId, ["COMPLETED", "PARTIAL", "FAILED", "CANCELLED"]);
+  pastSessions.sort((a, b) => String(b.completed_at || "").localeCompare(String(a.completed_at || "")));
+  const lastSession = pastSessions[0] as any | undefined;
 
   // Fall back to WhizUnik Cloud API batches (sessionless ingest) so the
   // platform always shows the latest received data, even without a legacy
@@ -165,14 +150,8 @@ export function buildStatusPayload(userId: string) {
 
   if (!lastSync) {
     try {
-      const latest = db
-        .prepare(
-          `SELECT sync_id, entity_type, received_count, created_at
-           FROM sync_batches WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1`
-        )
-        .get(userId) as
-        | { sync_id: string; entity_type: string; received_count: number; created_at: string }
-        | undefined;
+      const batches = await listWSyncBatches(userId, undefined, 1);
+      const latest = batches[0] as any | undefined;
       if (latest) {
         lastSync = {
           syncId: latest.sync_id,
@@ -197,35 +176,29 @@ export function buildStatusPayload(userId: string) {
     companies,
     currentSync,
     lastSync,
-    lastConnection: buildLastConnection(userId, connectors),
-    pendingPairing: getPendingPairing(userId),
+    lastConnection: await buildLastConnection(userId, connectors),
+    pendingPairing: await getPendingPairing(userId),
   };
 }
 
 /** Most recent successful connect for this tenant — drives the "Connected ✓" banner. */
-export function buildLastConnection(
+export async function buildLastConnection(
   userId: string,
   connectors: ConnectorStatus[]
-): {
+): Promise<{
   connectorId: string;
   connectorName: string;
   connectedAt: string;
   deviceName: string | null;
   appVersion: string | null;
-} | null {
+} | null> {
   try {
     // Prefer the audit trail (covers legacy connects); fall back to newest
     // connector row (covers new-spec wz connects that predate audit writes).
     // `connectors` here holds only live devices — if the audited connect
     // belongs to a device that has since been disconnected, ignore it so the
     // "Connected" banner disappears instead of going stale.
-    const evt = db
-      .prepare(
-        `SELECT connector_id, created_at FROM tally_audit_logs
-         WHERE user_id = ? AND event = 'CONNECTOR_CONNECTED'
-         ORDER BY created_at DESC LIMIT 1`
-      )
-      .get(userId) as { connector_id: string | null; created_at: string } | undefined;
+    const evt = await latestConnectorEvent(userId, "CONNECTOR_CONNECTED") as { connector_id: string | null; created_at: string } | undefined;
     if (evt) {
       const match = evt.connector_id
         ? connectors.find((c) => c.connectorId === evt.connector_id)
@@ -259,16 +232,14 @@ export function buildLastConnection(
 }
 
 /** Whether the user has an unused, unexpired pairing code (legacy table). */
-export function getPendingPairing(userId: string): { active: boolean; expiresAt: string | null } {
+export async function getPendingPairing(userId: string): Promise<{ active: boolean; expiresAt: string | null }> {
   try {
-    const row = db
-      .prepare(
-        `SELECT expires_at FROM tally_pairing_codes
-         WHERE user_id = ? AND used_at IS NULL AND expires_at > datetime('now')
-         ORDER BY created_at DESC LIMIT 1`
-      )
-      .get(userId) as { expires_at: string } | undefined;
-    if (row) return { active: true, expiresAt: row.expires_at };
+    const rows = await dbQueryPk(userPk(userId), "PAIRING#");
+    const now = new Date().toISOString();
+    const match = rows
+      .filter((r) => !r.used_at && String(r.expires_at || "") > now)
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0];
+    if (match) return { active: true, expiresAt: match.expires_at as string };
   } catch {
     // ignore — legacy table may not exist
   }
@@ -285,37 +256,52 @@ function isWzHeartbeatFresh(lastHeartbeat: string | null): boolean {
 }
 
 /** Sync history with optional filters. */
-export function listSyncHistory(
+export async function listSyncHistory(
   userId: string,
   opts: { limit?: number; connectorId?: string; status?: string } = {}
 ) {
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
-  let sql = `SELECT sync_id, connector_id, company_id, tally_company_id, sync_type, entity_type, status,
-                    started_at, completed_at, total_records, processed_records, successful_records,
-                    duplicate_records, failed_records, total_batches, processed_batches, error_message
-             FROM tally_sync_sessions WHERE user_id = ?`;
-  const params: any[] = [userId];
+  let rows = await listSessionsForUser(userId);
 
   if (opts.connectorId) {
-    sql += ` AND connector_id = (SELECT id FROM tally_connectors WHERE connector_id = ? AND user_id = ?)`;
-    params.push(opts.connectorId, userId);
+    const { getConnectorByPublicId } = await import("./connector.service.js");
+    const conn = await getConnectorByPublicId(opts.connectorId);
+    rows = rows.filter((r) => (conn ? r.connector_id === conn.id : false) && r.user_id === userId);
   }
   if (opts.status) {
-    sql += ` AND status = ?`;
-    params.push(opts.status);
+    rows = rows.filter((r) => r.status === opts.status);
   }
-  sql += ` ORDER BY started_at DESC LIMIT ?`;
-  params.push(limit);
-
-  return db.prepare(sql).all(...params);
+  rows.sort((a, b) => String(b.started_at || "").localeCompare(String(a.started_at || "")));
+  return rows.slice(0, limit).map((r) => ({
+    sync_id: r.sync_id,
+    connector_id: r.connector_id,
+    company_id: r.company_id,
+    tally_company_id: r.tally_company_id,
+    sync_type: r.sync_type,
+    entity_type: r.entity_type,
+    status: r.status,
+    started_at: r.started_at,
+    completed_at: r.completed_at,
+    total_records: r.total_records,
+    processed_records: r.processed_records,
+    successful_records: r.successful_records,
+    duplicate_records: r.duplicate_records,
+    failed_records: r.failed_records,
+    total_batches: r.total_batches,
+    processed_batches: r.processed_batches,
+    error_message: r.error_message,
+  }));
 }
 
 /** Recent audit events for the frontend activity feed. */
-export function listAuditEvents(userId: string, limit = 50) {
-  return db
-    .prepare(
-      `SELECT event, connector_id, sync_id, request_id, detail, created_at
-       FROM tally_audit_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
-    )
-    .all(userId, Math.min(limit, 200));
+export async function listAuditEvents(userId: string, limit = 50) {
+  const rows = await listAuditForUser(userId, Math.min(limit, 200));
+  return rows.map((r) => ({
+    event: r.event,
+    connector_id: r.connector_id,
+    sync_id: r.sync_id,
+    request_id: r.request_id,
+    detail: r.detail,
+    created_at: r.created_at,
+  }));
 }

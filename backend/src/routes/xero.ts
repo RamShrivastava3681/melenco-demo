@@ -1,7 +1,21 @@
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { XeroClient } from "xero-node";
-import db from "../db/index.js";
+import {
+  getXeroConnection,
+  getXeroByState,
+  listXeroWithState,
+  upsertXeroConnection,
+  deleteXeroConnection,
+  findCustomerByName,
+  createCustomer,
+  findInvoiceByNumber,
+  createInvoice,
+  updateInvoice,
+  findPaymentAllocationExact,
+  createPayment,
+  createAllocation,
+} from "../db/storesCore.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -20,20 +34,17 @@ function getXeroClient(state?: string): XeroClient {
 }
 
 // --- Generate Xero consent URL ---
-router.get("/auth-url", requireAuth, (req: Request, res: Response) => {
+router.get("/auth-url", requireAuth, async (req: Request, res: Response) => {
   try {
     const state = uuidv4();
     console.log("[Xero auth-url] Generated state:", state);
 
     // Store state in the DB FIRST, before building the consent URL
-    const existing = db.prepare("SELECT id FROM xero_connections WHERE user_id = ?").get(req.user!.userId);
+    const existing = await getXeroConnection(req.user!.userId);
     if (existing) {
-      db.prepare("UPDATE xero_connections SET session_state = ?, updated_at = datetime('now') WHERE user_id = ?")
-        .run(state, req.user!.userId);
+      await upsertXeroConnection(req.user!.userId, { session_state: state });
     } else {
-      const id = uuidv4();
-      db.prepare("INSERT INTO xero_connections (id, user_id, session_state) VALUES (?, ?, ?)")
-        .run(id, req.user!.userId, state);
+      await upsertXeroConnection(req.user!.userId, { id: uuidv4(), session_state: state });
     }
 
     // IMPORTANT: Pass the state to getXeroClient() so buildConsentUrl() includes it
@@ -79,15 +90,13 @@ router.get("/callback", async (req: Request, res: Response) => {
     console.log("[Xero callback] Received state:", state);
 
     // Find the connection by state
-    const connection = db.prepare(
-      "SELECT id, user_id FROM xero_connections WHERE session_state = ?"
-    ).get(state) as { id: string; user_id: string } | undefined;
+    const connection = await getXeroByState(state as string) as { id: string; user_id: string } | undefined;
 
     if (!connection) {
       console.error("[Xero callback] No connection found for state:", state);
       // Debug: show all stored states
-      const allStates = db.prepare("SELECT id, session_state, user_id FROM xero_connections WHERE session_state IS NOT NULL").all();
-      console.error("[Xero callback] Stored states in DB:", JSON.stringify(allStates));
+      const allStates = await listXeroWithState();
+      console.error("[Xero callback] Stored states in DB:", JSON.stringify(allStates.map((s) => ({ id: s.id, session_state: s.session_state, user_id: s.user_id }))));
       res.redirect(`${feUrl}/app?xero_error=invalid_state`);
       return;
     }
@@ -110,20 +119,12 @@ router.get("/callback", async (req: Request, res: Response) => {
       Date.now() + ((tokenSet.expires_in || 1800) as number) * 1000
     ).toISOString();
 
-    db.prepare(`
-      UPDATE xero_connections SET
-        access_token = ?,
-        refresh_token = ?,
-        token_expires_at = ?,
-        session_state = NULL,
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).run(
-      tokenSet.access_token,
-      tokenSet.refresh_token,
-      expiresAt,
-      connection.id
-    );
+    await upsertXeroConnection(connection.user_id, {
+      access_token: tokenSet.access_token,
+      refresh_token: tokenSet.refresh_token,
+      token_expires_at: expiresAt,
+      session_state: null,
+    });
 
     // Get tenants
     await xero.updateTenants(false);
@@ -135,19 +136,11 @@ router.get("/callback", async (req: Request, res: Response) => {
       const decoded = tokenSet.decodedPayload as Record<string, any> | undefined;
       console.log("[Xero callback] Tenant ID:", tenant.tenantId, "Name:", tenant.tenantName);
 
-      db.prepare(`
-        UPDATE xero_connections SET
-          tenant_id = ?,
-          tenant_name = ?,
-          xero_user_id = ?,
-          updated_at = datetime('now')
-        WHERE id = ?
-      `).run(
-        tenant.tenantId || "",
-        tenant.tenantName || "",
-        decoded?.xero_userid || null,
-        connection.id
-      );
+      await upsertXeroConnection(connection.user_id, {
+        tenant_id: tenant.tenantId || "",
+        tenant_name: tenant.tenantName || "",
+        xero_user_id: decoded?.xero_userid || null,
+      });
     }
 
     console.log("[Xero callback] Success! Redirecting to frontend with xero_connected=true");
@@ -160,12 +153,9 @@ router.get("/callback", async (req: Request, res: Response) => {
 });
 
 // --- Get connection status ---
-router.get("/status", requireAuth, (req: Request, res: Response) => {
+router.get("/status", requireAuth, async (req: Request, res: Response) => {
   try {
-    const connection = db.prepare(`
-      SELECT id, tenant_id, tenant_name, xero_user_id, token_expires_at, connected_at, updated_at
-      FROM xero_connections WHERE user_id = ?
-    `).get(req.user!.userId) as {
+    const connection = await getXeroConnection(req.user!.userId) as {
       id: string;
       tenant_id: string | null;
       tenant_name: string | null;
@@ -200,11 +190,9 @@ router.get("/status", requireAuth, (req: Request, res: Response) => {
 });
 
 // --- Disconnect Xero ---
-router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
+router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
   try {
-    const connection = db.prepare(
-      "SELECT id, access_token FROM xero_connections WHERE user_id = ?"
-    ).get(req.user!.userId) as { id: string; access_token: string } | undefined;
+    const connection = await getXeroConnection(req.user!.userId) as { id: string; access_token: string } | undefined;
 
     if (connection) {
       // Disconnect from Xero (best effort)
@@ -216,7 +204,7 @@ router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
         // Ignore disconnect errors
       }
 
-      db.prepare("DELETE FROM xero_connections WHERE id = ?").run(connection.id);
+      await deleteXeroConnection(req.user!.userId);
     }
 
     res.json({ success: true });
@@ -228,10 +216,7 @@ router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
 
 // --- Refresh token helper ---
 async function getValidToken(userId: string): Promise<{ accessToken: string; tenantId: string } | null> {
-  const connection = db.prepare(`
-    SELECT id, access_token, refresh_token, token_expires_at, tenant_id
-    FROM xero_connections WHERE user_id = ?
-  `).get(userId) as {
+  const connection = await getXeroConnection(userId) as {
     id: string;
     access_token: string;
     refresh_token: string;
@@ -258,14 +243,11 @@ async function getValidToken(userId: string): Promise<{ accessToken: string; ten
         Date.now() + ((tokenSet.expires_in || 1800) as number) * 1000
       ).toISOString();
 
-      db.prepare(`
-        UPDATE xero_connections SET
-          access_token = ?,
-          refresh_token = ?,
-          token_expires_at = ?,
-          updated_at = datetime('now')
-        WHERE id = ?
-      `).run(tokenSet.access_token, tokenSet.refresh_token, expiresAt, connection.id);
+      await upsertXeroConnection(userId, {
+        access_token: tokenSet.access_token,
+        refresh_token: tokenSet.refresh_token,
+        token_expires_at: expiresAt,
+      });
 
       return { accessToken: tokenSet.access_token as string, tenantId: connection.tenant_id };
     } catch (err) {
@@ -509,18 +491,13 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
 
     for (const contact of selectedXeroContacts) {
       const name = contact.name || "Unknown";
-      const existing = db.prepare(
-        "SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)"
-      ).get(req.user!.userId, name) as { id: string } | undefined;
+      const existing = await findCustomerByName(req.user!.userId, name);
 
       if (existing) {
-        contactIdMap.set(contact.contactID, existing.id);
+        contactIdMap.set(contact.contactID, existing.id as string);
       } else {
-        const id = uuidv4();
-        db.prepare(
-          "INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)"
-        ).run(id, req.user!.userId, name);
-        contactIdMap.set(contact.contactID, id);
+        const created = await createCustomer(req.user!.userId, name);
+        contactIdMap.set(contact.contactID, created.id as string);
         contactsCreated++;
       }
     }
@@ -606,24 +583,33 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       }
 
       // Check if invoice exists
-      const existing = db.prepare(
-        "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
-      ).get(req.user!.userId, customerId, invoiceNumber) as { id: string } | undefined;
+      const existing = await findInvoiceByNumber(req.user!.userId, customerId, invoiceNumber);
 
       if (existing) {
-        db.prepare(`
-          UPDATE invoices SET
-            issue_date = ?, due_date = ?, amount = ?, balance = ?,
-            status = ?, closed_date = ?, payment_days = ?, late_payment_days = ?
-          WHERE id = ?
-        `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays, existing.id);
+        await updateInvoice(req.user!.userId, existing.id as string, {
+          issue_date: issueDate,
+          due_date: dueDate,
+          amount,
+          balance: amountDue,
+          status: ourStatus,
+          closed_date: closedDate,
+          payment_days: payDays,
+          late_payment_days: lateDays,
+        });
         invoicesUpdated++;
       } else {
-        const id = uuidv4();
-        db.prepare(`
-          INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date, payment_days, late_payment_days)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(id, req.user!.userId, customerId, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays);
+        await createInvoice(req.user!.userId, {
+          customer_id: customerId,
+          invoice_number: invoiceNumber,
+          issue_date: issueDate,
+          due_date: dueDate,
+          amount,
+          balance: amountDue,
+          status: ourStatus,
+          closed_date: closedDate,
+          payment_days: payDays,
+          late_payment_days: lateDays,
+        });
         invoicesCreated++;
       }
     }
@@ -650,9 +636,7 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       if (!customerId) continue;
 
       // Find invoice
-      const invoice = db.prepare(
-        "SELECT id, amount, balance FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
-      ).get(req.user!.userId, customerId, xeroPay.invoice.invoiceNumber) as { id: string; amount: number; balance: number } | undefined;
+      const invoice = await findInvoiceByNumber(req.user!.userId, customerId, xeroPay.invoice.invoiceNumber) as { id: string; amount: number; balance: number } | undefined;
 
       if (!invoice) continue;
 
@@ -660,28 +644,35 @@ router.post("/import", requireAuth, async (req: Request, res: Response) => {
       const amount = Number(xeroPay.amount);
 
       // Check if this payment already exists
-      const existingPay = db.prepare(`
-        SELECT p.id FROM payments p
-        JOIN payment_allocations pa ON pa.payment_id = p.id
-        WHERE p.user_id = ? AND p.customer_id = ? AND pa.invoice_id = ? AND p.payment_date = ? AND pa.amount_applied = ?
-      `).get(req.user!.userId, customerId, invoice.id, paymentDate, amount) as { id: string } | undefined;
+      const existingPay = await findPaymentAllocationExact(
+        req.user!.userId, customerId, invoice.id as string, paymentDate, amount
+      );
 
       if (!existingPay) {
-        const payAmount = Math.min(amount, invoice.balance);
+        const payAmount = Math.min(amount, Number(invoice.balance));
         if (payAmount === 0) continue;
 
         const paymentId = uuidv4();
         const allocationId = uuidv4();
 
-        db.prepare(`
-          INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(paymentId, req.user!.userId, customerId, paymentDate, payAmount, payAmount, 0, "Xero sync");
+        await createPayment(req.user!.userId, {
+          id: paymentId,
+          customer_id: customerId,
+          payment_date: paymentDate,
+          amount: payAmount,
+          applied_amount: payAmount,
+          remaining: 0,
+          note: "Xero sync",
+        });
 
-        db.prepare(`
-          INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(allocationId, req.user!.userId, paymentId, invoice.id, payAmount, paymentDate, payAmount >= invoice.balance ? 1 : 0);
+        await createAllocation(req.user!.userId, {
+          id: allocationId,
+          payment_id: paymentId,
+          invoice_id: invoice.id,
+          amount_applied: payAmount,
+          applied_date: paymentDate,
+          closed_invoice: payAmount >= Number(invoice.balance) ? 1 : 0,
+        });
 
         paymentsCreated++;
       }
@@ -728,17 +719,12 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
 
       for (const contact of contacts) {
         const name = contact.name || "Unknown";
-        const existing = db.prepare(
-          "SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)"
-        ).get(req.user!.userId, name) as { id: string } | undefined;
+        const existing = await findCustomerByName(req.user!.userId, name);
 
         if (existing) {
           contactsUpdated++;
         } else {
-          const id = uuidv4();
-          db.prepare(
-            "INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)"
-          ).run(id, req.user!.userId, name);
+          await createCustomer(req.user!.userId, name);
           contactsCreated++;
         }
       }
@@ -762,9 +748,7 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
           : "open";
 
         // Find customer by name
-        const customer = db.prepare(
-          "SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)"
-        ).get(req.user!.userId, xeroInv.contact.name) as { id: string } | undefined;
+        const customer = await findCustomerByName(req.user!.userId, xeroInv.contact.name);
 
         if (!customer) continue;
 
@@ -784,24 +768,33 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         }
 
         // Check if invoice exists
-        const existing = db.prepare(
-          "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
-        ).get(req.user!.userId, customer.id, invoiceNumber) as { id: string } | undefined;
+        const existing = await findInvoiceByNumber(req.user!.userId, customer.id as string, invoiceNumber);
 
         if (existing) {
-          db.prepare(`
-            UPDATE invoices SET
-              issue_date = ?, due_date = ?, amount = ?, balance = ?,
-              status = ?, closed_date = ?, payment_days = ?, late_payment_days = ?
-            WHERE id = ?
-          `).run(issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays, existing.id);
+          await updateInvoice(req.user!.userId, existing.id as string, {
+            issue_date: issueDate,
+            due_date: dueDate,
+            amount,
+            balance: amountDue,
+            status: ourStatus,
+            closed_date: closedDate,
+            payment_days: payDays,
+            late_payment_days: lateDays,
+          });
           invoicesUpdated++;
         } else {
-          const id = uuidv4();
-          db.prepare(`
-            INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status, closed_date, payment_days, late_payment_days)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(id, req.user!.userId, customer.id, invoiceNumber, issueDate, dueDate, amount, amountDue, ourStatus, closedDate, payDays, lateDays);
+          await createInvoice(req.user!.userId, {
+            customer_id: customer.id,
+            invoice_number: invoiceNumber,
+            issue_date: issueDate,
+            due_date: dueDate,
+            amount,
+            balance: amountDue,
+            status: ourStatus,
+            closed_date: closedDate,
+            payment_days: payDays,
+            late_payment_days: lateDays,
+          });
           invoicesCreated++;
         }
       }
@@ -818,16 +811,12 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         if (!xeroPay.invoice?.invoiceNumber || !xeroPay.contact?.name) continue;
 
         // Find customer
-        const customer = db.prepare(
-          "SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)"
-        ).get(req.user!.userId, xeroPay.contact.name) as { id: string } | undefined;
+        const customer = await findCustomerByName(req.user!.userId, xeroPay.contact.name);
 
         if (!customer) continue;
 
         // Find invoice
-        const invoice = db.prepare(
-          "SELECT id, amount, balance FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
-        ).get(req.user!.userId, customer.id, xeroPay.invoice.invoiceNumber) as { id: string; amount: number; balance: number } | undefined;
+        const invoice = await findInvoiceByNumber(req.user!.userId, customer.id as string, xeroPay.invoice.invoiceNumber) as { id: string; amount: number; balance: number } | undefined;
 
         if (!invoice) continue;
 
@@ -835,28 +824,35 @@ router.post("/sync", requireAuth, async (req: Request, res: Response) => {
         const amount = Number(xeroPay.amount);
 
         // Check if this payment already exists
-        const existingPay = db.prepare(`
-          SELECT p.id FROM payments p
-          JOIN payment_allocations pa ON pa.payment_id = p.id
-          WHERE p.user_id = ? AND p.customer_id = ? AND pa.invoice_id = ? AND p.payment_date = ? AND pa.amount_applied = ?
-        `).get(req.user!.userId, customer.id, invoice.id, paymentDate, amount) as { id: string } | undefined;
+        const existingPay = await findPaymentAllocationExact(
+          req.user!.userId, customer.id as string, invoice.id as string, paymentDate, amount
+        );
 
         if (!existingPay) {
-          const payAmount = Math.min(amount, invoice.balance);
+          const payAmount = Math.min(amount, Number(invoice.balance));
           if (payAmount === 0) continue;
 
           const paymentId = uuidv4();
           const allocationId = uuidv4();
 
-          db.prepare(`
-            INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(paymentId, req.user!.userId, customer.id, paymentDate, payAmount, payAmount, 0, "Xero sync");
+          await createPayment(req.user!.userId, {
+            id: paymentId,
+            customer_id: customer.id,
+            payment_date: paymentDate,
+            amount: payAmount,
+            applied_amount: payAmount,
+            remaining: 0,
+            note: "Xero sync",
+          });
 
-          db.prepare(`
-            INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).run(allocationId, req.user!.userId, paymentId, invoice.id, payAmount, paymentDate, payAmount >= invoice.balance ? 1 : 0);
+          await createAllocation(req.user!.userId, {
+            id: allocationId,
+            payment_id: paymentId,
+            invoice_id: invoice.id,
+            amount_applied: payAmount,
+            applied_date: paymentDate,
+            closed_invoice: payAmount >= Number(invoice.balance) ? 1 : 0,
+          });
 
           paymentsCreated++;
         }

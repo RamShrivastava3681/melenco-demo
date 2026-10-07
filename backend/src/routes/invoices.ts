@@ -1,6 +1,14 @@
 import { Router, Request, Response } from "express";
-import { v4 as uuidv4 } from "uuid";
-import db from "../db/index.js";
+import {
+  listInvoices,
+  findInvoiceByNumber,
+  createInvoice,
+  getInvoice,
+  deleteInvoice,
+  getCustomer,
+  listAllocations,
+  listPayments,
+} from "../db/storesCore.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -8,26 +16,13 @@ const router = Router();
 router.use(requireAuth);
 
 // List invoices
-router.get("/", (req: Request, res: Response) => {
+router.get("/", async (req: Request, res: Response) => {
   const { customer_id, status, due_date_lte } = req.query;
-  let sql = "SELECT * FROM invoices WHERE user_id = ?";
-  const params: any[] = [req.user!.userId];
-
-  if (customer_id) {
-    sql += " AND customer_id = ?";
-    params.push(customer_id);
-  }
-  if (status && (status === "open" || status === "closed")) {
-    sql += " AND status = ?";
-    params.push(status);
-  }
-  if (due_date_lte) {
-    sql += " AND due_date <= ?";
-    params.push(due_date_lte);
-  }
-  sql += " ORDER BY due_date";
-
-  const rows = db.prepare(sql).all(...params);
+  const rows = await listInvoices(req.user!.userId, {
+    customer_id: customer_id as string | undefined,
+    status: status === "open" || status === "closed" ? (status as string) : undefined,
+    due_date_lte: due_date_lte as string | undefined,
+  });
   res.json({ invoices: rows });
 });
 
@@ -35,7 +30,7 @@ router.get("/", (req: Request, res: Response) => {
 // Returns two lists:
 //   imported — invoices that were successfully created
 //   skipped  — invoices that already exist for this customer (same invoice_number)
-router.post("/", (req: Request, res: Response) => {
+router.post("/", async (req: Request, res: Response) => {
   const { invoices: invoiceList } = req.body;
 
   if (!Array.isArray(invoiceList) || invoiceList.length === 0) {
@@ -49,44 +44,39 @@ router.post("/", (req: Request, res: Response) => {
   const errors: Array<{ invoice_number: string; error: string }> = [];
 
   try {
-    const tx = db.transaction(() => {
-      for (const inv of invoiceList) {
-        if (!inv.customer_id || !inv.invoice_number || !inv.issue_date || !inv.due_date || !inv.amount) {
-          errors.push({
-            invoice_number: inv.invoice_number || "unknown",
-            error: "Missing required fields",
-          });
-          continue;
-        }
-
-        // Check if invoice already exists for this customer
-        const existing = db
-          .prepare(
-            "SELECT id FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?"
-          )
-          .get(userId, inv.customer_id, inv.invoice_number) as { id: string } | undefined;
-
-        if (existing) {
-          skipped.push({
-            invoice_number: inv.invoice_number,
-            customer_id: inv.customer_id,
-            reason: "Already exists in the platform",
-          });
-          continue;
-        }
-
-        const id = uuidv4();
-        db.prepare(
-          `INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`
-        ).run(id, userId, inv.customer_id, inv.invoice_number, inv.issue_date, inv.due_date, inv.amount, inv.amount);
-
-        const row = db.prepare("SELECT * FROM invoices WHERE id = ?").get(id);
-        imported.push(row);
+    for (const inv of invoiceList) {
+      if (!inv.customer_id || !inv.invoice_number || !inv.issue_date || !inv.due_date || !inv.amount) {
+        errors.push({
+          invoice_number: inv.invoice_number || "unknown",
+          error: "Missing required fields",
+        });
+        continue;
       }
-    });
 
-    tx();
+      // Check if invoice already exists for this customer
+      const existing = await findInvoiceByNumber(userId, inv.customer_id, inv.invoice_number);
+
+      if (existing) {
+        skipped.push({
+          invoice_number: inv.invoice_number,
+          customer_id: inv.customer_id,
+          reason: "Already exists in the platform",
+        });
+        continue;
+      }
+
+      const row = await createInvoice(userId, {
+        customer_id: inv.customer_id,
+        invoice_number: inv.invoice_number,
+        issue_date: inv.issue_date,
+        due_date: inv.due_date,
+        amount: inv.amount,
+        balance: inv.amount,
+        status: "open",
+      });
+      imported.push(row);
+    }
+
     res.status(201).json({
       imported,
       skipped,
@@ -102,67 +92,88 @@ router.post("/", (req: Request, res: Response) => {
 });
 
 // Export invoices with payment and allocation details, filterable by customer and status
-router.get("/export", (req: Request, res: Response) => {
+router.get("/export", async (req: Request, res: Response) => {
   const userId = req.user!.userId;
   const { customer_id, status } = req.query;
 
-  let sql = `      SELECT
-        i.invoice_number,
-        i.issue_date,
-        i.due_date,
-        i.amount,
-        i.balance,
-        i.status,
-        i.closed_date,
-        i.payment_days,
-        i.late_payment_days,
-      c.name AS customer_name,
-      pa.amount_applied,
-      pa.applied_date,
-      pa.closed_invoice,
-      p.payment_date AS payment_date,
-      p.amount AS payment_amount,
-      p.note AS payment_note
-    FROM invoices i
-    LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = ?
-    LEFT JOIN payment_allocations pa ON pa.invoice_id = i.id AND pa.user_id = ?
-    LEFT JOIN payments p ON p.id = pa.payment_id AND p.user_id = ?
-    WHERE i.user_id = ?
-  `;
-  const params: any[] = [userId, userId, userId, userId];
-
-  if (customer_id) {
-    sql += ` AND i.customer_id = ?`;
-    params.push(customer_id);
+  let invoices = await listInvoices(userId, {
+    customer_id: customer_id as string | undefined,
+  });
+  if (status === "open" || status === "closed") {
+    invoices = invoices.filter((i) => i.status === status);
   }
 
-  if (status === "open") {
-    sql += ` AND i.status = 'open'`;
-  } else if (status === "closed") {
-    sql += ` AND i.status = 'closed'`;
+  const [allocs, payments] = await Promise.all([
+    listAllocations(userId),
+    listPayments(userId),
+  ]);
+  const payById = new Map(payments.map((p) => [p.id as string, p]));
+  const allocsByInvoice = new Map<string, any[]>();
+  for (const a of allocs) {
+    const key = a.invoice_id as string;
+    if (!allocsByInvoice.has(key)) allocsByInvoice.set(key, []);
+    allocsByInvoice.get(key)!.push(a);
   }
-  // status = "all" or unset — export all statuses
 
-  sql += ` ORDER BY i.closed_date DESC, i.invoice_number`;
+  const rows: any[] = [];
+  // Cache customer names
+  const customerNames = new Map<string, string>();
+  async function customerName(cid: string): Promise<string | null> {
+    if (customerNames.has(cid)) return customerNames.get(cid)!;
+    const c = await getCustomer(userId, cid);
+    const name = (c?.name as string) || null;
+    customerNames.set(cid, name as string);
+    return name;
+  }
 
-  const rows = db.prepare(sql).all(...params);
+  const sorted = [...invoices].sort((a, b) => {
+    const ca = String(a.closed_date || "");
+    const cb = String(b.closed_date || "");
+    if (cb !== ca) return cb.localeCompare(ca);
+    return String(a.invoice_number || "").localeCompare(String(b.invoice_number || ""));
+  });
+
+  for (const i of sorted) {
+    const name = await customerName(i.customer_id as string);
+    const related = allocsByInvoice.get(i.id as string) || [null];
+    for (const pa of related) {
+      const p = pa ? payById.get(pa.payment_id as string) : undefined;
+      rows.push({
+        invoice_number: i.invoice_number,
+        issue_date: i.issue_date,
+        due_date: i.due_date,
+        amount: i.amount,
+        balance: i.balance,
+        status: i.status,
+        closed_date: i.closed_date ?? null,
+        payment_days: i.payment_days ?? null,
+        late_payment_days: i.late_payment_days ?? null,
+        customer_name: name,
+        amount_applied: pa?.amount_applied ?? null,
+        applied_date: pa?.applied_date ?? null,
+        closed_invoice: pa?.closed_invoice ?? null,
+        payment_date: p?.payment_date ?? null,
+        payment_amount: p?.amount ?? null,
+        payment_note: p?.note ?? null,
+      });
+    }
+  }
+
   res.json({ rows });
 });
 
 // Delete invoice
-router.delete("/:id", (req: Request, res: Response) => {
-  const { id } = req.params;
+router.delete("/:id", async (req: Request, res: Response) => {
+  const { id } = req.params as { id: string };
 
-  const invoice = db
-    .prepare("SELECT id FROM invoices WHERE id = ? AND user_id = ?")
-    .get(id, req.user!.userId);
+  const invoice = await getInvoice(req.user!.userId, id);
 
   if (!invoice) {
     res.status(404).json({ error: "Invoice not found" });
     return;
   }
 
-  db.prepare("DELETE FROM invoices WHERE id = ?").run(id);
+  await deleteInvoice(req.user!.userId, id);
   res.json({ success: true });
 });
 

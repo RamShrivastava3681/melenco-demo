@@ -5,10 +5,10 @@ import { requireConnectorAuth } from "../middleware/connectorAuth.js";
 import { rateLimiters } from "../middleware/rateLimiter.js";
 import { sendError, errorHandler } from "../errors.js";
 import { formatZodError } from "../validators/schemas.js";
-import { consumePairingCode } from "../services/pairing.service.js";
-import { registerConnector, touchHeartbeat } from "../services/connector.service.js";
-import { ensureCompany } from "../services/company.service.js";
-import { startSession, requireSessionForConnector, completeSession, failSession } from "../services/syncSession.service.js";
+import { consumePairingCode, peekPairingCode as peekCode } from "../services/pairing.service.js";
+import { registerConnector, touchHeartbeat, getConnectorByPublicId } from "../services/connector.service.js";
+import { ensureCompany, requireCompanyAccess } from "../services/company.service.js";
+import { startSession, requireSessionForConnector, completeSession, failSession, declareSessionTotals as declareTotals, getSessionBySyncId } from "../services/syncSession.service.js";
 import { processBatch } from "../services/batch.service.js";
 import { buildConnectorConfig } from "../services/config.service.js";
 import { audit } from "../services/audit.service.js";
@@ -16,6 +16,14 @@ import { logInfo, logError } from "../utils/logger.js";
 import { AuthManager } from "../auth/auth-manager.js";
 import { getAccessToken, resetAccessTokenCache } from "../token-cache.js";
 import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
+import { connectSchema } from "../validators/schemas.js";
+import {
+  getSyncCommandGlobal,
+  updateSyncCommand,
+  listPendingCommandsForConnector,
+} from "../../../db/storesTally.js";
+import { heartbeatSchema, syncStartSchema, batchSchema, syncCompleteSchema, syncErrorSchema, commandAckSchema } from "../validators/schemas.js";
+import { config } from "../utils/env.js";
 
 const router = Router();
 
@@ -45,9 +53,8 @@ async function retryBatchWithFreshToken(
   }
 
   // Read current connector credentials from DB to refresh
-  const connectorRow = db.prepare(
-    `SELECT access_token, refresh_token_hash, device_id, connector_id FROM tally_connectors WHERE connector_id = ?`
-  ).get(connectorRowId) as {
+  const connectorRow = await getConnectorByPublicId(connectorRowId) as {
+    id: string;
     access_token: string | null;
     refresh_token_hash: string | null;
     device_id: string | null;
@@ -103,7 +110,7 @@ function parseBody(schema: z.ZodTypeAny, body: unknown): any {
  * Requires the pairing code to belong to the JWT-authenticated tenant context
  * carried in the pairing record itself — the code IS the transient credential.
  */
-router.post("/connect", rateLimiters.connect, (req: Request, res: Response) => {
+router.post("/connect", rateLimiters.connect, async (req: Request, res: Response) => {
   const requestId = req.requestId;
   try {
     const input = parseBody(connectSchema, req.body);
@@ -111,8 +118,8 @@ router.post("/connect", rateLimiters.connect, (req: Request, res: Response) => {
     // 1. Validate + consume pairing code (single-use, TTL-checked).
     //    The pairing record carries the tenant (user_id) — that is the
     //    authorization anchor: the connector inherits exactly that tenant.
-    const pairing = peekCode(input.pairingCode);
-    const credentials = registerConnector({
+    const pairing = await peekCode(input.pairingCode);
+    const credentials = await registerConnector({
       userId: pairing.user_id,
       pairingCodeId: pairing.id,
       connectorName: input.connectorName,
@@ -121,17 +128,20 @@ router.post("/connect", rateLimiters.connect, (req: Request, res: Response) => {
       appVersion: input.appVersion,
       requestId,
     });
-    consumePairingCode(input.pairingCode, pairing.user_id, requestId);
+    await consumePairingCode(input.pairingCode, pairing.user_id, requestId);
 
     // 2. Register companies reported by the connector (maps tally companies)
-    const companies = (input.companies || []).map((c: { guid: string; name: string }) =>
-      ensureCompany({
-        userId: pairing.user_id,
-        tallyCompanyGuid: c.guid,
-        tallyCompanyName: c.name,
-        requestId,
-      })
-    );
+    const companies: any[] = [];
+    for (const c of input.companies || []) {
+      companies.push(
+        await ensureCompany({
+          userId: pairing.user_id,
+          tallyCompanyGuid: (c as { guid: string; name: string }).guid,
+          tallyCompanyName: (c as { guid: string; name: string }).name,
+          requestId,
+        })
+      );
+    }
 
     logInfo("connect", req, `Connector ${credentials.credentials.connectorId} paired`);
 
@@ -140,7 +150,7 @@ router.post("/connect", rateLimiters.connect, (req: Request, res: Response) => {
       connectorId: credentials.credentials.connectorId,
       accessToken: credentials.credentials.accessToken, // shown exactly once
       hmacSecret: credentials.credentials.hmacSecret, // shown exactly once
-      config: buildConnectorConfig(pairing.user_id, companies[0]?.id ?? null),
+      config: await buildConnectorConfig(pairing.user_id, companies[0]?.id ?? null),
       companies: companies.map((c: any) => ({ id: c.id, tallyCompanyGuid: c.tally_company_guid, name: c.tally_company_name })),
       apiBaseUrl: credentials.credentials.apiBaseUrl,
       heartbeatIntervalSeconds: credentials.credentials.heartbeatIntervalSeconds,
@@ -150,10 +160,6 @@ router.post("/connect", rateLimiters.connect, (req: Request, res: Response) => {
     errorHandler(err, req, res);
   }
 });
-
-// helper import placed after to avoid circular import noise
-import { peekPairingCode as peekCode } from "../services/pairing.service.js";
-import { connectSchema } from "../validators/schemas.js";
 
 /**
  * Everything below requires connector authentication.
@@ -167,16 +173,17 @@ router.use("/commands", requireConnectorAuth, rateLimiters.default);
 /**
  * POST /heartbeat — liveness + pending command pickup.
  */
-router.post("/heartbeat", rateLimiters.heartbeat, (req: Request, res: Response) => {
+router.post("/heartbeat", rateLimiters.heartbeat, async (req: Request, res: Response) => {
   try {
     const input = parseBody(heartbeatSchema, req.body);
+    void input;
     const connector = req.connector!;
 
     // Record liveness so the platform Online badge + lastConnection stay fresh.
-    touchHeartbeat(connector.rowId);
+    await touchHeartbeat(connector.rowId);
 
     // Deliver any pending cloud→connector commands (FIFO, mark delivered)
-    const commands = db_allPendingCommands(connector.rowId);
+    const commands = await db_allPendingCommands(connector.rowId);
 
     res.json({
       success: true,
@@ -195,26 +202,22 @@ router.post("/heartbeat", rateLimiters.heartbeat, (req: Request, res: Response) 
  * PUSH_VOUCHERS written to Tally). Marks DONE/CANCELLED so the platform UI
  * can show Queued → Delivered → Done.
  */
-router.post("/commands/ack", (req: Request, res: Response) => {
+router.post("/commands/ack", async (req: Request, res: Response) => {
   try {
     const input = parseBody(commandAckSchema, req.body);
     const connector = req.connector!;
-    const row = db.prepare(`SELECT id, connector_id, status FROM tally_sync_commands WHERE id = ?`).get(
-      input.commandId
-    ) as { id: string; connector_id: string; status: string } | undefined;
+    const row = await getSyncCommandGlobal(input.commandId) as { id: string; connector_id: string; status: string } | undefined;
     if (!row || row.connector_id !== connector.rowId) {
       return sendError(res, "INVALID_PAYLOAD", "Unknown command for this connector", undefined, req.requestId);
     }
-    db.prepare(
-      `UPDATE tally_sync_commands SET status = ?, completed_at = datetime('now') WHERE id = ?`
-    ).run(input.status, row.id);
+    await updateSyncCommand(row as any, { status: input.status, completed_at: new Date().toISOString() });
     audit("BATCH_ACCEPTED", {
       userId: connector.userId,
       connectorId: connector.connectorId,
       requestId: req.requestId,
-      detail: { commandId: row.id, status: input.status },
+      detail: { commandId: (row as any).id, status: input.status },
     });
-    res.json({ success: true, id: row.id, status: input.status });
+    res.json({ success: true, id: (row as any).id, status: input.status });
   } catch (err) {
     errorHandler(err, req, res);
   }
@@ -223,18 +226,19 @@ router.post("/commands/ack", (req: Request, res: Response) => {
 /**
  * GET /config — full sync configuration for this tenant (+ optional company).
  */
-router.get("/config", (req: Request, res: Response) => {
+router.get("/config", async (req: Request, res: Response) => {
   try {
     const connector = req.connector!;
     const companyId = typeof req.query.companyId === "string" ? req.query.companyId : null;
     // Authorization: company must belong to the connector's tenant
     if (companyId) {
-      const row = db_getCompany(connector.userId, companyId);
-      if (!row) {
+      try {
+        await requireCompanyAccess(connector.userId, companyId);
+      } catch {
         return sendError(res, "INVALID_COMPANY", "Company not found for this account", undefined, req.requestId);
       }
     }
-    res.json({ success: true, config: buildConnectorConfig(connector.userId, companyId) });
+    res.json({ success: true, config: await buildConnectorConfig(connector.userId, companyId) });
   } catch (err) {
     errorHandler(err, req, res);
   }
@@ -243,18 +247,20 @@ router.get("/config", (req: Request, res: Response) => {
 /**
  * POST /sync/start — open a sync session.
  */
-router.post("/sync/start", (req: Request, res: Response) => {
+router.post("/sync/start", async (req: Request, res: Response) => {
   try {
     const input = parseBody(syncStartSchema, req.body);
     const connector = req.connector!;
 
     // Company must belong to this tenant — never trust client-supplied ids
-    const company = db_getCompany(connector.userId, input.companyId);
-    if (!company) {
+    let company: any;
+    try {
+      company = await requireCompanyAccess(connector.userId, input.companyId);
+    } catch {
       return sendError(res, "INVALID_COMPANY", "Company not found for this account", undefined, req.requestId);
     }
 
-    const { syncId } = startSession({
+    const { syncId } = await startSession({
       connectorRowId: connector.rowId,
       userId: connector.userId,
       companyId: company.id,
@@ -266,13 +272,14 @@ router.post("/sync/start", (req: Request, res: Response) => {
     });
 
     if (input.totalRecords || input.totalBatches) {
-      declareTotals(startedSessionRowId(syncId), input.totalRecords ?? 0, input.totalBatches ?? 0);
+      const row = await getSessionBySyncId(syncId);
+      if (row) await declareTotals(row as any, input.totalRecords ?? 0, input.totalBatches ?? 0);
     }
 
     res.status(201).json({
       success: true,
       syncId,
-      batchSize: buildConnectorConfig(connector.userId, company.id).batchLimits.maxRecords,
+      batchSize: (await buildConnectorConfig(connector.userId, company.id)).batchLimits.maxRecords,
       nextBatch: 1,
     });
   } catch (err) {
@@ -331,9 +338,7 @@ router.post("/sync/batch", rateLimiters.batch, async (req: Request, res: Respons
               throw new Error('Auth manager not initialized');
             }
 
-            const connectorRow = db.prepare(
-              `SELECT access_token, refresh_token_hash, device_id, connector_id FROM tally_connectors WHERE connector_id = ?`
-            ).get(connector.connectorId) as {
+            const connectorRow = await getConnectorByPublicId(connector.connectorId) as {
               access_token: string | null;
               refresh_token_hash: string | null;
               device_id: string | null;
@@ -388,11 +393,11 @@ router.post("/sync/batch", rateLimiters.batch, async (req: Request, res: Respons
 /**
  * POST /sync/complete — finalize a session and persist checkpoints.
  */
-router.post("/sync/complete", (req: Request, res: Response) => {
+router.post("/sync/complete", async (req: Request, res: Response) => {
   try {
     const input = parseBody(syncCompleteSchema, req.body);
     const connector = req.connector!;
-    const session = requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
+    const session = await requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
 
     if (session.status === "COMPLETED" || session.status === "PARTIAL") {
       // Idempotent replay — return current state without side effects
@@ -400,7 +405,7 @@ router.post("/sync/complete", (req: Request, res: Response) => {
       return;
     }
 
-    const updated = completeSession({
+    const updated = await completeSession({
       session,
       requestId: req.requestId,
       lastObjectId: input.lastObjectId ?? null,
@@ -417,13 +422,13 @@ router.post("/sync/complete", (req: Request, res: Response) => {
 /**
  * POST /sync/error — connector reports a fatal sync error.
  */
-router.post("/sync/error", (req: Request, res: Response) => {
+router.post("/sync/error", async (req: Request, res: Response) => {
   try {
     const input = parseBody(syncErrorSchema, req.body);
     const connector = req.connector!;
-    const session = requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
+    const session = await requireSessionForConnector(input.syncId, connector.rowId, connector.userId);
 
-    const updated = failSession(session, input.errorMessage, req.requestId);
+    const updated = await failSession(session, input.errorMessage, req.requestId);
     res.json({ success: true, session: publicSession(updated) });
   } catch (err) {
     errorHandler(err, req, res);
@@ -432,34 +437,14 @@ router.post("/sync/error", (req: Request, res: Response) => {
 
 // ---- small db helpers (keep route bodies readable) -------------------------
 
-import db from "../../../db/index.js";
-import { heartbeatSchema, syncStartSchema, batchSchema, syncCompleteSchema, syncErrorSchema, commandAckSchema } from "../validators/schemas.js";
-import { declareSessionTotals as declareTotals, getSessionBySyncId } from "../services/syncSession.service.js";
-import { config } from "../utils/env.js";
-
-function db_getCompany(userId: string, companyRowId: string): any {
-  return db
-    .prepare(`SELECT * FROM tally_companies WHERE id = ? AND user_id = ?`)
-    .get(companyRowId, userId);
-}
-
-function db_allPendingCommands(connectorRowId: string): Array<{ id: string; command: string; payload?: unknown }> {
-  const rows = db
-    .prepare(
-      `SELECT id, command, payload FROM tally_sync_commands
-       WHERE connector_id = ? AND status = 'PENDING' ORDER BY created_at LIMIT 20`
-    )
-    .all(connectorRowId) as Array<{ id: string; command: string; payload: string | null }>;
+async function db_allPendingCommands(connectorRowId: string): Promise<Array<{ id: string; command: string; payload?: unknown }>> {
+  const rows = await listPendingCommandsForConnector(connectorRowId, 20);
   if (rows.length === 0) return [];
-  db.prepare(
-    `UPDATE tally_sync_commands SET status = 'DELIVERED', delivered_at = datetime('now')
-     WHERE id IN (${rows.map((r) => `'${r.id.replace(/'/g, "''")}'`).join(",")})`
-  ).run();
-  return rows.map((r) => ({ id: r.id, command: r.command, payload: r.payload ? JSON.parse(r.payload) : undefined }));
-}
-
-function startedSessionRowId(syncId: string): string {
-  return getSessionBySyncId(syncId)!.id;
+  const now = new Date().toISOString();
+  for (const r of rows) {
+    await updateSyncCommand(r, { status: "DELIVERED", delivered_at: now });
+  }
+  return rows.map((r) => ({ id: r.id as string, command: r.command as string, payload: r.payload ? JSON.parse(r.payload as string) : undefined }));
 }
 
 function buildConnectorLimits() {

@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import db from "../db/index.js";
+import { listAllocations } from "../db/storesCore.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -7,11 +7,8 @@ const router = Router();
 router.use(requireAuth);
 
 // List all allocations
-router.get("/", (req: Request, res: Response) => {
-  const rows = db
-    .prepare("SELECT * FROM payment_allocations WHERE user_id = ?")
-    .all(req.user!.userId);
-
+router.get("/", async (req: Request, res: Response) => {
+  const rows = await listAllocations(req.user!.userId);
   res.json({ allocations: rows });
 });
 

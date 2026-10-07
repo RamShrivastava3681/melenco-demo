@@ -1,12 +1,19 @@
 import { v4 as uuidv4 } from "uuid";
-import db from "../../../db/index.js";
+import {
+  getSessionBySyncId as getBySync,
+  getActiveSession,
+  createSession,
+  updateSession,
+  cancelActiveSessionsForConnector as cancelForConnector,
+} from "../../../db/storesTally.js";
 import { ApiError } from "../errors.js";
 import { audit } from "./audit.service.js";
 import { markSync } from "./connector.service.js";
 import { recordCheckpoint } from "./checkpoint.service.js";
 import type { SyncType, EntityType } from "../constants.js";
+import type { DbItem } from "../../../db/dynamo.js";
 
-export interface SyncSessionRow {
+export interface SyncSessionRow extends DbItem {
   id: string;
   sync_id: string;
   connector_id: string;
@@ -30,19 +37,17 @@ export interface SyncSessionRow {
 
 const ACTIVE_STATUSES: SyncSessionRow["status"][] = ["PENDING", "RUNNING"];
 
-export function getSessionBySyncId(syncId: string): SyncSessionRow | undefined {
-  return db
-    .prepare(`SELECT * FROM tally_sync_sessions WHERE sync_id = ?`)
-    .get(syncId) as SyncSessionRow | undefined;
+export async function getSessionBySyncId(syncId: string): Promise<SyncSessionRow | undefined> {
+  return (await getBySync(syncId)) as SyncSessionRow | undefined;
 }
 
 /** Get a session and enforce tenant ownership. */
-export function requireSessionForConnector(
+export async function requireSessionForConnector(
   syncId: string,
   connectorRowId: string,
   userId: string
-): SyncSessionRow {
-  const session = getSessionBySyncId(syncId);
+): Promise<SyncSessionRow> {
+  const session = await getSessionBySyncId(syncId);
   if (!session) {
     throw new ApiError("INVALID_PAYLOAD", "Unknown syncId");
   }
@@ -56,7 +61,7 @@ export function requireSessionForConnector(
  * Start a sync session. Prevents unbounded concurrent sessions per
  * connector + company + entity type (an active session blocks re-start).
  */
-export function startSession(params: {
+export async function startSession(params: {
   connectorRowId: string;
   userId: string;
   companyId: string;
@@ -65,41 +70,29 @@ export function startSession(params: {
   entityType: string;
   totalBatches?: number;
   requestId?: string;
-}): { syncId: string; session: SyncSessionRow } {
-  const active = db
-    .prepare(
-      `SELECT sync_id FROM tally_sync_sessions
-       WHERE connector_id = ? AND company_id = ? AND entity_type = ? AND status IN ('PENDING','RUNNING')
-       ORDER BY started_at DESC LIMIT 1`
-    )
-    .get(params.connectorRowId, params.companyId, params.entityType) as
-    | { sync_id: string }
-    | undefined;
+}): Promise<{ syncId: string; session: SyncSessionRow }> {
+  const active = await getActiveSession(params.connectorRowId, params.companyId, params.entityType);
 
   if (active) {
     throw new ApiError("INVALID_BATCH", `A ${params.entityType} sync is already running`, {
-      activeSyncId: active.sync_id,
+      activeSyncId: active.sync_id as string,
     });
   }
 
   const syncId = `sync_${uuidv4().replace(/-/g, "").slice(0, 20)}`;
   const id = uuidv4();
 
-  db.prepare(
-    `INSERT INTO tally_sync_sessions
-       (id, sync_id, connector_id, user_id, company_id, tally_company_id, sync_type, entity_type, status, total_batches)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)`
-  ).run(
+  await createSession({
     id,
-    syncId,
-    params.connectorRowId,
-    params.userId,
-    params.companyId,
-    params.tallyCompanyId,
-    params.syncType,
-    params.entityType,
-    params.totalBatches ?? 0
-  );
+    sync_id: syncId,
+    connector_id: params.connectorRowId,
+    user_id: params.userId,
+    company_id: params.companyId,
+    tally_company_id: params.tallyCompanyId,
+    sync_type: params.syncType,
+    entity_type: params.entityType,
+    total_batches: params.totalBatches ?? 0,
+  });
 
   audit("SYNC_STARTED", {
     userId: params.userId,
@@ -109,116 +102,106 @@ export function startSession(params: {
     detail: { entityType: params.entityType, syncType: params.syncType, companyId: params.companyId },
   });
 
-  const session = getSessionBySyncId(syncId)!;
+  const session = (await getSessionBySyncId(syncId)) as SyncSessionRow;
   return { syncId, session };
 }
 
 /** Set declared totals from sync/start (optional but recommended). */
-export function declareSessionTotals(syncRowId: string, totalRecords: number, totalBatches: number): void {
-  db.prepare(
-    `UPDATE tally_sync_sessions SET total_records = MAX(total_records, ?), total_batches = MAX(total_batches, ?)
-     WHERE id = ?`
-  ).run(totalRecords, totalBatches, syncRowId);
+export async function declareSessionTotals(syncRow: SyncSessionRow, totalRecords: number, totalBatches: number): Promise<void> {
+  await updateSession(syncRow, {
+    total_records: Math.max(Number(syncRow.total_records || 0), totalRecords),
+    total_batches: Math.max(Number(syncRow.total_batches || 0), totalBatches),
+  });
 }
 
 /** Apply a processed batch's counters to the session. */
-export function applyBatchCounters(
-  syncRowId: string,
+export async function applyBatchCounters(
+  syncRow: SyncSessionRow,
   counters: { accepted: number; duplicates: number; failed: number }
-): void {
-  db.prepare(
-    `UPDATE tally_sync_sessions
-     SET processed_records = processed_records + ?,
-         successful_records = successful_records + ?,
-         duplicate_records = duplicate_records + ?,
-         failed_records = failed_records + ?,
-         processed_batches = processed_batches + 1,
-         status = 'RUNNING'
-     WHERE id = ?`
-  ).run(
-    counters.accepted + counters.duplicates + counters.failed,
-    counters.accepted,
-    counters.duplicates,
-    counters.failed,
-    syncRowId
-  );
+): Promise<void> {
+  const total = counters.accepted + counters.duplicates + counters.failed;
+  await updateSession(syncRow, {
+    processed_records: Number(syncRow.processed_records || 0) + total,
+    successful_records: Number(syncRow.successful_records || 0) + counters.accepted,
+    duplicate_records: Number(syncRow.duplicate_records || 0) + counters.duplicates,
+    failed_records: Number(syncRow.failed_records || 0) + counters.failed,
+    processed_batches: Number(syncRow.processed_batches || 0) + 1,
+    status: "RUNNING",
+  });
 }
 
 /** Reject a batch (validation failure) — counts as processed but failed. */
-export function applyBatchRejection(syncRowId: string, failedCount: number): void {
-  db.prepare(
-    `UPDATE tally_sync_sessions
-     SET processed_records = processed_records + ?, failed_records = failed_records + ?,
-         processed_batches = processed_batches + 1, status = 'RUNNING'
-     WHERE id = ?`
-  ).run(failedCount, failedCount, syncRowId);
+export async function applyBatchRejection(syncRow: SyncSessionRow, failedCount: number): Promise<void> {
+  await updateSession(syncRow, {
+    processed_records: Number(syncRow.processed_records || 0) + failedCount,
+    failed_records: Number(syncRow.failed_records || 0) + failedCount,
+    processed_batches: Number(syncRow.processed_batches || 0) + 1,
+    status: "RUNNING",
+  });
 }
 
 /**
  * Complete a session. Status derives from counters: COMPLETED when nothing
  * failed, PARTIAL when some records failed, plus checkpoint persistence.
  */
-export function completeSession(params: {
+export async function completeSession(params: {
   session: SyncSessionRow;
   requestId?: string;
   lastObjectId?: string | null;
   lastVoucherDate?: string | null;
   lastVoucherNumber?: string | null;
-}): SyncSessionRow {
-  const s = params.session;
-  const failed = s.failed_records;
+}): Promise<SyncSessionRow> {
+  const fresh = ((await getSessionBySyncId(params.session.sync_id)) || params.session) as SyncSessionRow;
+  const failed = Number(fresh.failed_records || 0);
+  const processed = Number(fresh.processed_records || 0);
   const status: SyncSessionRow["status"] =
-    failed === 0 ? "COMPLETED" : failed < s.processed_records ? "PARTIAL" : "FAILED";
+    failed === 0 ? "COMPLETED" : failed < processed ? "PARTIAL" : "FAILED";
 
-  db.prepare(
-    `UPDATE tally_sync_sessions
-     SET status = ?, completed_at = datetime('now')
-     WHERE id = ?`
-  ).run(status, s.id);
+  await updateSession(fresh, { status, completed_at: new Date().toISOString() });
 
   // Persist incremental checkpoint for this company + entity type
-  recordCheckpoint({
-    userId: s.user_id,
-    companyId: s.company_id,
-    entityType: s.entity_type,
+  await recordCheckpoint({
+    userId: fresh.user_id,
+    companyId: fresh.company_id,
+    entityType: fresh.entity_type,
     lastObjectId: params.lastObjectId ?? null,
     lastVoucherDate: params.lastVoucherDate ?? null,
     lastVoucherNumber: params.lastVoucherNumber ?? null,
   });
 
-  markSync(s.connector_id, status === "COMPLETED");
+  await markSync(fresh.connector_id, status === "COMPLETED");
 
   const event =
     status === "COMPLETED" ? "SYNC_COMPLETED" : status === "PARTIAL" ? "SYNC_PARTIAL" : "SYNC_FAILED";
   audit(event, {
-    userId: s.user_id,
-    syncId: s.sync_id,
+    userId: fresh.user_id,
+    syncId: fresh.sync_id,
     requestId: params.requestId,
     detail: {
-      entityType: s.entity_type,
-      processed: s.processed_records,
-      successful: s.successful_records,
-      duplicates: s.duplicate_records,
-      failed: s.failed_records,
+      entityType: fresh.entity_type,
+      processed: fresh.processed_records,
+      successful: fresh.successful_records,
+      duplicates: fresh.duplicate_records,
+      failed: fresh.failed_records,
     },
   });
 
-  return getSessionBySyncId(s.sync_id)!;
+  return (await getSessionBySyncId(fresh.sync_id)) as SyncSessionRow;
 }
 
 /** Mark a session failed with an error message (from sync/error). */
-export function failSession(session: SyncSessionRow, errorMessage: string, requestId?: string): SyncSessionRow {
+export async function failSession(session: SyncSessionRow, errorMessage: string, requestId?: string): Promise<SyncSessionRow> {
   if (!ACTIVE_STATUSES.includes(session.status)) {
     // Idempotent: already-final sessions stay final
     return session;
   }
-  db.prepare(
-    `UPDATE tally_sync_sessions
-     SET status = 'FAILED', completed_at = datetime('now'), error_message = ?
-     WHERE id = ?`
-  ).run(errorMessage.slice(0, 2000), session.id);
+  await updateSession(session, {
+    status: "FAILED",
+    completed_at: new Date().toISOString(),
+    error_message: errorMessage.slice(0, 2000),
+  });
 
-  markSync(session.connector_id, false);
+  await markSync(session.connector_id, false);
 
   audit("SYNC_FAILED", {
     userId: session.user_id,
@@ -227,15 +210,10 @@ export function failSession(session: SyncSessionRow, errorMessage: string, reque
     detail: { entityType: session.entity_type },
   });
 
-  return getSessionBySyncId(session.sync_id)!;
+  return (await getSessionBySyncId(session.sync_id)) as SyncSessionRow;
 }
 
 /** Cancel all active sessions for a connector (used on disconnect). */
-export function cancelActiveSessionsForConnector(connectorRowId: string): void {
-  db.prepare(
-    `UPDATE tally_sync_sessions
-     SET status = 'CANCELLED', completed_at = datetime('now'),
-         error_message = COALESCE(error_message, 'Connector disconnected')
-     WHERE connector_id = ? AND status IN ('PENDING','RUNNING')`
-  ).run(connectorRowId);
+export async function cancelActiveSessionsForConnector(connectorRowId: string): Promise<void> {
+  await cancelForConnector(connectorRowId);
 }

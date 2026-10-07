@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
-import db from "../../../db/index.js";
+import { getWConnectorByPublicId } from "../../../db/storesWhizunik.js";
 
 const DEFAULT_JWT_SECRET = "change-me-to-a-random-secret-in-production";
 
@@ -131,7 +131,7 @@ export function sendWzError(res: Response, code: WzErrorCode, message: string): 
   res.status(STATUS_FOR_CODE[code]).json({ error: { code, message } });
 }
 
-export function wzAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function wzAuthMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers.authorization;
   if (!header || !header.startsWith("Bearer ")) {
     sendWzError(res, "AUTHENTICATION_FAILED", "Missing or invalid Authorization header");
@@ -147,9 +147,7 @@ export function wzAuthMiddleware(req: Request, res: Response, next: NextFunction
     // Disconnected devices stop here: a revoked connector's JWT is dead
     // immediately, not just at the next refresh.
     try {
-      const row = db.prepare(`SELECT status FROM connectors WHERE connector_id = ?`).get(claims.connectorId) as
-        | { status: string }
-        | undefined;
+      const row = await getWConnectorByPublicId(claims.connectorId);
       if (!row || row.status !== "active") {
         sendWzError(res, "AUTHENTICATION_FAILED", "Connector has been revoked");
         return;

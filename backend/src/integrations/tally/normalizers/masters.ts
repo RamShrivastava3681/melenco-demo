@@ -1,5 +1,18 @@
-import db from "../../../db/index.js";
-import { v4 as uuidv4 } from "uuid";
+import {
+  findCustomerByName,
+  createCustomer,
+  findSupplierByName,
+  createSupplier,
+  findProductByName,
+  createProduct,
+} from "../../../db/storesCore.js";
+import {
+  findLedger,
+  createLedger,
+  updateLedger,
+  getCompany,
+} from "../../../db/storesTally.js";
+import { dbUpdate } from "../../../db/dynamo.js";
 import { ApiError } from "../errors.js";
 import type { NormalizeContext, NormalizedResult } from "./registry.js";
 
@@ -15,7 +28,7 @@ import type { NormalizeContext, NormalizedResult } from "./registry.js";
 
 interface MasterTarget {
   table: string;
-  normalize: (ctx: NormalizeContext) => NormalizedResult;
+  normalize: (ctx: NormalizeContext) => Promise<NormalizedResult>;
 }
 
 function dataOf(ctx: NormalizeContext): Record<string, any> {
@@ -42,67 +55,74 @@ function parentOf(ctx: NormalizeContext): string | null {
 }
 
 /** Insert a customer (debtor) if absent — matches existing customers table semantics. */
-function upsertCustomer(userId: string, name: string): string {
-  const existing = db
-    .prepare(`SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  if (existing) return existing.id;
-
-  const id = uuidv4();
-  db.prepare(`INSERT OR IGNORE INTO customers (id, user_id, name) VALUES (?, ?, ?)`).run(id, userId, name);
-  const row = db
-    .prepare(`SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  return row!.id;
+async function upsertCustomer(userId: string, name: string): Promise<string> {
+  const existing = await findCustomerByName(userId, name);
+  if (existing) return existing.id as string;
+  try {
+    const created = await createCustomer(userId, name);
+    return created.id as string;
+  } catch {
+    const again = await findCustomerByName(userId, name);
+    return again!.id as string;
+  }
 }
 
 /** Insert a supplier if absent. */
-function upsertSupplier(userId: string, name: string): string {
-  const existing = db
-    .prepare(`SELECT id FROM suppliers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  if (existing) return existing.id;
+async function upsertSupplier(userId: string, name: string): Promise<string> {
+  const existing = await findSupplierByName(userId, name);
+  if (existing) return existing.id as string;
+  const created = await createSupplier(userId, name);
+  return created.id as string;
+}
 
-  const id = uuidv4();
-  db.prepare(`INSERT OR IGNORE INTO suppliers (id, user_id, name) VALUES (?, ?, ?)`).run(id, userId, name);
-  const row = db
-    .prepare(`SELECT id FROM suppliers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  return row!.id;
+async function upsertLedgerType(
+  ctx: NormalizeContext,
+  name: string,
+  ledgerType: string
+): Promise<string> {
+  const existing = await findLedger(ctx.userId, ctx.companyId, name);
+  if (existing && existing.ledger_type === ledgerType) return existing.id as string;
+  if (existing) {
+    await updateLedger(existing, { parent_group: parentOf(ctx) ?? existing.parent_group, ledger_type: ledgerType });
+    return existing.id as string;
+  }
+  const created = await createLedger({
+    user_id: ctx.userId,
+    company_id: ctx.companyId,
+    name,
+    parent_group: parentOf(ctx),
+    ledger_type: ledgerType,
+  });
+  return created.id as string;
 }
 
 export const MASTER_TARGETS: Record<string, MasterTarget> = {
   COMPANY: {
     table: "tally_companies",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const name = masterName(ctx);
-      db.prepare(
-        `UPDATE tally_companies SET tally_company_name = ?, display_name = COALESCE(?, display_name) WHERE id = ?`
-      ).run(name, (d.display as string) || null, ctx.companyId);
+      const company = await getCompany(ctx.userId, ctx.companyId);
+      if (company) {
+        await dbUpdate(company.pk, company.sk, {
+          tally_company_name: name,
+          display_name: (d.display as string) || company.display_name || null,
+        });
+      }
       return { table: "tally_companies", recordId: ctx.companyId };
     },
   },
   GROUP: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, parent_group, ledger_type)
-         VALUES (?, ?, ?, ?, ?, 'GROUP')`
-      ).run(id, ctx.userId, ctx.companyId, name, parentOf(ctx));
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'GROUP'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "GROUP");
+      return { table: "tally_ledgers", recordId };
     },
   },
   LEDGER: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const name = masterName(ctx);
       const parent = parentOf(ctx);
@@ -111,167 +131,116 @@ export const MASTER_TARGETS: Record<string, MasterTarget> = {
       // Party ledgers map to WhizUnik customers/suppliers; others stay as ledgers
       const partyType = typeof d.partyType === "string" ? d.partyType.toLowerCase() : "";
       if (partyType === "debtor" || partyType === "customer") {
-        const customerId = upsertCustomer(ctx.userId, name);
-        ensureLedgerRow(ctx, name, parent, opening, "PARTY_DEBTOR");
+        const customerId = await upsertCustomer(ctx.userId, name);
+        await ensureLedgerRow(ctx, name, parent, opening, "PARTY_DEBTOR");
         return { table: "customers", recordId: customerId };
       }
       if (partyType === "creditor" || partyType === "supplier") {
-        const supplierId = upsertSupplier(ctx.userId, name);
-        ensureLedgerRow(ctx, name, parent, opening, "PARTY_CREDITOR");
+        const supplierId = await upsertSupplier(ctx.userId, name);
+        await ensureLedgerRow(ctx, name, parent, opening, "PARTY_CREDITOR");
         return { table: "suppliers", recordId: supplierId };
       }
 
-      const id = ensureLedgerRow(ctx, name, parent, opening, d.ledgerType || null);
+      const id = await ensureLedgerRow(ctx, name, parent, opening, d.ledgerType || null);
       return { table: "tally_ledgers", recordId: id };
     },
   },
   STOCK_GROUP: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, parent_group, ledger_type)
-         VALUES (?, ?, ?, ?, ?, 'STOCK_GROUP')`
-      ).run(id, ctx.userId, ctx.companyId, name, parentOf(ctx));
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'STOCK_GROUP'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "STOCK_GROUP");
+      return { table: "tally_ledgers", recordId };
     },
   },
   STOCK_CATEGORY: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, parent_group, ledger_type)
-         VALUES (?, ?, ?, ?, ?, 'STOCK_CATEGORY')`
-      ).run(id, ctx.userId, ctx.companyId, name, parentOf(ctx));
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'STOCK_CATEGORY'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "STOCK_CATEGORY");
+      return { table: "tally_ledgers", recordId };
     },
   },
   STOCK_ITEM: {
     table: "products",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const name = masterName(ctx);
-      const existing = db
-        .prepare(`SELECT id FROM products WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-        .get(ctx.userId, name) as { id: string } | undefined;
+      const existing = await findProductByName(ctx.userId, name);
 
-      if (existing) return { table: "products", recordId: existing.id };
+      if (existing) return { table: "products", recordId: existing.id as string };
 
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO products (id, user_id, name, group_name, category, base_unit, description)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        id,
-        ctx.userId,
-        name,
-        (d.group as string) || null,
-        (d.category as string) || null,
-        (d.baseUnit || d.unit as string) || null,
-        (d.description as string) || null
-      );
-      const row = db
-        .prepare(`SELECT id FROM products WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-        .get(ctx.userId, name) as { id: string };
-      return { table: "products", recordId: row.id };
+      try {
+        const created = await createProduct(ctx.userId, {
+          name,
+          group_name: (d.group as string) || null,
+          category: (d.category as string) || null,
+          base_unit: ((d.baseUnit || d.unit) as string) || null,
+          description: (d.description as string) || null,
+        });
+        return { table: "products", recordId: created.id as string };
+      } catch {
+        const again = await findProductByName(ctx.userId, name);
+        return { table: "products", recordId: again!.id as string };
+      }
     },
   },
   UNIT: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, ledger_type)
-         VALUES (?, ?, ?, ?, 'UNIT')`
-      ).run(id, ctx.userId, ctx.companyId, name);
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'UNIT'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "UNIT");
+      return { table: "tally_ledgers", recordId };
     },
   },
   GODOWN: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, ledger_type)
-         VALUES (?, ?, ?, ?, 'GODOWN')`
-      ).run(id, ctx.userId, ctx.companyId, name);
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'GODOWN'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "GODOWN");
+      return { table: "tally_ledgers", recordId };
     },
   },
   VOUCHER_TYPE: {
     table: "tally_ledgers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const name = masterName(ctx);
-      const id = uuidv4();
-      db.prepare(
-        `INSERT OR IGNORE INTO tally_ledgers (id, user_id, company_id, name, ledger_type)
-         VALUES (?, ?, ?, ?, 'VOUCHER_TYPE')`
-      ).run(id, ctx.userId, ctx.companyId, name);
-      const row = db
-        .prepare(
-          `SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ? AND ledger_type = 'VOUCHER_TYPE'`
-        )
-        .get(ctx.userId, ctx.companyId, name) as { id: string };
-      return { table: "tally_ledgers", recordId: row.id };
+      const recordId = await upsertLedgerType(ctx, name, "VOUCHER_TYPE");
+      return { table: "tally_ledgers", recordId };
     },
   },
 };
 
-function ensureLedgerRow(
+async function ensureLedgerRow(
   ctx: NormalizeContext,
   name: string,
   parent: string | null,
   opening: number,
   ledgerType: string | null
-): string {
-  const existing = db
-    .prepare(`SELECT id FROM tally_ledgers WHERE user_id = ? AND company_id = ? AND name = ?`)
-    .get(ctx.userId, ctx.companyId, name) as { id: string } | undefined;
+): Promise<string> {
+  const existing = await findLedger(ctx.userId, ctx.companyId, name);
 
   if (existing) {
-    db.prepare(
-      `UPDATE tally_ledgers SET parent_group = COALESCE(?, parent_group),
-         opening_balance = ?, ledger_type = COALESCE(?, ledger_type), updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(parent, opening, ledgerType, existing.id);
-    return existing.id;
+    const attrs: Record<string, any> = { opening_balance: opening };
+    if (parent) attrs.parent_group = parent;
+    if (ledgerType) attrs.ledger_type = ledgerType;
+    await updateLedger(existing, attrs);
+    return existing.id as string;
   }
 
-  const id = uuidv4();
-  db.prepare(
-    `INSERT INTO tally_ledgers (id, user_id, company_id, name, parent_group, ledger_type, opening_balance)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, ctx.userId, ctx.companyId, name, parent, ledgerType, opening);
-  return id;
+  const created = await createLedger({
+    user_id: ctx.userId,
+    company_id: ctx.companyId,
+    name,
+    parent_group: parent,
+    ledger_type: ledgerType,
+    opening_balance: opening,
+  });
+  return created.id as string;
 }
 
 /** Dispatch helper used by the registry. */
-export function normalizeMaster(ctx: NormalizeContext): NormalizedResult {
+export async function normalizeMaster(ctx: NormalizeContext): Promise<NormalizedResult> {
   const target = MASTER_TARGETS[ctx.entityType];
   if (!target) {
     throw new ApiError("NORMALIZATION_FAILED", `Unsupported master entity ${ctx.entityType}`);

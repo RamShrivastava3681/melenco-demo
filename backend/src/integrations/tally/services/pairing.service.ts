@@ -1,9 +1,12 @@
-import { v4 as uuidv4 } from "uuid";
-import db from "../../../db/index.js";
-import { config } from "../utils/env.js";
 import { generatePairingCode, sha256, safeEqual } from "../utils/crypto.js";
+import { config } from "../utils/env.js";
 import { ApiError } from "../errors.js";
 import { audit } from "./audit.service.js";
+import {
+  createPairingRow,
+  getPairingByCodeHash,
+  markPairingUsed,
+} from "../../../db/storesTally.js";
 
 export interface PairingCode {
   id: string;
@@ -12,36 +15,28 @@ export interface PairingCode {
 }
 
 /** Generate a new pairing code for the authenticated user (hashed at rest). */
-export function createPairingCode(userId: string, requestId?: string): PairingCode {
+export async function createPairingCode(userId: string, requestId?: string): Promise<PairingCode> {
   const code = generatePairingCode();
-  const id = uuidv4();
   const expiresAt = new Date(Date.now() + config.pairingCodeTtlMinutes * 60_000).toISOString();
 
-  db.prepare(
-    `INSERT INTO tally_pairing_codes (id, user_id, code_hash, expires_at)
-     VALUES (?, ?, ?, ?)`
-  ).run(id, userId, sha256(code), expiresAt);
+  const row = await createPairingRow(userId, sha256(code), expiresAt);
 
   audit("PAIRING_CODE_CREATED", { userId, requestId, detail: { expiresAt } });
-  return { id, code, expiresAt };
+  return { id: row.id as string, code, expiresAt };
 }
 
 /**
  * Consume a pairing code. Single-use: marks used immediately on success so a
  * concurrent reuse fails. Throws structured errors on invalid/expired/used codes.
  */
-export function consumePairingCode(
+export async function consumePairingCode(
   code: string,
   userId: string,
   requestId?: string
-): { id: string } {
+): Promise<{ id: string }> {
   const codeHash = sha256(code);
 
-  const row = db
-    .prepare(
-      `SELECT id, user_id, expires_at, used_at, attempts FROM tally_pairing_codes WHERE code_hash = ?`
-    )
-    .get(codeHash) as
+  const row = await getPairingByCodeHash(codeHash) as
     | { id: string; user_id: string; expires_at: string; used_at: string | null; attempts: number }
     | undefined;
 
@@ -71,17 +66,14 @@ export function consumePairingCode(
   }
 
   // Mark used immediately (single-use)
-  db.prepare(`UPDATE tally_pairing_codes SET used_at = datetime('now') WHERE id = ?`).run(row.id);
+  const full = await getPairingByCodeHash(codeHash);
+  if (full) await markPairingUsed(full);
   return { id: row.id };
 }
 
 /** Look up a code without consuming it (used by connect flow before full validation). */
-export function peekPairingCode(code: string): { id: string; user_id: string; expires_at: string; used_at: string | null } {
-  const row = db
-    .prepare(
-      `SELECT id, user_id, expires_at, used_at FROM tally_pairing_codes WHERE code_hash = ?`
-    )
-    .get(sha256(code)) as
+export async function peekPairingCode(code: string): Promise<{ id: string; user_id: string; expires_at: string; used_at: string | null }> {
+  const row = await getPairingByCodeHash(sha256(code)) as
     | { id: string; user_id: string; expires_at: string; used_at: string | null }
     | undefined;
   if (!row) throw new ApiError("AUTHENTICATION_FAILED", "Invalid pairing code");

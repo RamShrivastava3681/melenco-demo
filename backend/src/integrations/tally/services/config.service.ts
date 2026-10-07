@@ -1,4 +1,3 @@
-import db from "../../../db/index.js";
 import { config } from "../utils/env.js";
 import { RECORD_ENTITY_TYPES, REPORT_ENTITY_TYPES } from "../constants.js";
 import { listCheckpointsForCompany } from "./checkpoint.service.js";
@@ -72,8 +71,8 @@ export function getEntityConfigs(): EntitySyncConfig[] {
  * reportQueries are declarative placeholders — the cloud never guesses Tally
  * XML; operators supply per-version query definitions via env/config later.
  */
-export function buildConnectorConfig(userId: string, companyId: string | null) {
-  const checkpoints = companyId ? listCheckpointsForCompany(userId, companyId) : [];
+export async function buildConnectorConfig(userId: string, companyId: string | null) {
+  const checkpoints = companyId ? await listCheckpointsForCompany(userId, companyId) : [];
 
   const reportQueries = Object.fromEntries(
     REPORT_ENTITY_TYPES.map((rt) => [rt, { enabled: false, queryTemplate: null as string | null }])

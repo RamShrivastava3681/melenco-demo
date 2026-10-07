@@ -13,7 +13,10 @@ module.exports = {
         // The backend refuses to boot in production without a real secret
         // (empty/default silently invalidates every connector token).
         JWT_SECRET: "REPLACE_WITH_STRONG_RANDOM_SECRET", // ← Set this to a strong random value!
-        DATABASE_URL: "./data/ledgerly.db",
+        AWS_REGION: "ap-south-1",
+        AWS_ACCESS_KEY_ID: "", // ← IAM credentials with DynamoDB access to the table below
+        AWS_SECRET_ACCESS_KEY: "", // ← (or omit both when running on infra with an instance role)
+        DYNAMODB_TABLE_PREFIX: "mickey-mouse", // ← DynamoDB single-table name (pk + sk)
         ADMIN_EMAIL: "", // ← Set to seed an admin user on first boot (e.g. "admin@example.com")
         ADMIN_PASSWORD: "", // ← Set alongside ADMIN_EMAIL (min 6 chars)
         FRONTEND_URL: "https://excel.frillchills.com",

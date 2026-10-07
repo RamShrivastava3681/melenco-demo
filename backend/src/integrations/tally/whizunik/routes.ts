@@ -1,7 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "node:crypto";
-import db from "../../../db/index.js";
 import {
   wzConnectSchema,
   wzTokenSchema,
@@ -35,6 +34,58 @@ import {
 import { generatePairingCode } from "../utils/crypto.js";
 import { requireAuth } from "../../../middleware/auth.js";
 import { publicApiBaseUrl, WHIZUNIK_PROTOCOL_VERSION } from "./baseUrl.js";
+import {
+  ensureTenant as ensureWzTenant,
+  getTenant as getWzTenant,
+  getWConnectorByPublicId,
+  findWConnectorByDevice,
+  createWConnector,
+  updateWConnector,
+  findWCompanyByGuid,
+  findWCompanyByName,
+  getWCompany,
+  createWCompany,
+  updateWCompany,
+  latestWCompanyForTenant,
+  getWSyncBatchByBatchId,
+  getWSyncBatchByRequestId,
+  createWSyncBatch,
+  listWSyncBatches,
+  getWPairing,
+  createWPairing,
+  markWPairingUsed,
+  createWSyncRecord,
+  listWSyncRecords,
+  createWCommand,
+  getWCommand,
+  listPendingWCommands,
+  listWCommands,
+  updateWCommand,
+  getMasterLink,
+  putMasterLink,
+  updateMasterLink,
+  createMasterAttempt,
+  listMasterAttempts,
+} from "../../../db/storesWhizunik.js";
+import {
+  getPairingByCodeHash,
+  markPairingUsed,
+  getConnectorByPublicId as getLegacyConnector,
+  getCompany as getLegacyCompany,
+  createSyncCommand,
+  getSyncCommandGlobal,
+  listSyncCommandsForUser,
+} from "../../../db/storesTally.js";
+import {
+  getUserById,
+  getCustomer,
+  getSupplier,
+  getProduct,
+  listCustomers,
+  listSuppliers,
+  listProducts,
+  listInvoices,
+} from "../../../db/storesCore.js";
 
 const router = Router();
 
@@ -48,52 +99,38 @@ function newCompanyId(): string {
   return `whiz-company-${crypto.randomBytes(3).toString("hex")}`;
 }
 
-function ensureTenant(id: string, name: string): { id: string; name: string } {
-  const existing = db.prepare(`SELECT id, name FROM tenants WHERE id = ?`).get(id) as
-    | { id: string; name: string }
-    | undefined;
-  if (existing) return existing;
-  db.prepare(`INSERT INTO tenants (id, name) VALUES (?, ?)`).run(id, name);
-  return { id, name };
+async function ensureTenant(id: string, name: string): Promise<{ id: string; name: string }> {
+  const existing = await ensureWzTenant(id, name);
+  return { id: existing.id as string, name: (existing.name as string) || name };
 }
 
-function tenantNameFor(tenantId: string): string {
-  const t = db.prepare(`SELECT name FROM tenants WHERE id = ?`).get(tenantId) as
-    | { name: string }
-    | undefined;
-  if (t?.name) return t.name;
+async function tenantNameFor(tenantId: string): Promise<string> {
+  const t = await getWzTenant(tenantId);
+  if (t?.name) return t.name as string;
   // Bridge legacy users table (tenant == users.id in the existing app)
   try {
-    const u = db.prepare(`SELECT name FROM users WHERE id = ?`).get(tenantId) as
-      | { name: string }
-      | undefined;
-    if (u?.name) return u.name || "Tenant Name";
+    const u = await getUserById(tenantId);
+    if (u?.name) return (u.name as string) || "Tenant Name";
   } catch { /* users table may not exist in isolation */ }
   return "Tenant Name";
 }
 
-function ensureCompany(tenantId: string, name: string, tallyGuid?: string | null): { id: string; tallyGuid: string | null } {
+async function ensureCompany(tenantId: string, name: string, tallyGuid?: string | null): Promise<{ id: string; tallyGuid: string | null }> {
   const guid = tallyGuid?.trim() ? tallyGuid.trim() : null;
   if (guid) {
-    const byGuid = db.prepare(`SELECT id, tally_guid FROM companies WHERE tenant_id = ? AND tally_guid = ?`).get(
-      tenantId, guid
-    ) as { id: string; tally_guid: string | null } | undefined;
+    const byGuid = await findWCompanyByGuid(tenantId, guid);
     if (byGuid) {
-      if (name && name !== undefined) {
-        try { db.prepare(`UPDATE companies SET name = ? WHERE id = ?`).run(name, byGuid.id); } catch { /* noop */ }
+      if (name && name !== undefined && byGuid.name !== name) {
+        try { await updateWCompany(byGuid, { name }); } catch { /* noop */ }
       }
-      return { id: byGuid.id, tallyGuid: byGuid.tally_guid };
+      return { id: byGuid.id as string, tallyGuid: (byGuid.tally_guid as string) ?? null };
     }
   } else {
-    const byName = db.prepare(`SELECT id, tally_guid FROM companies WHERE tenant_id = ? AND name = ? AND tally_guid IS NULL`).get(
-      tenantId, name
-    ) as { id: string; tally_guid: string | null } | undefined;
-    if (byName) return { id: byName.id, tallyGuid: byName.tally_guid };
+    const byName = await findWCompanyByName(tenantId, name);
+    if (byName && !byName.tally_guid) return { id: byName.id as string, tallyGuid: null };
   }
   const id = newCompanyId();
-  db.prepare(`INSERT INTO companies (id, tally_guid, tenant_id, name) VALUES (?, ?, ?, ?)`).run(
-    id, guid, tenantId, name
-  );
+  await createWCompany({ id, tally_guid: guid, tenant_id: tenantId, name });
   return { id, tallyGuid: guid };
 }
 
@@ -108,79 +145,74 @@ function ensureCompany(tenantId: string, name: string, tallyGuid?: string | null
  *   2. tally_guid match (legacy guid)
  *   3. name match (legacy name, incl. rows whose tally_guid IS NULL)
  */
-function resolveBatchCompany(tenantId: string, companyIdInput: string): { id: string; tenant_id: string } | null {
-  const byId = db.prepare(`SELECT id, tenant_id FROM companies WHERE id = ?`).get(companyIdInput) as
-    | { id: string; tenant_id: string }
-    | undefined;
-  if (byId && byId.tenant_id === tenantId) return byId;
+async function resolveBatchCompany(tenantId: string, companyIdInput: string): Promise<{ id: string; tenant_id: string } | null> {
+  const byId = await getWCompany(companyIdInput);
+  if (byId && byId.tenant_id === tenantId) return { id: byId.id as string, tenant_id: byId.tenant_id as string };
 
   const trimmed = companyIdInput.trim();
   if (trimmed) {
-    const byGuid = db.prepare(`SELECT id, tenant_id FROM companies WHERE tenant_id = ? AND tally_guid = ?`).get(
-      tenantId, trimmed
-    ) as { id: string; tenant_id: string } | undefined;
-    if (byGuid) return byGuid;
+    const byGuid = await findWCompanyByGuid(tenantId, trimmed);
+    if (byGuid) return { id: byGuid.id as string, tenant_id: byGuid.tenant_id as string };
 
-    const byName = db.prepare(`SELECT id, tenant_id FROM companies WHERE tenant_id = ? AND name = ?`).get(
-      tenantId, trimmed
-    ) as { id: string; tenant_id: string } | undefined;
-    if (byName) return byName;
+    const byName = await findWCompanyByName(tenantId, trimmed);
+    if (byName) return { id: byName.id as string, tenant_id: byName.tenant_id as string };
   }
   return null;
 }
 
-function issuePair(connectorId: string, deviceId: string, tenantId: string) {
+async function updateWConnectorByPublicId(connectorId: string, attrs: Record<string, any>): Promise<void> {
+  const row = await getWConnectorByPublicId(connectorId);
+  if (row) await updateWConnector(row, attrs);
+}
+
+async function issuePair(connectorId: string, deviceId: string, tenantId: string) {
   const access = signAccessToken(connectorId, deviceId, tenantId);
   const refresh = signRefreshToken(connectorId, deviceId, tenantId);
-  db.prepare(`UPDATE connectors SET refresh_token_hash = ?, updated_at = datetime('now') WHERE connector_id = ?`).run(
-    sha256(refresh), connectorId
-  );
+  await updateWConnectorByPublicId(connectorId, { refresh_token_hash: sha256(refresh) });
   return { accessToken: access.token, accessTokenExpiresAt: access.expiresAt, refreshToken: refresh };
 }
 
-function connectResponse(connectorId: string, deviceId: string, tenantId: string, company: { id: string; tallyGuid: string | null }) {
-  const pair = issuePair(connectorId, deviceId, tenantId);
+async function connectResponse(connectorId: string, deviceId: string, tenantId: string, company: { id: string; tallyGuid: string | null }) {
+  const pair = await issuePair(connectorId, deviceId, tenantId);
   return {
     connectorId,
     accessToken: pair.accessToken,
     refreshToken: pair.refreshToken,
     accessTokenExpiresAt: pair.accessTokenExpiresAt,
-    tenant: { id: tenantId, name: tenantNameFor(tenantId) },
+    tenant: { id: tenantId, name: await tenantNameFor(tenantId) },
     companyMapping: { tallyCompanyGuid: company.tallyGuid, whizunikCompanyId: company.id },
   };
 }
 
 /** Look up a pairing code in the new table, then fall back to legacy tally_pairing_codes. */
-function lookupPairingCode(code: string): {
+async function lookupPairingCode(code: string): Promise<{
   kind: "whizunik" | "legacy";
   tenantId: string;
   companyName?: string | null;
   tallyGuid?: string | null;
   expiresAt: string;
   usedAt?: string | null;
-} | null {
-  const wz = db.prepare(`SELECT code, tenant_id, company_name, tally_guid, expires_at, used_at FROM pairing_codes WHERE code = ?`).get(code) as
-    | { code: string; tenant_id: string; company_name: string | null; tally_guid: string | null; expires_at: string; used_at: string | null }
-    | undefined;
+} | null> {
+  const wz = await getWPairing(code);
   if (wz) {
-    return { kind: "whizunik", tenantId: wz.tenant_id, companyName: wz.company_name, tallyGuid: wz.tally_guid, expiresAt: wz.expires_at, usedAt: wz.used_at };
+    return { kind: "whizunik", tenantId: wz.tenant_id as string, companyName: (wz.company_name as string) ?? null, tallyGuid: (wz.tally_guid as string) ?? null, expiresAt: wz.expires_at as string, usedAt: (wz.used_at as string) ?? null };
   }
   try {
-    const legacy = db.prepare(`SELECT id, user_id, expires_at, used_at FROM tally_pairing_codes WHERE code_hash = ?`).get(
-      sha256(code)
-    ) as { id: string; user_id: string; expires_at: string; used_at: string | null } | undefined;
+    const legacy = await getPairingByCodeHash(sha256(code));
     if (legacy) {
-      return { kind: "legacy", tenantId: legacy.user_id, expiresAt: legacy.expires_at, usedAt: legacy.used_at };
+      return { kind: "legacy", tenantId: legacy.user_id as string, expiresAt: legacy.expires_at as string, usedAt: (legacy.used_at as string) ?? null };
     }
   } catch { /* legacy table may not exist */ }
   return null;
 }
 
-function consumePairingCode(code: string, found: { kind: "whizunik" | "legacy"; tenantId: string }): void {
+async function consumePairingCode(code: string, found: { kind: "whizunik" | "legacy"; tenantId: string }): Promise<void> {
   if (found.kind === "whizunik") {
-    db.prepare(`UPDATE pairing_codes SET used_at = datetime('now') WHERE code = ?`).run(code);
+    const row = await getWPairing(code);
+    if (row) await markWPairingUsed(row);
   } else {
-    db.prepare(`UPDATE tally_pairing_codes SET used_at = datetime('now') WHERE code_hash = ?`).run(sha256(code));
+    const row = await getPairingByCodeHash(sha256(code));
+    if (row) await markPairingUsed(row);
   }
 }
 
@@ -221,80 +253,78 @@ router.post(
       next(); // legacy connector — handled by connector.routes.ts
       return;
     }
-    const parsed = wzConnectSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    const input = parsed.data;
-    try {
-      const found = lookupPairingCode(input.pairingCode);
-      if (!found) {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Invalid pairing code");
+    void (async () => {
+      const parsed = wzConnectSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
         return;
       }
-      if (found.usedAt) {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Pairing code already used");
-        return;
-      }
-      if (new Date(found.expiresAt).getTime() < Date.now()) {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Pairing code expired — generate a new one");
-        return;
-      }
-
-      ensureTenant(found.tenantId, tenantNameFor(found.tenantId));
-      const company = ensureCompany(found.tenantId, input.company.name, input.company.tallyGuid ?? found.tallyGuid ?? undefined);
-
-      const connectorId = newConnectorId();
-      db.prepare(
-        `INSERT INTO connectors (id, connector_id, device_id, device_name, tenant_id, status, app_version, protocol_version)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`
-      ).run(uuidv4(), connectorId, input.deviceId, input.deviceName, found.tenantId, input.appVersion, input.protocolVersion);
-
-      // Re-pairing the same device must not pile up ghost devices in the
-      // dashboard: older live connectors for this (tenant, device) are
-      // superseded — hidden from the device list and unable to refresh.
-      // (Their access tokens die at the auth check; refresh hashes cleared.)
+      const input = parsed.data;
       try {
-        const stale = db.prepare(
-          `SELECT connector_id FROM connectors
-           WHERE tenant_id = ? AND device_id = ? AND connector_id != ? AND status = 'active'`
-        ).all(found.tenantId, input.deviceId, connectorId) as Array<{ connector_id: string }>;
-        if (stale.length > 0) {
-          db.prepare(
-            `UPDATE connectors SET status = 'replaced', refresh_token_hash = NULL, updated_at = datetime('now')
-             WHERE tenant_id = ? AND device_id = ? AND connector_id != ? AND status = 'active'`
-          ).run(found.tenantId, input.deviceId, connectorId);
-          for (const s of stale) {
+        const found = await lookupPairingCode(input.pairingCode);
+        if (!found) {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Invalid pairing code");
+          return;
+        }
+        if (found.usedAt) {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Pairing code already used");
+          return;
+        }
+        if (new Date(found.expiresAt).getTime() < Date.now()) {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Pairing code expired — generate a new one");
+          return;
+        }
+
+        await ensureTenant(found.tenantId, await tenantNameFor(found.tenantId));
+        const company = await ensureCompany(found.tenantId, input.company.name, input.company.tallyGuid ?? found.tallyGuid ?? undefined);
+
+        const connectorId = newConnectorId();
+        await createWConnector({
+          id: uuidv4(),
+          connector_id: connectorId,
+          device_id: input.deviceId,
+          device_name: input.deviceName,
+          tenant_id: found.tenantId,
+          app_version: input.appVersion,
+          protocol_version: input.protocolVersion,
+        });
+
+        // Re-pairing the same device must not pile up ghost devices in the
+        // dashboard: older live connectors for this (tenant, device) are
+        // superseded — hidden from the device list and unable to refresh.
+        // (Their access tokens die at the auth check; refresh hashes cleared.)
+        try {
+          const stale = await findWConnectorByDevice(found.tenantId, input.deviceId, connectorId);
+          if (stale) {
+            await updateWConnector(stale, { status: "replaced", refresh_token_hash: null });
             try {
-              db.prepare(
-                `UPDATE connector_commands SET status = 'CANCELLED', completed_at = datetime('now')
-                 WHERE connector_id = ? AND status IN ('PENDING', 'DELIVERED')`
-              ).run(s.connector_id);
+              const pending = await listPendingWCommands(stale.connector_id as string, 100);
+              const now = new Date().toISOString();
+              for (const cmd of pending) {
+                await updateWCommand(cmd, { status: "CANCELLED", completed_at: now });
+              }
             } catch { /* ignore per-device cleanup failures */ }
           }
-        }
-      } catch { /* supersede is best-effort; the new pairing already succeeded */ }
+        } catch { /* supersede is best-effort; the new pairing already succeeded */ }
 
-      consumePairingCode(input.pairingCode, found);
+        await consumePairingCode(input.pairingCode, found);
 
-      try {
-        db.prepare(
-          `INSERT INTO tally_audit_logs (id, user_id, connector_id, event, detail)
-           VALUES (?, ?, ?, 'CONNECTOR_CONNECTED', ?)`
-        ).run(
-          uuidv4(),
-          found.tenantId,
-          connectorId,
-          JSON.stringify({ deviceName: input.deviceName, appVersion: input.appVersion, protocol: "whizunik" })
-        );
-      } catch { /* audit must never break connect */ }
+        try {
+          const { writeAudit } = await import("../../../db/storesTally.js");
+          await writeAudit({
+            userId: found.tenantId,
+            connectorId,
+            event: "CONNECTOR_CONNECTED",
+            detail: { deviceName: input.deviceName, appVersion: input.appVersion, protocol: "whizunik" },
+          });
+        } catch { /* audit must never break connect */ }
 
-      res.status(200).json(connectResponse(connectorId, input.deviceId, found.tenantId, company));
-    } catch (err) {
-      console.error("[whizunik][connect] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+        res.status(200).json(await connectResponse(connectorId, input.deviceId, found.tenantId, company));
+      } catch (err) {
+        console.error("[whizunik][connect] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   }
 );
 
@@ -306,56 +336,54 @@ router.post(
   "/token",
   wzRateLimit(60 * 60_000, 120, (req) => `wz-token|${req.ip || "unknown"}`),
   (req: Request, res: Response) => {
-    const parsed = wzTokenSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    const input = parsed.data;
-    try {
-      let claims;
+    void (async () => {
+      const parsed = wzTokenSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
+        return;
+      }
+      const input = parsed.data;
       try {
-        claims = verifyRefreshToken(input.refreshToken);
-      } catch (e: unknown) {
-        const code = (e as { code?: string })?.code === "TOKEN_EXPIRED" ? "TOKEN_EXPIRED" : "AUTHENTICATION_FAILED";
-        sendWzError(res, code as "TOKEN_EXPIRED" | "AUTHENTICATION_FAILED", (e as Error)?.message || "Invalid refresh token");
-        return;
-      }
-      if (claims.connectorId !== input.connectorId || claims.deviceId !== input.deviceId) {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Refresh token does not match connector or device");
-        return;
-      }
-      const row = db.prepare(`SELECT connector_id, device_id, tenant_id, status, refresh_token_hash FROM connectors WHERE connector_id = ?`).get(
-        input.connectorId
-      ) as { connector_id: string; device_id: string | null; tenant_id: string; status: string; refresh_token_hash: string | null } | undefined;
-      if (!row || row.status !== "active") {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Connector has been revoked");
-        return;
-      }
-      if (!row.refresh_token_hash || row.refresh_token_hash !== sha256(input.refreshToken)) {
-        sendWzError(res, "AUTHENTICATION_FAILED", "Invalid refresh token");
-        return;
-      }
+        let claims;
+        try {
+          claims = verifyRefreshToken(input.refreshToken);
+        } catch (e: unknown) {
+          const code = (e as { code?: string })?.code === "TOKEN_EXPIRED" ? "TOKEN_EXPIRED" : "AUTHENTICATION_FAILED";
+          sendWzError(res, code as "TOKEN_EXPIRED" | "AUTHENTICATION_FAILED", (e as Error)?.message || "Invalid refresh token");
+          return;
+        }
+        if (claims.connectorId !== input.connectorId || claims.deviceId !== input.deviceId) {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Refresh token does not match connector or device");
+          return;
+        }
+        const row = await getWConnectorByPublicId(input.connectorId);
+        if (!row || row.status !== "active") {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Connector has been revoked");
+          return;
+        }
+        if (!row.refresh_token_hash || row.refresh_token_hash !== sha256(input.refreshToken)) {
+          sendWzError(res, "AUTHENTICATION_FAILED", "Invalid refresh token");
+          return;
+        }
 
-      // Company mapping: latest company for this tenant (or the one from the last batch)
-      const company = db.prepare(`SELECT id, tally_guid FROM companies WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1`).get(
-        row.tenant_id
-      ) as { id: string; tally_guid: string | null } | undefined;
-      const mapping = company ?? { id: "", tally_guid: null };
+        // Company mapping: latest company for this tenant (or the one from the last batch)
+        const company = await latestWCompanyForTenant(row.tenant_id as string);
+        const mapping = company ?? { id: "", tally_guid: null };
 
-      const pair = issuePair(row.connector_id, row.device_id || input.deviceId, row.tenant_id);
-      res.status(200).json({
-        connectorId: row.connector_id,
-        accessToken: pair.accessToken,
-        refreshToken: pair.refreshToken,
-        accessTokenExpiresAt: pair.accessTokenExpiresAt,
-        tenant: { id: row.tenant_id, name: tenantNameFor(row.tenant_id) },
-        companyMapping: { tallyCompanyGuid: mapping.tally_guid, whizunikCompanyId: mapping.id },
-      });
-    } catch (err) {
-      console.error("[whizunik][token] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+        const pair = await issuePair(row.connector_id as string, (row.device_id as string) || input.deviceId, row.tenant_id as string);
+        res.status(200).json({
+          connectorId: row.connector_id,
+          accessToken: pair.accessToken,
+          refreshToken: pair.refreshToken,
+          accessTokenExpiresAt: pair.accessTokenExpiresAt,
+          tenant: { id: row.tenant_id, name: await tenantNameFor(row.tenant_id as string) },
+          companyMapping: { tallyCompanyGuid: (mapping as any).tally_guid, whizunikCompanyId: (mapping as any).id },
+        });
+      } catch (err) {
+        console.error("[whizunik][token] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   }
 );
 
@@ -378,7 +406,7 @@ router.post(
       // Mixed legacy headers + new body: prefer new-spec (Bearer only per spec,
       // but be lenient and accept the Bearer token when present).
     }
-    wzAuthMiddleware(req, res, () => {
+    void wzAuthMiddleware(req, res, async () => {
       const parsed = wzBatchSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
@@ -389,18 +417,17 @@ router.post(
       try {
         // Company must belong to the connector's tenant (tenant from token, never payload).
         // Accept the WhizUnik company id plus legacy Tally GUID / name fallbacks.
-        const company = resolveBatchCompany(claims.tenantId, input.companyId);
+        const company = await resolveBatchCompany(claims.tenantId, input.companyId);
         if (!company) {
           sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
           return;
         }
 
         // Idempotency: batchId OR requestId seen before → replay stored ACK
-        const existing = db.prepare(`SELECT batch_id, received_count FROM sync_batches WHERE batch_id = ? OR request_id = ?`).get(
-          input.batchId, input.requestId
-        ) as { batch_id: string; received_count: number } | undefined;
-        if (existing) {
-          res.status(200).json({ acked: true, batchId: existing.batch_id, duplicate: true, receivedCount: 0 });
+        const byBatch = await getWSyncBatchByBatchId(input.batchId);
+        const existing = byBatch || (await getWSyncBatchByRequestId(input.requestId));
+        if (existing && (existing as any).tenant_id === claims.tenantId) {
+          res.status(200).json({ acked: true, batchId: (existing as any).batch_id, duplicate: true, receivedCount: 0 });
           return;
         }
 
@@ -408,48 +435,49 @@ router.post(
         // Store the canonical company id so legacy GUID/name uploads land on
         // the same company row the platform shows (not the raw input string).
         const canonicalCompanyId = company.id;
-        db.prepare(
-          `INSERT INTO sync_batches (id, batch_id, request_id, sync_id, tenant_id, connector_id, company_id, entity_type, received_count, duplicate)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-        ).run(uuidv4(), input.batchId, input.requestId, input.syncId, claims.tenantId, claims.connectorId, canonicalCompanyId, input.entityType, receivedCount);
+        try {
+          await createWSyncBatch({
+            id: uuidv4(),
+            batch_id: input.batchId,
+            request_id: input.requestId,
+            sync_id: input.syncId,
+            tenant_id: claims.tenantId,
+            connector_id: claims.connectorId,
+            company_id: canonicalCompanyId,
+            entity_type: input.entityType,
+            received_count: receivedCount,
+            duplicate: 0,
+          });
+        } catch (err: unknown) {
+          const msg = (err as Error)?.message || "";
+          if (msg.includes("UNIQUE")) {
+            const dup = (await getWSyncBatchByBatchId(input.batchId)) || (await getWSyncBatchByRequestId(input.requestId));
+            res.status(200).json({ acked: true, batchId: (dup as any)?.batch_id ?? input.batchId, duplicate: true, receivedCount: 0 });
+            return;
+          }
+          throw err;
+        }
 
         // Receive path: persist every record so the platform can show and
         // reconcile exactly what the connector pushed (per-record storage).
-        const insertRecord = db.prepare(
-          `INSERT INTO sync_records (id, batch_id, tenant_id, company_id, entity_type, source_object_id, source_voucher_number, source_voucher_date, payload)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        );
         for (const r of input.records) {
-          insertRecord.run(
-            uuidv4(),
-            input.batchId,
-            claims.tenantId,
-            canonicalCompanyId,
-            r.entityType || input.entityType,
-            r.sourceObjectId ?? null,
-            r.sourceVoucherNumber ?? null,
-            r.sourceVoucherDate ?? null,
-            JSON.stringify(r)
-          );
+          await createWSyncRecord({
+            id: uuidv4(),
+            batch_id: input.batchId,
+            tenant_id: claims.tenantId,
+            company_id: canonicalCompanyId,
+            entity_type: (r as any).entityType || input.entityType,
+            source_object_id: (r as any).sourceObjectId ?? null,
+            source_voucher_number: (r as any).sourceVoucherNumber ?? null,
+            source_voucher_date: (r as any).sourceVoucherDate ?? null,
+            payload: JSON.stringify(r),
+          });
         }
 
-        db.prepare(`UPDATE connectors SET last_sync = datetime('now'), updated_at = datetime('now') WHERE connector_id = ?`).run(claims.connectorId);
+        await updateWConnectorByPublicId(claims.connectorId, { last_sync: new Date().toISOString() });
 
         res.status(200).json({ acked: true, batchId: input.batchId, duplicate: false, receivedCount });
       } catch (err: unknown) {
-        const msg = (err as Error)?.message || "";
-        if (msg.includes("UNIQUE constraint failed")) {
-          // Concurrent duplicate insert — treat as idempotent replay
-          try {
-            const existing = db.prepare(`SELECT batch_id FROM sync_batches WHERE batch_id = ? OR request_id = ?`).get(
-              input.batchId, input.requestId
-            ) as { batch_id: string } | undefined;
-            res.status(200).json({ acked: true, batchId: existing?.batch_id ?? input.batchId, duplicate: true, receivedCount: 0 });
-          } catch {
-            sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-          }
-          return;
-        }
         console.error("[whizunik][sync/batch] failed:", err);
         sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
@@ -479,7 +507,7 @@ router.post(
       next(); // legacy connector — handled by connector.routes.ts
       return;
     }
-    wzAuthMiddleware(req, res, () => {
+    void wzAuthMiddleware(req, res, async () => {
       const parsed = wzHeartbeatSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
@@ -494,12 +522,15 @@ router.post(
         return;
       }
       try {
-        db.prepare(
-          `UPDATE connectors SET last_heartbeat = datetime('now'), app_version = ?, protocol_version = ?, tally_version = ?, status = 'active', updated_at = datetime('now')
-           WHERE connector_id = ?`
-        ).run(input.appVersion, input.protocolVersion, tallyVersion, claims.connectorId);
+        await updateWConnectorByPublicId(claims.connectorId, {
+          last_heartbeat: new Date().toISOString(),
+          app_version: input.appVersion,
+          protocol_version: input.protocolVersion,
+          tally_version: tallyVersion,
+          status: "active",
+        });
         if (input.status === "running" && input.currentSync) {
-          db.prepare(`UPDATE connectors SET last_sync = datetime('now') WHERE connector_id = ?`).run(claims.connectorId);
+          await updateWConnectorByPublicId(claims.connectorId, { last_sync: new Date().toISOString() });
         }
         res.status(204).send();
       } catch (err) {
@@ -543,34 +574,41 @@ function adminKeyOk(req: Request): boolean {
 
 router.post("/admin/pairing-codes", (req: Request, res: Response) => {
   const proceed = () => {
-    const parsed = wzAdminPairingSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    const input = parsed.data;
-    try {
-      // Resolve tenant: explicit id wins; otherwise derive from the JWT user.
-      const jwtUser = (req as Request & { user?: { userId?: string } }).user;
-      const tenantId = input.tenantId || jwtUser?.userId || `tenant-${crypto.randomBytes(4).toString("hex")}`;
-      const tenantName = input.tenantName || tenantNameFor(tenantId);
-      ensureTenant(tenantId, tenantName);
+    void (async () => {
+      const parsed = wzAdminPairingSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
+        return;
+      }
+      const input = parsed.data;
+      try {
+        // Resolve tenant: explicit id wins; otherwise derive from the JWT user.
+        const jwtUser = (req as Request & { user?: { userId?: string } }).user;
+        const tenantId = input.tenantId || jwtUser?.userId || `tenant-${crypto.randomBytes(4).toString("hex")}`;
+        const tenantName = input.tenantName || (await tenantNameFor(tenantId));
+        await ensureTenant(tenantId, tenantName);
 
-      const companyName = input.companyName || input.company || undefined;
-      const tallyGuid = input.tallyGuid || input.tallyCompanyGuid || undefined;
+        const companyName = input.companyName || input.company || undefined;
+        const tallyGuid = input.tallyGuid || input.tallyCompanyGuid || undefined;
 
-      const ttlMinutes = input.ttlMinutes ?? 60;
-      const code = generatePairingCode();
-      const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
-      db.prepare(
-        `INSERT INTO pairing_codes (code, tenant_id, company_name, tally_guid, expires_at) VALUES (?, ?, ?, ?, ?)`
-      ).run(code, tenantId, companyName ?? null, tallyGuid ?? null, expiresAt);
+        const ttlMinutes = input.ttlMinutes ?? 60;
+        const code = generatePairingCode();
+        const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+        await createWPairing({
+          code,
+          tenant_id: tenantId,
+          company_name: companyName ?? null,
+          tally_guid: tallyGuid ?? null,
+          expires_at: expiresAt,
+          used_at: null,
+        });
 
-      res.status(201).json({ pairingCode: code, tenantId, expiresAt });
-    } catch (err) {
-      console.error("[whizunik][admin/pairing-codes] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+        res.status(201).json({ pairingCode: code, tenantId, expiresAt });
+      } catch (err) {
+        console.error("[whizunik][admin/pairing-codes] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   };
 
   if (adminKeyOk(req)) {
@@ -612,68 +650,72 @@ router.get("/info", (_req: Request, res: Response) => {
 /** GET /sync/batches — batch history for this tenant (receive visibility). */
 router.get("/sync/batches", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      const { companyId, entityType, limit } = req.query as Record<string, string | undefined>;
-      const take = Math.min(Math.max(parseInt(limit || "25", 10) || 25, 1), 100);
-      let sql = `SELECT batch_id, request_id, sync_id, connector_id, company_id, entity_type, received_count, duplicate, created_at
-                 FROM sync_batches WHERE tenant_id = ?`;
-      const params: unknown[] = [userId];
-      if (companyId) {
-        sql += ` AND company_id = ?`;
-        params.push(companyId);
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const { companyId, entityType, limit } = req.query as Record<string, string | undefined>;
+        const take = Math.min(Math.max(parseInt(limit || "25", 10) || 25, 1), 100);
+        const batches = (await listWSyncBatches(userId, {
+          company_id: companyId,
+          entity_type: entityType,
+        }, take)).map((b) => ({
+          batch_id: b.batch_id,
+          request_id: b.request_id,
+          sync_id: b.sync_id,
+          connector_id: b.connector_id,
+          company_id: b.company_id,
+          entity_type: b.entity_type,
+          received_count: b.received_count,
+          duplicate: b.duplicate,
+          created_at: b.created_at,
+        }));
+        res.status(200).json({ batches });
+      } catch (err) {
+        console.error("[whizunik][sync/batches] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      if (entityType) {
-        sql += ` AND entity_type = ?`;
-        params.push(entityType);
-      }
-      sql += ` ORDER BY created_at DESC LIMIT ?`;
-      params.push(take);
-      const batches = db.prepare(sql).all(...params);
-      res.status(200).json({ batches });
-    } catch (err) {
-      console.error("[whizunik][sync/batches] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 
 /** GET /received — individual records the platform received (paginated). */
 router.get("/received", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      const { companyId, entityType, limit, offset } = req.query as Record<string, string | undefined>;
-      const take = Math.min(Math.max(parseInt(limit || "50", 10) || 50, 1), 200);
-      const skip = Math.max(parseInt(offset || "0", 10) || 0, 0);
-      let sql = `SELECT id, batch_id, company_id, entity_type, source_object_id, source_voucher_number, source_voucher_date, payload, created_at
-                 FROM sync_records WHERE tenant_id = ?`;
-      const params: unknown[] = [userId];
-      if (companyId) {
-        sql += ` AND company_id = ?`;
-        params.push(companyId);
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const { companyId, entityType, limit, offset } = req.query as Record<string, string | undefined>;
+        const take = Math.min(Math.max(parseInt(limit || "50", 10) || 50, 1), 200);
+        const skip = Math.max(parseInt(offset || "0", 10) || 0, 0);
+        const rows = await listWSyncRecords(userId, {
+          company_id: companyId,
+          entity_type: entityType,
+        }, take, skip);
+        const records = rows.map((r) => {
+          let payload: unknown = null;
+          try {
+            payload = JSON.parse(r.payload as string);
+          } catch {
+            payload = r.payload;
+          }
+          return {
+            id: r.id,
+            batch_id: r.batch_id,
+            company_id: r.company_id,
+            entity_type: r.entity_type,
+            source_object_id: r.source_object_id,
+            source_voucher_number: r.source_voucher_number,
+            source_voucher_date: r.source_voucher_date,
+            payload,
+            created_at: r.created_at,
+          };
+        });
+        res.status(200).json({ records, limit: take, offset: skip });
+      } catch (err) {
+        console.error("[whizunik][received] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      if (entityType) {
-        sql += ` AND entity_type = ?`;
-        params.push(entityType);
-      }
-      sql += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
-      params.push(take, skip);
-      const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-      const records = rows.map((r) => {
-        let payload: unknown = null;
-        try {
-          payload = JSON.parse(r.payload as string);
-        } catch {
-          payload = r.payload;
-        }
-        return { ...r, payload };
-      });
-      res.status(200).json({ records, limit: take, offset: skip });
-    } catch (err) {
-      console.error("[whizunik][received] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 
@@ -688,39 +730,40 @@ router.get("/received", (req: Request, res: Response) => {
  */
 router.post("/commands", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    const parsed = wzPushCommandSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    try {
-      const userId = req.user!.userId;
-      const row = db.prepare(`SELECT connector_id, tenant_id FROM connectors WHERE connector_id = ?`).get(
-        parsed.data.connectorId
-      ) as { connector_id: string; tenant_id: string } | undefined;
-      if (!row || row.tenant_id !== userId) {
-        sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+    void (async () => {
+      const parsed = wzPushCommandSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
         return;
       }
-      const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
-      db.prepare(
-        `INSERT INTO connector_commands (id, tenant_id, connector_id, command, payload) VALUES (?, ?, ?, ?, ?)`
-      ).run(id, userId, row.connector_id, parsed.data.command, JSON.stringify(parsed.data.payload ?? {}));
-      const created = db.prepare(
-        `SELECT id, connector_id, command, payload, status, created_at FROM connector_commands WHERE id = ?`
-      ).get(id) as { id: string; connector_id: string; command: string; payload: string; status: string; created_at: string };
-      res.status(201).json({
-        id: created.id,
-        connectorId: created.connector_id,
-        command: created.command,
-        payload: JSON.parse(created.payload),
-        status: created.status,
-        createdAt: created.created_at,
-      });
-    } catch (err) {
-      console.error("[whizunik][commands] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+      try {
+        const userId = req.user!.userId;
+        const row = await getWConnectorByPublicId(parsed.data.connectorId);
+        if (!row || row.tenant_id !== userId) {
+          sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+          return;
+        }
+        const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+        const created = await createWCommand({
+          id,
+          tenant_id: userId,
+          connector_id: row.connector_id,
+          command: parsed.data.command,
+          payload: JSON.stringify(parsed.data.payload ?? {}),
+        });
+        res.status(201).json({
+          id: created.id,
+          connectorId: created.connector_id,
+          command: created.command,
+          payload: JSON.parse(created.payload as string),
+          status: created.status,
+          createdAt: created.created_at,
+        });
+      } catch (err) {
+        console.error("[whizunik][commands] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   });
 });
 
@@ -732,117 +775,125 @@ router.post("/commands", (req: Request, res: Response) => {
  */
 router.post("/invoices/push", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    const parsed = wzPushInvoicesSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    try {
-      const userId = req.user!.userId;
-      const { connectorId, companyId, invoiceIds } = parsed.data;
-
-      // Resolve connector: new-spec first, legacy tc_* as fallback.
-      let pushTarget: { kind: "whizunik"; connectorId: string } | { kind: "legacy"; rowId: string; connectorId: string } | null = null;
-      const conn = db.prepare(`SELECT connector_id, tenant_id FROM connectors WHERE connector_id = ?`).get(
-        connectorId
-      ) as { connector_id: string; tenant_id: string } | undefined;
-      if (conn && conn.tenant_id === userId) {
-        pushTarget = { kind: "whizunik", connectorId: conn.connector_id };
-      } else {
-        try {
-          const legacy = db.prepare(
-            `SELECT id, connector_id, user_id FROM tally_connectors WHERE connector_id = ?`
-          ).get(connectorId) as { id: string; connector_id: string; user_id: string } | undefined;
-          if (legacy && legacy.user_id === userId) {
-            pushTarget = { kind: "legacy", rowId: legacy.id, connectorId: legacy.connector_id };
-          }
-        } catch { /* legacy table may not exist */ }
-      }
-      if (!pushTarget) {
-        sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+    void (async () => {
+      const parsed = wzPushInvoicesSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
         return;
       }
-      const company = db.prepare(`SELECT id, name, tally_guid FROM companies WHERE id = ?`).get(
-        companyId
-      ) as { id: string; name: string; tally_guid: string | null } | undefined;
-      if (!company) {
-        // Fall back to legacy tally_companies for old connectors.
-        try {
-          const legacyCo = db.prepare(`SELECT id, tally_company_guid, tally_company_name FROM tally_companies WHERE id = ? AND user_id = ?`).get(
-            companyId, userId
-          ) as { id: string; tally_company_guid: string; tally_company_name: string } | undefined;
-          if (!legacyCo) {
+      try {
+        const userId = req.user!.userId;
+        const { connectorId, companyId, invoiceIds } = parsed.data;
+
+        // Resolve connector: new-spec first, legacy tc_* as fallback.
+        let pushTarget: { kind: "whizunik"; connectorId: string } | { kind: "legacy"; rowId: string; connectorId: string } | null = null;
+        const conn = await getWConnectorByPublicId(connectorId);
+        if (conn && conn.tenant_id === userId) {
+          pushTarget = { kind: "whizunik", connectorId: conn.connector_id as string };
+        } else {
+          try {
+            const legacy = await getLegacyConnector(connectorId);
+            if (legacy && legacy.user_id === userId) {
+              pushTarget = { kind: "legacy", rowId: legacy.id as string, connectorId: legacy.connector_id as string };
+            }
+          } catch { /* legacy table may not exist */ }
+        }
+        if (!pushTarget) {
+          sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+          return;
+        }
+        const company = await getWCompany(companyId) as { id: string; name: string; tally_guid: string | null } | undefined;
+        if (!company) {
+          // Fall back to legacy tally_companies for old connectors.
+          try {
+            const legacyCo = await getLegacyCompany(userId, companyId);
+            if (!legacyCo) {
+              sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+              return;
+            }
+          } catch {
             sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
             return;
           }
-        } catch {
-          sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+        }
+
+        const uniqueIds = [...new Set(invoiceIds)];
+        const allInvoices = await listInvoices(userId);
+        const wanted = new Set(uniqueIds);
+        const rows = allInvoices.filter((i) => wanted.has(i.id as string));
+        if (rows.length === 0) {
+          sendWzError(res, "INVALID_PAYLOAD", "No matching invoices for this account");
           return;
         }
-      }
+        const foundIds = new Set(rows.map((r) => r.id));
+        const missing = uniqueIds.filter((id) => !foundIds.has(id));
 
-      const uniqueIds = [...new Set(invoiceIds)];
-      const placeholders = uniqueIds.map(() => "?").join(",");
-      const rows = db.prepare(
-        `SELECT i.id, i.invoice_number, i.issue_date, i.due_date, i.amount, i.balance, i.status,
-                c.name AS customer_name
-         FROM invoices i LEFT JOIN customers c ON c.id = i.customer_id AND c.user_id = i.user_id
-         WHERE i.user_id = ? AND i.id IN (${placeholders})`
-      ).all(userId, ...uniqueIds) as Array<{
-        id: string; invoice_number: string; issue_date: string; due_date: string;
-        amount: number; balance: number; status: string; customer_name: string | null;
-      }>;
-      if (rows.length === 0) {
-        sendWzError(res, "INVALID_PAYLOAD", "No matching invoices for this account");
-        return;
-      }
-      const foundIds = new Set(rows.map((r) => r.id));
-      const missing = uniqueIds.filter((id) => !foundIds.has(id));
+        // Resolve customer names
+        const nameCache = new Map<string, string>();
+        async function custName(cid: string): Promise<string> {
+          if (nameCache.has(cid)) return nameCache.get(cid)!;
+          const c = await getCustomer(userId, cid);
+          const n = ((c?.name as string) ?? "Unknown");
+          nameCache.set(cid, n);
+          return n;
+        }
 
-      const vouchers = rows.map((r) => ({
-        invoiceId: r.id,
-        invoiceNumber: r.invoice_number,
-        partyName: r.customer_name ?? "Unknown",
-        amount: Number(r.amount),
-        balance: Number(r.balance),
-        issueDate: r.issue_date,
-        dueDate: r.due_date,
-        tallyDate: String(r.issue_date).slice(0, 10).replace(/-/g, ""),
-        voucherType: "Sales",
-        narration: `WhizUnik ${r.invoice_number} due ${r.due_date}`,
-      }));
+        const vouchers: Array<Record<string, unknown>> = [];
+        for (const r of rows) {
+          vouchers.push({
+            invoiceId: r.id,
+            invoiceNumber: r.invoice_number,
+            partyName: await custName(r.customer_id as string),
+            amount: Number(r.amount),
+            balance: Number(r.balance),
+            issueDate: r.issue_date,
+            dueDate: r.due_date,
+            tallyDate: String(r.issue_date).slice(0, 10).replace(/-/g, ""),
+            voucherType: "Sales",
+            narration: `WhizUnik ${r.invoice_number} due ${r.due_date}`,
+          });
+        }
 
-      const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
-      const payload = {
-        companyId,
-        companyName: company?.name ?? "",
-        tallyCompanyGuid: company?.tally_guid ?? null,
-        vouchers,
-      };
-      const payloadJson = JSON.stringify(payload);
-      if (pushTarget.kind === "whizunik") {
-        db.prepare(
-          `INSERT INTO connector_commands (id, tenant_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_VOUCHERS', ?)`
-        ).run(id, userId, pushTarget.connectorId, payloadJson);
-      } else {
-        db.prepare(
-          `INSERT INTO tally_sync_commands (id, user_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_VOUCHERS', ?)`
-        ).run(id, userId, pushTarget.rowId, payloadJson);
+        const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+        const payload = {
+          companyId,
+          companyName: (company as any)?.name ?? "",
+          tallyCompanyGuid: (company as any)?.tally_guid ?? null,
+          vouchers,
+        };
+        const payloadJson = JSON.stringify(payload);
+        if (pushTarget.kind === "whizunik") {
+          await createWCommand({
+            id,
+            tenant_id: userId,
+            connector_id: pushTarget.connectorId,
+            command: "PUSH_VOUCHERS",
+            payload: payloadJson,
+          });
+        } else {
+          await createSyncCommand({
+            id,
+            user_id: userId,
+            connector_id: pushTarget.rowId,
+            command: "PUSH_VOUCHERS",
+            payload: payloadJson,
+          });
+        }
+        res.status(201).json({
+          id,
+          connectorId: pushTarget.connectorId,
+          command: "PUSH_VOUCHERS",
+          status: "PENDING",
+          createdAt: new Date().toISOString(),
+          voucherCount: vouchers.length,
+          missingInvoiceIds: missing,
+          vouchers,
+        });
+      } catch (err) {
+        console.error("[whizunik][invoices/push] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      res.status(201).json({
-        id,
-        connectorId: pushTarget.connectorId,
-        command: "PUSH_VOUCHERS",
-        status: "PENDING",
-        createdAt: new Date().toISOString(),
-        voucherCount: vouchers.length,
-        missingInvoiceIds: missing,
-        vouchers,
-      });
-    } catch (err) {
-      console.error("[whizunik][invoices/push] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 
@@ -852,67 +903,66 @@ router.post("/invoices/push", (req: Request, res: Response) => {
  */
 router.get("/commands", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      const { connectorId, limit } = req.query as Record<string, string | undefined>;
-      const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
-      let sql = `SELECT id, connector_id, command, payload, status, created_at, delivered_at, completed_at
-                 FROM connector_commands WHERE tenant_id = ?`;
-      const params: unknown[] = [userId];
-      if (connectorId) {
-        sql += ` AND connector_id = ?`;
-        params.push(connectorId);
-      }
-      sql += ` ORDER BY created_at DESC LIMIT ?`;
-      params.push(take);
-      const rows = db.prepare(sql).all(...params) as Array<{
-        id: string; connector_id: string; command: string; payload: string;
-        status: string; created_at: string; delivered_at: string | null; completed_at: string | null;
-      }>;
-      // Merge legacy tally_sync_commands so old connectors' pushes show too.
+    void (async () => {
       try {
-        let legacySql = `SELECT tc.id, tcc.connector_id AS public_id, tc.command, tc.payload, tc.status, tc.created_at, tc.delivered_at, tc.completed_at
-                         FROM tally_sync_commands tc JOIN tally_connectors tcc ON tcc.id = tc.connector_id
-                         WHERE tc.user_id = ?`;
-        const legacyParams: unknown[] = [userId];
-        if (connectorId) {
-          legacySql += ` AND tcc.connector_id = ?`;
-          legacyParams.push(connectorId);
-        }
-        legacySql += ` ORDER BY tc.created_at DESC LIMIT ?`;
-        legacyParams.push(take);
-        const legacyRows = db.prepare(legacySql).all(...legacyParams) as Array<{
-          id: string; public_id: string; command: string; payload: string;
-          status: string; created_at: string; delivered_at: string | null; completed_at: string | null;
-        }>;
-        for (const lr of legacyRows) {
-          rows.push({
-            id: lr.id, connector_id: lr.public_id, command: lr.command, payload: lr.payload,
-            status: lr.status, created_at: lr.created_at, delivered_at: lr.delivered_at, completed_at: lr.completed_at,
-          });
-        }
-      } catch { /* legacy table may not exist */ }
-      rows.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
-      const page = rows.slice(0, take);
-      res.status(200).json({
-        commands: page.map((r) => {
-          let payload: unknown = {};
-          try { payload = JSON.parse(r.payload); } catch { payload = {}; }
-          const voucherCount = Array.isArray((payload as { vouchers?: unknown[] })?.vouchers)
-            ? ((payload as { vouchers: unknown[] }).vouchers.length)
-            : undefined;
-          return {
-            id: r.id, connectorId: r.connector_id, command: r.command,
-            status: r.status, createdAt: r.created_at,
-            deliveredAt: r.delivered_at, completedAt: r.completed_at,
-            voucherCount,
-          };
-        }),
-      });
-    } catch (err) {
-      console.error("[whizunik][commands/list] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+        const userId = req.user!.userId;
+        const { connectorId, limit } = req.query as Record<string, string | undefined>;
+        const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
+        const rows = (await listWCommands(userId, connectorId, take)).map((r) => ({
+          id: r.id as string,
+          connector_id: r.connector_id as string,
+          command: r.command as string,
+          payload: r.payload as string,
+          status: r.status as string,
+          created_at: r.created_at as string,
+          delivered_at: (r.delivered_at as string) ?? null,
+          completed_at: (r.completed_at as string) ?? null,
+        }));
+        // Merge legacy tally_sync_commands so old connectors' pushes show too.
+        try {
+          const legacyRows = await listSyncCommandsForUser(userId);
+          for (const lr of legacyRows) {
+            if (connectorId) {
+              const conn = await getLegacyConnector(connectorId).catch(() => undefined);
+              if (!conn || lr.connector_id !== conn.id) continue;
+            }
+            const publicRow = await import("../../../db/storesTally.js").then((m) =>
+              m.getConnectorByRowId(lr.connector_id as string)
+            );
+            rows.push({
+              id: lr.id as string,
+              connector_id: (publicRow?.connector_id as string) ?? (lr.connector_id as string),
+              command: lr.command as string,
+              payload: lr.payload as string,
+              status: lr.status as string,
+              created_at: lr.created_at as string,
+              delivered_at: (lr.delivered_at as string) ?? null,
+              completed_at: (lr.completed_at as string) ?? null,
+            });
+          }
+        } catch { /* legacy table may not exist */ }
+        rows.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+        const page = rows.slice(0, take);
+        res.status(200).json({
+          commands: page.map((r) => {
+            let payload: unknown = {};
+            try { payload = JSON.parse(r.payload); } catch { payload = {}; }
+            const voucherCount = Array.isArray((payload as { vouchers?: unknown[] })?.vouchers)
+              ? ((payload as { vouchers: unknown[] }).vouchers.length)
+              : undefined;
+            return {
+              id: r.id, connectorId: r.connector_id, command: r.command,
+              status: r.status, createdAt: r.created_at,
+              deliveredAt: r.delivered_at, completedAt: r.completed_at,
+              voucherCount,
+            };
+          }),
+        });
+      } catch (err) {
+        console.error("[whizunik][commands/list] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   });
 });
 
@@ -922,42 +972,41 @@ router.get("/commands", (req: Request, res: Response) => {
  */
 router.get("/commands/status/:id", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      let row = db.prepare(
-        `SELECT id, connector_id, command, payload, status, created_at, delivered_at, completed_at
-         FROM connector_commands WHERE id = ? AND tenant_id = ?`
-      ).get(req.params.id, userId) as
-        | { id: string; connector_id: string; command: string; payload: string; status: string; created_at: string; delivered_at: string | null; completed_at: string | null }
-        | undefined;
-      if (!row) {
-        // Legacy fallback: tally_sync_commands keyed by connector row id.
-        try {
-          const lr = db.prepare(
-            `SELECT tc.id, tcc.connector_id AS connector_id, tc.command, tc.payload, tc.status, tc.created_at, tc.delivered_at, tc.completed_at
-             FROM tally_sync_commands tc JOIN tally_connectors tcc ON tcc.id = tc.connector_id
-             WHERE tc.id = ? AND tc.user_id = ?`
-          ).get(req.params.id, userId) as
-            | { id: string; connector_id: string; command: string; payload: string; status: string; created_at: string; delivered_at: string | null; completed_at: string | null }
-            | undefined;
-          if (lr) row = lr;
-        } catch { /* ignore */ }
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const cmdId = req.params.id as string;
+        let row = await getWCommand(cmdId, userId);
+        if (row && (row as any).tenant_id !== userId) row = undefined;
+        if (!row) {
+          // Legacy fallback: tally_sync_commands keyed by connector row id.
+          const lr = await getSyncCommandGlobal(cmdId);
+          if (lr && lr.user_id === userId) {
+            const conn = await import("../../../db/storesTally.js").then((m) =>
+              m.getConnectorByRowId(lr.connector_id as string)
+            );
+            row = {
+              ...lr,
+              connector_id: (conn?.connector_id as string) ?? lr.connector_id,
+            } as any;
+          }
+        }
+        if (!row) {
+          sendWzError(res, "INVALID_PAYLOAD", "Command not found for this account");
+          return;
+        }
+        let payload: unknown = {};
+        try { payload = JSON.parse(row.payload as string); } catch { payload = {}; }
+        res.status(200).json({
+          id: row.id, connectorId: row.connector_id, command: row.command,
+          payload, status: row.status, createdAt: row.created_at,
+          deliveredAt: (row.delivered_at as string) ?? null, completedAt: (row.completed_at as string) ?? null,
+        });
+      } catch (err) {
+        console.error("[whizunik][commands/get] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      if (!row) {
-        sendWzError(res, "INVALID_PAYLOAD", "Command not found for this account");
-        return;
-      }
-      let payload: unknown = {};
-      try { payload = JSON.parse(row.payload); } catch { payload = {}; }
-      res.status(200).json({
-        id: row.id, connectorId: row.connector_id, command: row.command,
-        payload, status: row.status, createdAt: row.created_at,
-        deliveredAt: row.delivered_at, completedAt: row.completed_at,
-      });
-    } catch (err) {
-      console.error("[whizunik][commands/get] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 
@@ -966,26 +1015,23 @@ router.get("/commands/status/:id", (req: Request, res: Response) => {
  * Pending commands are returned FIFO and marked DELIVERED.
  */
 router.get("/commands/pending", (req: Request, res: Response) => {
-  wzAuthMiddleware(req, res, () => {
+  void wzAuthMiddleware(req, res, async () => {
     try {
       const claims = (req as Request & { wzClaims?: AccessClaims }).wzClaims!;
-      const rows = db.prepare(
-        `SELECT id, command, payload, created_at FROM connector_commands
-         WHERE connector_id = ? AND status = 'PENDING' ORDER BY created_at LIMIT 20`
-      ).all(claims.connectorId) as Array<{ id: string; command: string; payload: string; created_at: string }>;
+      const rows = await listPendingWCommands(claims.connectorId, 20);
       if (rows.length > 0) {
-        const ids = rows.map((r) => `'${r.id.replace(/'/g, "''")}'`).join(",");
-        db.prepare(
-          `UPDATE connector_commands SET status = 'DELIVERED', delivered_at = datetime('now') WHERE id IN (${ids})`
-        ).run();
+        const now = new Date().toISOString();
+        for (const r of rows) {
+          await updateWCommand(r, { status: "DELIVERED", delivered_at: now });
+        }
         // Phase 3: delivered master pushes move QUEUED links to SENDING.
-        markDeliveredMastersSending(claims.tenantId, rows);
+        await markDeliveredMastersSending(claims.tenantId, rows as unknown as Array<{ command: string; payload: string }>);
       }
       res.status(200).json({
         commands: rows.map((r) => {
           let payload: unknown = {};
           try {
-            payload = JSON.parse(r.payload);
+            payload = JSON.parse(r.payload as string);
           } catch {
             payload = {};
           }
@@ -1001,7 +1047,7 @@ router.get("/commands/pending", (req: Request, res: Response) => {
 
 /** POST /commands/ack — connector acknowledges a pushed command (Bearer auth). */
 router.post("/commands/ack", (req: Request, res: Response) => {
-  wzAuthMiddleware(req, res, () => {
+  void wzAuthMiddleware(req, res, async () => {
     const parsed = wzAckCommandSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
@@ -1009,19 +1055,15 @@ router.post("/commands/ack", (req: Request, res: Response) => {
     }
     try {
       const claims = (req as Request & { wzClaims?: AccessClaims }).wzClaims!;
-      const row = db.prepare(`SELECT id, connector_id, command, payload, status, created_at FROM connector_commands WHERE id = ?`).get(
-        parsed.data.commandId
-      ) as { id: string; connector_id: string; command: string; payload: string | null; status: string; created_at: string } | undefined;
+      const row = await getWCommand(parsed.data.commandId);
       if (!row || row.connector_id !== claims.connectorId) {
         sendWzError(res, "INVALID_PAYLOAD", "Unknown command for this connector");
         return;
       }
-      db.prepare(
-        `UPDATE connector_commands SET status = ?, completed_at = datetime('now') WHERE id = ?`
-      ).run(parsed.data.status, row.id);
+      await updateWCommand(row, { status: parsed.data.status, completed_at: new Date().toISOString() });
       // Phase 3: master results update the per-master link + evidence log.
       if (row.command === "PUSH_MASTERS") {
-        applyMasterAck(claims.tenantId, claims.connectorId, row, parsed.data.status, parsed.data.result);
+        await applyMasterAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
       }
       res.status(200).json({ id: row.id, status: parsed.data.status });
     } catch (err) {
@@ -1046,12 +1088,11 @@ const MASTER_TABLE: Record<MasterKind, string> = {
   sku: "products",
 };
 
-function loadMasterRow(tenantId: string, kind: MasterKind, id: string): Record<string, unknown> | null {
+async function loadMasterRow(tenantId: string, kind: MasterKind, id: string): Promise<Record<string, unknown> | null> {
   try {
-    const row = db.prepare(
-      `SELECT * FROM ${MASTER_TABLE[kind]} WHERE id = ? AND user_id = ?`
-    ).get(id, tenantId) as Record<string, unknown> | undefined;
-    return row ?? null;
+    if (kind === "customer") return ((await getCustomer(tenantId, id)) as Record<string, unknown> | undefined) ?? null;
+    if (kind === "supplier") return ((await getSupplier(tenantId, id)) as Record<string, unknown> | undefined) ?? null;
+    return ((await getProduct(tenantId, id)) as Record<string, unknown> | undefined) ?? null;
   } catch {
     return null;
   }
@@ -1090,7 +1131,7 @@ function validateMasterFields(kind: MasterKind, fields: Record<string, unknown>)
 }
 
 /** Upsert the QUEUED link for a master being pushed (attempts accumulate). */
-function queueMasterLink(
+async function queueMasterLink(
   tenantId: string,
   kind: MasterKind,
   whizunikId: string,
@@ -1098,36 +1139,43 @@ function queueMasterLink(
   idempotencyKey: string,
   requestId: string,
   approvedBy: string,
-): void {
-  const existing = db.prepare(
-    `SELECT attempts FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
-  ).get(tenantId, kind, whizunikId) as { attempts: number } | undefined;
+): Promise<void> {
+  const existing = await getMasterLink(tenantId, kind, whizunikId);
   if (existing) {
-    db.prepare(
-      `UPDATE master_sync_links
-       SET status = 'QUEUED', version = ?, attempts = ?, last_error = NULL,
-           idempotency_key = ?, request_id = ?, approved_by = ?, updated_at = datetime('now')
-       WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
-    ).run(version, (existing.attempts ?? 0) + 1, idempotencyKey, requestId, approvedBy, tenantId, kind, whizunikId);
+    await putMasterLink({
+      tenant_id: tenantId,
+      kind,
+      whizunik_id: whizunikId,
+      status: "QUEUED",
+      version,
+      attempts: Number(existing.attempts ?? 0) + 1,
+      last_error: null,
+      idempotency_key: idempotencyKey,
+      request_id: requestId,
+      approved_by: approvedBy,
+    });
   } else {
-    db.prepare(
-      `INSERT INTO master_sync_links
-         (tenant_id, kind, whizunik_id, version, status, attempts, idempotency_key, direction, request_id, approved_by)
-       VALUES (?, ?, ?, ?, 'QUEUED', 1, ?, 'outbound', ?, ?)`
-    ).run(tenantId, kind, whizunikId, version, idempotencyKey, requestId, approvedBy);
+    await putMasterLink({
+      tenant_id: tenantId,
+      kind,
+      whizunik_id: whizunikId,
+      version,
+      status: "QUEUED",
+      attempts: 1,
+      idempotency_key: idempotencyKey,
+      direction: "outbound",
+      request_id: requestId,
+      approved_by: approvedBy,
+    });
   }
 }
 
 /** Delivered PUSH_MASTERS commands move their QUEUED links to SENDING. */
-function markDeliveredMastersSending(
+async function markDeliveredMastersSending(
   tenantId: string,
   rows: Array<{ command: string; payload: string }>,
-): void {
+): Promise<void> {
   try {
-    const stmt = db.prepare(
-      `UPDATE master_sync_links SET status = 'SENDING', updated_at = datetime('now')
-       WHERE tenant_id = ? AND kind = ? AND whizunik_id = ? AND status = 'QUEUED'`
-    );
     for (const r of rows) {
       if (r.command !== "PUSH_MASTERS") continue;
       try {
@@ -1135,7 +1183,10 @@ function markDeliveredMastersSending(
         const kind = p.master?.kind;
         const id = p.master?.id;
         if ((kind === "customer" || kind === "supplier" || kind === "sku") && id) {
-          stmt.run(tenantId, kind, id);
+          const link = await getMasterLink(tenantId, kind, id);
+          if (link && link.status === "QUEUED") {
+            await updateMasterLink(tenantId, kind, id, { status: "SENDING" });
+          }
         }
       } catch { /* skip unparseable payloads */ }
     }
@@ -1155,13 +1206,13 @@ interface MasterAckResult {
 }
 
 /** Apply a connector ack for a PUSH_MASTERS command to the link + evidence log. */
-function applyMasterAck(
+async function applyMasterAck(
   tenantId: string,
   connectorId: string,
   cmd: { id: string; payload: string | null; created_at: string },
   ackStatus: string,
   result: MasterAckResult | undefined,
-): void {
+): Promise<void> {
   try {
     if (!cmd.payload) return;
     const p = JSON.parse(cmd.payload) as {
@@ -1178,66 +1229,45 @@ function applyMasterAck(
     if (outcome === "synced" || outcome === "linked") linkStatus = "SYNCED";
     else if (outcome === "needs_review") linkStatus = "NEEDS_REVIEW";
 
-    const link = db.prepare(
-      `SELECT attempts FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
-    ).get(tenantId, kind, whizunikId) as { attempts: number } | undefined;
-    const attempts = (link?.attempts ?? 0) + (typeof result?.retryCount === "number" ? result.retryCount : 0);
-    db.prepare(
-      `INSERT INTO master_sync_links
-         (tenant_id, kind, whizunik_id, tally_name, tally_master_id, version, status, attempts, last_error,
-          idempotency_key, direction, request_id, approved_by, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'outbound', ?, NULL, datetime('now'))
-       ON CONFLICT(tenant_id, kind, whizunik_id) DO UPDATE SET
-         tally_name = COALESCE(excluded.tally_name, master_sync_links.tally_name),
-         tally_master_id = COALESCE(excluded.tally_master_id, master_sync_links.tally_master_id),
-         version = excluded.version,
-         status = excluded.status,
-         attempts = excluded.attempts,
-         last_error = excluded.last_error,
-         idempotency_key = excluded.idempotency_key,
-         request_id = excluded.request_id,
-         updated_at = datetime('now')`
-    ).run(
-      tenantId,
+    const link = await getMasterLink(tenantId, kind, whizunikId);
+    const attempts = Number(link?.attempts ?? 0) + (typeof result?.retryCount === "number" ? result.retryCount : 0);
+    await putMasterLink({
+      tenant_id: tenantId,
       kind,
-      whizunikId,
-      result?.tallyName ?? null,
-      result?.tallyMasterId ?? null,
+      whizunik_id: whizunikId,
+      tally_name: result?.tallyName ?? (link?.tally_name as string) ?? null,
+      tally_master_id: result?.tallyMasterId ?? (link?.tally_master_id as string) ?? null,
       version,
-      linkStatus,
+      status: linkStatus,
       attempts,
-      result?.error ?? (ackStatus === "CANCELLED" ? "Cancelled by connector" : null),
-      p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
-      cmd.id,
-    );
+      last_error: result?.error ?? (ackStatus === "CANCELLED" ? "Cancelled by connector" : null),
+      idempotency_key: p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
+      direction: "outbound",
+      request_id: cmd.id,
+      approved_by: (link?.approved_by as string) ?? null,
+    });
 
     // Evidence log (§13): one row per attempt with request/response.
     const now = new Date().toISOString();
-    db.prepare(
-      `INSERT INTO master_sync_attempts
-         (id, tenant_id, connector_id, kind, whizunik_id, company_id, request_id, idempotency_key,
-          requested_at, responded_at, http_status, tally_status, success, error_message, retry_count,
-          request_payload, response_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      `att_${uuidv4().replace(/-/g, "").slice(0, 16)}`,
-      tenantId,
-      connectorId,
+    await createMasterAttempt({
+      id: `att_${uuidv4().replace(/-/g, "").slice(0, 16)}`,
+      tenant_id: tenantId,
+      connector_id: connectorId,
       kind,
-      whizunikId,
-      p.companyId ?? null,
-      cmd.id,
-      p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
-      cmd.created_at,
-      now,
-      linkStatus === "SYNCED" ? 200 : 422,
-      linkStatus,
-      linkStatus === "SYNCED" ? 1 : 0,
-      result?.error ?? null,
-      typeof result?.retryCount === "number" ? result.retryCount : 0,
-      JSON.stringify({ master: p.master, companyId: p.companyId ?? null }),
-      result?.responsePayload !== undefined ? JSON.stringify(result.responsePayload) : null,
-    );
+      whizunik_id: whizunikId,
+      company_id: p.companyId ?? null,
+      request_id: cmd.id,
+      idempotency_key: p.master?.idempotencyKey ?? masterIdempotencyKey(kind, whizunikId, version),
+      requested_at: cmd.created_at,
+      responded_at: now,
+      http_status: linkStatus === "SYNCED" ? 200 : 422,
+      tally_status: linkStatus,
+      success: linkStatus === "SYNCED" ? 1 : 0,
+      error_message: result?.error ?? null,
+      retry_count: typeof result?.retryCount === "number" ? result.retryCount : 0,
+      request_payload: JSON.stringify({ master: p.master, companyId: p.companyId ?? null }),
+      response_payload: result?.responsePayload !== undefined ? JSON.stringify(result.responsePayload) : null,
+    });
   } catch (err) {
     console.error("[whizunik][masters/ack] link update failed:", err);
   }
@@ -1251,92 +1281,93 @@ function applyMasterAck(
  */
 router.post("/masters/push", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    const parsed = wzPushMastersSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
-      return;
-    }
-    try {
-      const userId = req.user!.userId;
-      const { connectorId, companyId, items } = parsed.data;
-
-      // Resolve connector: new-spec first, legacy tc_* as fallback.
-      let targetConnectorId: string | null = null;
-      const conn = db.prepare(`SELECT connector_id, tenant_id, status FROM connectors WHERE connector_id = ?`).get(
-        connectorId
-      ) as { connector_id: string; tenant_id: string; status: string } | undefined;
-      if (conn && conn.tenant_id === userId && conn.status === "active") {
-        targetConnectorId = conn.connector_id;
-      } else {
-        try {
-          const legacy = db.prepare(
-            `SELECT tcc.connector_id AS connector_id FROM tally_connectors tcc WHERE tcc.connector_id = ? AND tcc.user_id = ? AND tcc.status != 'REVOKED'`
-          ).get(connectorId, userId) as { connector_id: string } | undefined;
-          if (legacy) targetConnectorId = legacy.connector_id;
-        } catch { /* legacy table may not exist */ }
-      }
-      if (!targetConnectorId) {
-        sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+    void (async () => {
+      const parsed = wzPushMastersSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
         return;
       }
-      const company = resolveBatchCompany(userId, companyId);
-      if (!company) {
-        sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
-        return;
-      }
+      try {
+        const userId = req.user!.userId;
+        const { connectorId, companyId, items } = parsed.data;
 
-      const queued: Array<{ id: string; kind: string; commandId: string; idempotencyKey: string }> = [];
-      const rejected: Array<{ id: string; kind: string; reason: string }> = [];
-      const seen = new Set<string>();
-      for (const item of items) {
-        const key = `${item.kind}:${item.id}`;
-        if (seen.has(key)) {
-          rejected.push({ id: item.id, kind: item.kind, reason: "Duplicate item in this request" });
-          continue;
+        // Resolve connector: new-spec first, legacy tc_* as fallback.
+        let targetConnectorId: string | null = null;
+        const conn = await getWConnectorByPublicId(connectorId);
+        if (conn && conn.tenant_id === userId && conn.status === "active") {
+          targetConnectorId = conn.connector_id as string;
+        } else {
+          try {
+            const legacy = await getLegacyConnector(connectorId);
+            if (legacy && legacy.user_id === userId && legacy.status !== "REVOKED") {
+              targetConnectorId = legacy.connector_id as string;
+            }
+          } catch { /* legacy table may not exist */ }
         }
-        seen.add(key);
-        const row = loadMasterRow(userId, item.kind, item.id);
-        if (!row) {
-          rejected.push({ id: item.id, kind: item.kind, reason: "Master record not found for this account" });
-          continue;
+        if (!targetConnectorId) {
+          sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+          return;
         }
-        const version = typeof row.version === "number" && row.version > 0 ? row.version : 1;
-        const fields = masterFieldsFor(item.kind, row);
-        const check = validateMasterFields(item.kind, fields);
-        if (!check.ok) {
-          rejected.push({ id: item.id, kind: item.kind, reason: check.reason ?? "Invalid master fields" });
-          // Record the rejection on the link so the dashboard shows FAILED with cause.
-          queueMasterLink(userId, item.kind, item.id, version, masterIdempotencyKey(item.kind, item.id, version), "rejected", userId);
-          db.prepare(
-            `UPDATE master_sync_links SET status = 'FAILED', last_error = ?, updated_at = datetime('now')
-             WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
-          ).run(check.reason ?? "Invalid master fields", userId, item.kind, item.id);
-          continue;
+        const company = await resolveBatchCompany(userId, companyId);
+        if (!company) {
+          sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+          return;
         }
-        const idempotencyKey = masterIdempotencyKey(item.kind, item.id, version);
-        const cmdId = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
-        const payload = {
-          companyId: company.id,
-          master: { kind: item.kind, id: item.id, version, idempotencyKey, fields },
-        };
-        db.prepare(
-          `INSERT INTO connector_commands (id, tenant_id, connector_id, command, payload) VALUES (?, ?, ?, 'PUSH_MASTERS', ?)`
-        ).run(cmdId, userId, targetConnectorId, JSON.stringify(payload));
-        queueMasterLink(userId, item.kind, item.id, version, idempotencyKey, cmdId, userId);
-        queued.push({ id: item.id, kind: item.kind, commandId: cmdId, idempotencyKey });
-      }
 
-      res.status(201).json({
-        connectorId: targetConnectorId,
-        queued,
-        rejected,
-        queuedCount: queued.length,
-        rejectedCount: rejected.length,
-      });
-    } catch (err) {
-      console.error("[whizunik][masters/push] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+        const queued: Array<{ id: string; kind: string; commandId: string; idempotencyKey: string }> = [];
+        const rejected: Array<{ id: string; kind: string; reason: string }> = [];
+        const seen = new Set<string>();
+        for (const item of items) {
+          const key = `${item.kind}:${item.id}`;
+          if (seen.has(key)) {
+            rejected.push({ id: item.id, kind: item.kind, reason: "Duplicate item in this request" });
+            continue;
+          }
+          seen.add(key);
+          const row = await loadMasterRow(userId, item.kind, item.id);
+          if (!row) {
+            rejected.push({ id: item.id, kind: item.kind, reason: "Master record not found for this account" });
+            continue;
+          }
+          const version = typeof row.version === "number" && (row.version as number) > 0 ? (row.version as number) : 1;
+          const fields = masterFieldsFor(item.kind, row);
+          const check = validateMasterFields(item.kind, fields);
+          if (!check.ok) {
+            rejected.push({ id: item.id, kind: item.kind, reason: check.reason ?? "Invalid master fields" });
+            // Record the rejection on the link so the dashboard shows FAILED with cause.
+            await queueMasterLink(userId, item.kind, item.id, version, masterIdempotencyKey(item.kind, item.id, version), "rejected", userId);
+            await updateMasterLink(userId, item.kind, item.id, { status: "FAILED", last_error: check.reason ?? "Invalid master fields" });
+            continue;
+          }
+          const idempotencyKey = masterIdempotencyKey(item.kind, item.id, version);
+          const cmdId = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+          const payload = {
+            companyId: company.id,
+            master: { kind: item.kind, id: item.id, version, idempotencyKey, fields },
+          };
+          await createWCommand({
+            id: cmdId,
+            tenant_id: userId,
+            connector_id: targetConnectorId,
+            command: "PUSH_MASTERS",
+            payload: JSON.stringify(payload),
+          });
+          await queueMasterLink(userId, item.kind, item.id, version, idempotencyKey, cmdId, userId);
+          queued.push({ id: item.id, kind: item.kind, commandId: cmdId, idempotencyKey });
+        }
+
+        res.status(201).json({
+          connectorId: targetConnectorId,
+          queued,
+          rejected,
+          queuedCount: queued.length,
+          rejectedCount: rejected.length,
+        });
+      } catch (err) {
+        console.error("[whizunik][masters/push] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
   });
 });
 
@@ -1347,57 +1378,55 @@ router.post("/masters/push", (req: Request, res: Response) => {
  */
 router.get("/masters/status", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      const q = wzMasterStatusQuerySchema.safeParse(req.query ?? {});
-      if (!q.success) {
-        sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(q.error));
-        return;
-      }
-      const { kind, status, limit } = q.data;
-      const kinds: MasterKind[] = kind ? [kind] : ["customer", "supplier", "sku"];
-      const out: Array<Record<string, unknown>> = [];
-      for (const k of kinds) {
-        const table = MASTER_TABLE[k];
-        let rows: Array<Record<string, unknown>>;
-        try {
-          rows = db.prepare(`SELECT * FROM ${table} WHERE user_id = ? ORDER BY name LIMIT 500`).all(userId) as Array<Record<string, unknown>>;
-        } catch {
-          continue;
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const q = wzMasterStatusQuerySchema.safeParse(req.query ?? {});
+        if (!q.success) {
+          sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(q.error));
+          return;
         }
-        for (const r of rows) {
-          const link = db.prepare(
-            `SELECT tally_name, tally_master_id, version AS link_version, status, attempts, last_error, idempotency_key, request_id, updated_at
-             FROM master_sync_links WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?`
-          ).get(userId, k, String(r.id)) as
-            | { tally_name: string | null; tally_master_id: string | null; link_version: number; status: string; attempts: number; last_error: string | null; idempotency_key: string | null; request_id: string | null; updated_at: string }
-            | undefined;
-          const st = link?.status ?? "NOT_SYNCED";
-          if (status && st !== status) continue;
-          out.push({
-            kind: k,
-            id: r.id,
-            name: (k === "sku" ? (r.sku_code ?? r.name) : r.name) ?? "",
-            displayName: r.name ?? "",
-            version: r.version ?? 1,
-            status: st,
-            tallyName: link?.tally_name ?? null,
-            tallyMasterId: link?.tally_master_id ?? null,
-            attempts: link?.attempts ?? 0,
-            lastError: link?.last_error ?? null,
-            idempotencyKey: link?.idempotency_key ?? null,
-            requestId: link?.request_id ?? null,
-            updatedAt: link?.updated_at ?? null,
-          });
+        const { kind, status, limit } = q.data;
+        const kinds: MasterKind[] = kind ? [kind] : ["customer", "supplier", "sku"];
+        const out: Array<Record<string, unknown>> = [];
+        for (const k of kinds) {
+          let rows: Array<Record<string, unknown>>;
+          try {
+            if (k === "customer") rows = (await listCustomers(userId)).slice(0, 500) as Array<Record<string, unknown>>;
+            else if (k === "supplier") rows = (await listSuppliers(userId)).slice(0, 500) as Array<Record<string, unknown>>;
+            else rows = (await listProducts(userId, 500)) as Array<Record<string, unknown>>;
+          } catch {
+            continue;
+          }
+          for (const r of rows) {
+            const link = await getMasterLink(userId, k, String(r.id));
+            const st = (link?.status as string) ?? "NOT_SYNCED";
+            if (status && st !== status) continue;
+            out.push({
+              kind: k,
+              id: r.id,
+              name: (k === "sku" ? ((r.sku_code ?? r.name) as string) : (r.name as string)) ?? "",
+              displayName: (r.name as string) ?? "",
+              version: (r.version as number) ?? 1,
+              status: st,
+              tallyName: (link?.tally_name as string) ?? null,
+              tallyMasterId: (link?.tally_master_id as string) ?? null,
+              attempts: (link?.attempts as number) ?? 0,
+              lastError: (link?.last_error as string) ?? null,
+              idempotencyKey: (link?.idempotency_key as string) ?? null,
+              requestId: (link?.request_id as string) ?? null,
+              updatedAt: (link?.updated_at as string) ?? null,
+            });
+            if (out.length >= limit) break;
+          }
           if (out.length >= limit) break;
         }
-        if (out.length >= limit) break;
+        res.status(200).json({ masters: out.slice(0, limit) });
+      } catch (err) {
+        console.error("[whizunik][masters/status] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      res.status(200).json({ masters: out.slice(0, limit) });
-    } catch (err) {
-      console.error("[whizunik][masters/status] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 
@@ -1407,37 +1436,33 @@ router.get("/masters/status", (req: Request, res: Response) => {
  */
 router.get("/masters/attempts", (req: Request, res: Response) => {
   requireAuth(req, res, () => {
-    try {
-      const userId = req.user!.userId;
-      const { kind, id, limit } = (req.query ?? {}) as Record<string, string | undefined>;
-      if (kind !== "customer" && kind !== "supplier" && kind !== "sku") {
-        sendWzError(res, "INVALID_PAYLOAD", "kind must be customer, supplier or sku");
-        return;
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const { kind, id, limit } = (req.query ?? {}) as Record<string, string | undefined>;
+        if (kind !== "customer" && kind !== "supplier" && kind !== "sku") {
+          sendWzError(res, "INVALID_PAYLOAD", "kind must be customer, supplier or sku");
+          return;
+        }
+        if (!id) {
+          sendWzError(res, "INVALID_PAYLOAD", "id is required");
+          return;
+        }
+        const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
+        const rows = await listMasterAttempts(userId, kind, id, take);
+        const attempts = rows.map((r) => {
+          let requestPayload: unknown = null;
+          let responsePayload: unknown = null;
+          try { requestPayload = r.request_payload ? JSON.parse(r.request_payload as string) : null; } catch { requestPayload = r.request_payload; }
+          try { responsePayload = r.response_payload ? JSON.parse(r.response_payload as string) : null; } catch { responsePayload = r.response_payload; }
+          return { ...r, request_payload: undefined, response_payload: undefined, requestPayload, responsePayload };
+        });
+        res.status(200).json({ attempts });
+      } catch (err) {
+        console.error("[whizunik][masters/attempts] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
       }
-      if (!id) {
-        sendWzError(res, "INVALID_PAYLOAD", "id is required");
-        return;
-      }
-      const take = Math.min(Math.max(parseInt(limit || "20", 10) || 20, 1), 100);
-      const rows = db.prepare(
-        `SELECT id, connector_id, kind, whizunik_id, company_id, request_id, idempotency_key,
-                requested_at, responded_at, http_status, tally_status, success, error_message,
-                retry_count, request_payload, response_payload
-         FROM master_sync_attempts WHERE tenant_id = ? AND kind = ? AND whizunik_id = ?
-         ORDER BY requested_at DESC LIMIT ?`
-      ).all(userId, kind, id, take) as Array<Record<string, unknown>>;
-      const attempts = rows.map((r) => {
-        let requestPayload: unknown = null;
-        let responsePayload: unknown = null;
-        try { requestPayload = r.request_payload ? JSON.parse(r.request_payload as string) : null; } catch { requestPayload = r.request_payload; }
-        try { responsePayload = r.response_payload ? JSON.parse(r.response_payload as string) : null; } catch { responsePayload = r.response_payload; }
-        return { ...r, request_payload: undefined, response_payload: undefined, requestPayload, responsePayload };
-      });
-      res.status(200).json({ attempts });
-    } catch (err) {
-      console.error("[whizunik][masters/attempts] failed:", err);
-      sendWzError(res, "SERVER_ERROR", "An internal error occurred");
-    }
+    })();
   });
 });
 

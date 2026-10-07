@@ -1,6 +1,7 @@
 import request from "supertest";
 import type { Express } from "express";
-import db from "../src/db/index.js";
+import { getConnectorByPublicId } from "../src/db/storesTally.js";
+import { cancelActiveSessionsForConnector } from "../src/db/storesTally.js";
 import { createApp } from "../src/app.js";
 import { resetRateLimiters } from "../src/integrations/tally/middleware/rateLimiter.js";
 
@@ -77,11 +78,10 @@ export async function startSync(
   // Test isolation: cancel leftover active sessions for this connector+entity
   // so tests don't block each other (production concurrency rules still apply
   // within a test — see the "prevents concurrent duplicate sessions" test).
-  db.prepare(
-    `UPDATE tally_sync_sessions SET status = 'CANCELLED', completed_at = datetime('now')
-     WHERE connector_id = (SELECT id FROM tally_connectors WHERE connector_id = ?)
-       AND entity_type = ? AND status IN ('PENDING','RUNNING')`
-  ).run(ctx.connectorId, entityType);
+  const row = await getConnectorByPublicId(ctx.connectorId);
+  if (row) {
+    await cancelActiveSessionsForConnector(row.id as string, entityType);
+  }
 
   const res = await request(user.app)
     .post("/api/integrations/tally/sync/start")

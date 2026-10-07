@@ -1,5 +1,17 @@
-import db from "../../../db/index.js";
-import { v4 as uuidv4 } from "uuid";
+import {
+  findCustomerByName,
+  createCustomer,
+  findSupplierByName,
+  createSupplier,
+  findInvoiceByNumber,
+  createInvoice,
+  updateInvoice,
+  listInvoices,
+  listPayments,
+  createPayment,
+  createAllocation,
+} from "../../../db/storesCore.js";
+import { findPurchaseInvoice, createPurchaseInvoice, createVoucher } from "../../../db/storesTally.js";
 import { ApiError } from "../errors.js";
 import type { NormalizeContext, NormalizedResult } from "./registry.js";
 
@@ -15,7 +27,7 @@ import type { NormalizeContext, NormalizedResult } from "./registry.js";
 
 interface VoucherTarget {
   table: string;
-  normalize: (ctx: NormalizeContext) => NormalizedResult;
+  normalize: (ctx: NormalizeContext) => Promise<NormalizedResult>;
 }
 
 function dataOf(ctx: NormalizeContext): Record<string, any> {
@@ -23,30 +35,23 @@ function dataOf(ctx: NormalizeContext): Record<string, any> {
 }
 
 /** Resolve or create the customer for a party-ledger name. */
-function upsertCustomer(userId: string, name: string): string {
-  const existing = db
-    .prepare(`SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  if (existing) return existing.id;
-  const id = uuidv4();
-  db.prepare(`INSERT OR IGNORE INTO customers (id, user_id, name) VALUES (?, ?, ?)`).run(id, userId, name);
-  const row = db
-    .prepare(`SELECT id FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string };
-  return row.id;
+async function upsertCustomer(userId: string, name: string): Promise<string> {
+  const existing = await findCustomerByName(userId, name);
+  if (existing) return existing.id as string;
+  try {
+    const created = await createCustomer(userId, name);
+    return created.id as string;
+  } catch {
+    const again = await findCustomerByName(userId, name);
+    return again!.id as string;
+  }
 }
 
-function upsertSupplier(userId: string, name: string): string {
-  const existing = db
-    .prepare(`SELECT id FROM suppliers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string } | undefined;
-  if (existing) return existing.id;
-  const id = uuidv4();
-  db.prepare(`INSERT OR IGNORE INTO suppliers (id, user_id, name) VALUES (?, ?, ?)`).run(id, userId, name);
-  const row = db
-    .prepare(`SELECT id FROM suppliers WHERE user_id = ? AND LOWER(name) = LOWER(?)`)
-    .get(userId, name) as { id: string };
-  return row.id;
+async function upsertSupplier(userId: string, name: string): Promise<string> {
+  const existing = await findSupplierByName(userId, name);
+  if (existing) return existing.id as string;
+  const created = await createSupplier(userId, name);
+  return created.id as string;
 }
 
 /** Valid ISO-ish date guard. */
@@ -79,7 +84,7 @@ function requireVoucherNumber(ctx: NormalizeContext): string {
 export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
   SALES_VOUCHER: {
     table: "invoices",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const voucherNumber = requireVoucherNumber(ctx);
       const issueDate = requireDate(ctx);
@@ -94,39 +99,40 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
           ? d.dueDate.slice(0, 10)
           : issueDate; // conservative default: due on issue
 
-      const customerId = upsertCustomer(ctx.userId, party.trim());
+      const customerId = await upsertCustomer(ctx.userId, party.trim());
 
       // Idempotent insert; updates balance/status if content changed
-      const existing = db
-        .prepare(
-          `SELECT id, status, balance FROM invoices WHERE user_id = ? AND customer_id = ? AND invoice_number = ?`
-        )
-        .get(ctx.userId, customerId, voucherNumber) as
-        | { id: string; status: string; balance: number }
-        | undefined;
+      const existing = await findInvoiceByNumber(ctx.userId, customerId, voucherNumber);
 
       if (existing) {
         // Only touch financials if the invoice is still open (never regress reconciled data)
         if (existing.status === "open") {
-          db.prepare(
-            `UPDATE invoices SET issue_date = ?, due_date = ?, amount = ?, balance = ? WHERE id = ?`
-          ).run(issueDate, dueDate, amount, amount, existing.id);
+          await updateInvoice(ctx.userId, existing.id as string, {
+            issue_date: issueDate,
+            due_date: dueDate,
+            amount,
+            balance: amount,
+          });
         }
-        return { table: "invoices", recordId: existing.id };
+        return { table: "invoices", recordId: existing.id as string };
       }
 
-      const id = uuidv4();
-      db.prepare(
-        `INSERT INTO invoices (id, user_id, customer_id, invoice_number, issue_date, due_date, amount, balance, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`
-      ).run(id, ctx.userId, customerId, voucherNumber, issueDate, dueDate, amount, amount);
-      return { table: "invoices", recordId: id };
+      const created = await createInvoice(ctx.userId, {
+        customer_id: customerId,
+        invoice_number: voucherNumber,
+        issue_date: issueDate,
+        due_date: dueDate,
+        amount,
+        balance: amount,
+        status: "open",
+      });
+      return { table: "invoices", recordId: created.id as string };
     },
   },
 
   RECEIPT_VOUCHER: {
     table: "payments",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const voucherNumber = requireVoucherNumber(ctx);
       const paymentDate = requireDate(ctx);
@@ -136,30 +142,27 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
         throw new ApiError("TALLY_DATA_INVALID", "Receipt voucher is missing partyName");
       }
 
-      const customerId = upsertCustomer(ctx.userId, party.trim());
+      const customerId = await upsertCustomer(ctx.userId, party.trim());
 
       // Idempotency beyond source records: same customer + date + amount + note tag
       const note = `Tally ${ctx.record.voucherType || "Receipt"} ${voucherNumber}`;
-      const existingPayment = db
-        .prepare(
-          `SELECT id FROM payments WHERE user_id = ? AND customer_id = ? AND payment_date = ? AND amount = ? AND note = ?`
-        )
-        .get(ctx.userId, customerId, paymentDate, amount, note) as { id: string } | undefined;
+      const existingPayment = (await listPayments(ctx.userId)).find(
+        (p) =>
+          p.customer_id === customerId &&
+          p.payment_date === paymentDate &&
+          Number(p.amount) === Number(amount) &&
+          p.note === note
+      );
       if (existingPayment) {
-        return { table: "payments", recordId: existingPayment.id };
+        return { table: "payments", recordId: existingPayment.id as string };
       }
 
       // FIFO allocation against open invoices (mirrors existing payments logic)
-      const openInvoices = db
-        .prepare(
-          `SELECT id, balance FROM invoices
-           WHERE user_id = ? AND customer_id = ? AND status = 'open' AND balance != 0
-           ORDER BY due_date`
-        )
-        .all(ctx.userId, customerId) as Array<{ id: string; balance: number }>;
+      const openInvoices = (await listInvoices(ctx.userId, { customer_id: customerId, status: "open" }))
+        .filter((i) => Number(i.balance) !== 0)
+        .sort((a, b) => String(a.due_date || "").localeCompare(String(b.due_date || "")));
 
       let remaining = amount;
-      const paymentId = uuidv4();
       const allocations: Array<{ invoiceId: string; applied: number; closes: boolean }> = [];
 
       for (const inv of openInvoices) {
@@ -169,35 +172,44 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
         const newBalance = +(balance - applied).toFixed(2);
         const closes = newBalance <= 0.004;
 
-        db.prepare(
-          `UPDATE invoices SET balance = ?, status = ?, closed_date = ? WHERE id = ?`
-        ).run(newBalance, closes ? "closed" : "open", closes ? paymentDate : null, inv.id);
+        await updateInvoice(ctx.userId, inv.id as string, {
+          balance: newBalance,
+          status: closes ? "closed" : "open",
+          closed_date: closes ? paymentDate : null,
+        });
 
-        allocations.push({ invoiceId: inv.id, applied: +applied.toFixed(2), closes });
+        allocations.push({ invoiceId: inv.id as string, applied: +applied.toFixed(2), closes });
         remaining = +(remaining - applied).toFixed(2);
       }
 
       const totalApplied = +allocations.reduce((s, a) => s + a.applied, 0).toFixed(2);
 
-      db.prepare(
-        `INSERT INTO payments (id, user_id, customer_id, payment_date, amount, applied_amount, remaining, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(paymentId, ctx.userId, customerId, paymentDate, amount, totalApplied, remaining, note);
+      const payment = await createPayment(ctx.userId, {
+        customer_id: customerId,
+        payment_date: paymentDate,
+        amount,
+        applied_amount: totalApplied,
+        remaining,
+        note,
+      });
 
       for (const a of allocations) {
-        db.prepare(
-          `INSERT INTO payment_allocations (id, user_id, payment_id, invoice_id, amount_applied, applied_date, closed_invoice)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(uuidv4(), ctx.userId, paymentId, a.invoiceId, a.applied, paymentDate, a.closes ? 1 : 0);
+        await createAllocation(ctx.userId, {
+          payment_id: payment.id,
+          invoice_id: a.invoiceId,
+          amount_applied: a.applied,
+          applied_date: paymentDate,
+          closed_invoice: a.closes ? 1 : 0,
+        });
       }
 
-      return { table: "payments", recordId: paymentId };
+      return { table: "payments", recordId: payment.id as string };
     },
   },
 
   PURCHASE_VOUCHER: {
     table: "purchase_invoices",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const voucherNumber = requireVoucherNumber(ctx);
       const issueDate = requireDate(ctx);
@@ -207,24 +219,23 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
         throw new ApiError("TALLY_DATA_INVALID", "Purchase voucher is missing partyName");
       }
 
-      const supplierId = upsertSupplier(ctx.userId, party.trim());
+      const supplierId = await upsertSupplier(ctx.userId, party.trim());
       const dueDate =
         typeof d.dueDate === "string" && /^\d{4}-\d{2}-\d{2}/.test(d.dueDate) ? d.dueDate.slice(0, 10) : null;
 
-      const existing = db
-        .prepare(
-          `SELECT id FROM purchase_invoices WHERE user_id = ? AND supplier_id = ? AND invoice_number = ?`
-        )
-        .get(ctx.userId, supplierId, voucherNumber) as { id: string } | undefined;
+      const existing = await findPurchaseInvoice(ctx.userId, supplierId, voucherNumber);
 
-      if (existing) return { table: "purchase_invoices", recordId: existing.id };
+      if (existing) return { table: "purchase_invoices", recordId: existing.id as string };
 
-      const id = uuidv4();
-      db.prepare(
-        `INSERT INTO purchase_invoices (id, user_id, supplier_id, invoice_number, issue_date, due_date, amount)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, ctx.userId, supplierId, voucherNumber, issueDate, dueDate, amount);
-      return { table: "purchase_invoices", recordId: id };
+      const created = await createPurchaseInvoice({
+        user_id: ctx.userId,
+        supplier_id: supplierId,
+        invoice_number: voucherNumber,
+        issue_date: issueDate,
+        due_date: dueDate,
+        amount,
+      });
+      return { table: "purchase_invoices", recordId: created.id as string };
     },
   },
 
@@ -232,36 +243,32 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
   // preserves the original voucher in a generic store — queryable, never lost.
   __DEFAULT__: {
     table: "tally_vouchers",
-    normalize: (ctx) => {
+    normalize: async (ctx) => {
       const d = dataOf(ctx);
       const voucherNumber =
         (typeof ctx.record.voucherNumber === "string" && ctx.record.voucherNumber.trim()) || null;
       const voucherDate = requireDate(ctx);
       const amount = requireAmount(ctx);
 
-      const id = uuidv4();
-      db.prepare(
-        `INSERT INTO tally_vouchers (id, user_id, company_id, voucher_type, voucher_number, voucher_date, party_ledger, amount, narrative, raw_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        id,
-        ctx.userId,
-        ctx.companyId,
-        ctx.entityType,
-        voucherNumber,
-        voucherDate,
-        (typeof ctx.record.partyName === "string" && ctx.record.partyName) || (d.partyName as string) || null,
+      const created = await createVoucher({
+        user_id: ctx.userId,
+        company_id: ctx.companyId,
+        voucher_type: ctx.entityType,
+        voucher_number: voucherNumber,
+        voucher_date: voucherDate,
+        party_ledger:
+          (typeof ctx.record.partyName === "string" && ctx.record.partyName) || (d.partyName as string) || null,
         amount,
-        (d.narration as string) || null,
-        JSON.stringify(ctx.record.data ?? ctx.record)
-      );
-      return { table: "tally_vouchers", recordId: id };
+        narrative: (d.narration as string) || null,
+        raw_json: JSON.stringify(ctx.record.data ?? ctx.record),
+      });
+      return { table: "tally_vouchers", recordId: created.id as string };
     },
   },
 };
 
 /** Dispatch helper used by the registry (falls back to generic store). */
-export function normalizeVoucher(ctx: NormalizeContext): NormalizedResult {
+export async function normalizeVoucher(ctx: NormalizeContext): Promise<NormalizedResult> {
   const target = VOUCHER_TARGETS[ctx.entityType] ?? VOUCHER_TARGETS.__DEFAULT__;
   return target.normalize(ctx);
 }

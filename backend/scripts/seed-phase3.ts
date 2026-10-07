@@ -16,7 +16,9 @@
  * are removed first so the script is re-runnable.
  */
 import "dotenv/config";
-import db, { initializeDatabase } from "../src/db/index.js";
+import { initializeDatabase, getUserById } from "../src/db/index.js";
+import { dbPut, dbQueryPk, dbDelete, dbScan } from "../src/db/dynamo.js";
+import { userPk, tenantPk, customerSk, supplierSk, productSk, mLinkSk, mAttemptSk, nowIso } from "../src/db/keys.js";
 
 const PREFIX = "Phase3 ";
 
@@ -83,6 +85,18 @@ const SEED: SeedSpec[] = [
   },
 ];
 
+const SK_FOR: Record<SeedSpec["table"], (id: string) => string> = {
+  customers: customerSk,
+  suppliers: supplierSk,
+  products: productSk,
+};
+
+const RT_FOR: Record<SeedSpec["table"], string> = {
+  customers: "CUSTOMER",
+  suppliers: "SUPPLIER",
+  products: "PRODUCT",
+};
+
 async function main(): Promise<void> {
   const userId = process.argv[2];
   const reset = process.argv.includes("--reset");
@@ -91,50 +105,61 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Safety: never seed a production database file.
-  const dbUrl = (process.env.DATABASE_URL || "").toLowerCase();
-  if (process.env.NODE_ENV === "production" || dbUrl.includes("prod")) {
+  // Safety: never seed a production table.
+  const table = (process.env.DYNAMODB_TABLE_PREFIX || "").toLowerCase();
+  if (process.env.NODE_ENV === "production" || table.includes("prod")) {
     console.error("Refusing to seed: production environment detected. Use dummy/test data only.");
     process.exit(1);
   }
 
   await initializeDatabase();
 
-  const user = db.prepare(`SELECT id, email FROM users WHERE id = ?`).get(userId) as
-    | { id: string; email: string }
-    | undefined;
+  const user = await getUserById(userId);
   if (!user) {
     console.error(`No such user: ${userId}`);
     process.exit(1);
   }
 
   if (reset) {
-    for (const table of ["customers", "suppliers", "products"] as const) {
+    for (const prefix of ["CUSTOMER#", "SUPPLIER#", "PRODUCT#"] as const) {
       try {
-        db.prepare(`DELETE FROM ${table} WHERE user_id = ? AND name LIKE '${PREFIX}%'`).run(userId);
+        const rows = await dbQueryPk(userPk(userId), prefix);
+        for (const r of rows) {
+          if (String(r.name || "").startsWith(PREFIX)) await dbDelete(r.pk, r.sk);
+        }
       } catch (err) {
-        console.error(`Reset failed for ${table}:`, err);
+        console.error(`Reset failed for ${prefix}:`, err);
         process.exit(1);
       }
     }
     try {
-      db.prepare(`DELETE FROM master_sync_links WHERE tenant_id = ?`).run(userId);
-      db.prepare(`DELETE FROM master_sync_attempts WHERE tenant_id = ?`).run(userId);
+      const links = await dbScan((it) => it.pk === tenantPk(userId) && (it.sk.startsWith("MSYNCLINK#") || it.sk.startsWith("MSYNCATTEMPT#")));
+      void mLinkSk;
+      void mAttemptSk;
+      for (const l of links) await dbDelete(l.pk, l.sk);
     } catch { /* links tables always exist with the whizunik schema */ }
   }
 
   let created = 0;
   let skipped = 0;
   for (const s of SEED) {
-    const existing = db.prepare(`SELECT id FROM ${s.table} WHERE id = ?`).get(s.id) as { id: string } | undefined;
-    if (existing) {
+    const sk = SK_FOR[s.table](s.id);
+    const found = await dbQueryPk(userPk(userId), sk).then((rows) => rows.find((r) => r.id === s.id));
+    if (found) {
       skipped++;
       continue;
     }
-    const cols = ["id", "user_id", "name", ...Object.keys(s.cols)];
-    const placeholders = cols.map(() => "?").join(", ");
-    const values = [s.id, userId, s.name, ...Object.values(s.cols)];
-    db.prepare(`INSERT INTO ${s.table} (${cols.join(", ")}) VALUES (${placeholders})`).run(...values);
+    await dbPut({
+      pk: userPk(userId),
+      sk,
+      recordType: RT_FOR[s.table],
+      id: s.id,
+      user_id: userId,
+      name: s.name,
+      created_at: nowIso(),
+      version: 1,
+      ...s.cols,
+    });
     created++;
   }
 

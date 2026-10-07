@@ -27,12 +27,13 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1147.0",
+    "@aws-sdk/lib-dynamodb": "^3.1147.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
-    "sql.js": "^1.11.0",
     "uuid": "^11.1.0",
     "xero-node": "^18.0.0",
     "zod": "^4.6.5"
@@ -43,7 +44,6 @@
     "@types/express": "^5.0.0",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.16.5",
-    "@types/sql.js": "^1.4.11",
     "@types/supertest": "^7.2.1",
     "@types/uuid": "^10.0.0",
     "supertest": "^7.3.0",

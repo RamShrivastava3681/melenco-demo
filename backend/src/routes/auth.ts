@@ -1,12 +1,11 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { v4 as uuidv4 } from "uuid";
-import db from "../db/index.js";
+import { createUser, getUserById, getUserByEmail } from "../db/storesCore.js";
 import { generateToken, requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-router.post("/signup", (req: Request, res: Response) => {
+router.post("/signup", async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
 
@@ -20,25 +19,22 @@ router.post("/signup", (req: Request, res: Response) => {
       return;
     }
 
-    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    const existing = await getUserByEmail(email);
     if (existing) {
       res.status(409).json({ error: "Email already registered" });
       return;
     }
 
-    const id = uuidv4();
     const passwordHash = bcrypt.hashSync(password, 10);
     const displayName = name || email.split("@")[0];
 
-    db.prepare(
-      "INSERT INTO users (id, email, password_hash, name) VALUES (?, ?, ?, ?)"
-    ).run(id, email, passwordHash, displayName);
+    const user = await createUser(email, passwordHash, displayName);
 
-    const token = generateToken({ userId: id, email });
+    const token = generateToken({ userId: user.id, email });
 
     res.status(201).json({
       token,
-      user: { id, email, name: displayName },
+      user: { id: user.id, email, name: displayName },
     });
   } catch (error) {
     console.error("Signup error:", error);
@@ -46,7 +42,7 @@ router.post("/signup", (req: Request, res: Response) => {
   }
 });
 
-router.post("/signin", (req: Request, res: Response) => {
+router.post("/signin", async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -55,9 +51,7 @@ router.post("/signin", (req: Request, res: Response) => {
       return;
     }
 
-    const user = db
-      .prepare("SELECT id, email, password_hash, name FROM users WHERE email = ?")
-      .get(email) as { id: string; email: string; password_hash: string; name: string } | undefined;
+    const user = await getUserByEmail(email);
 
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
       res.status(401).json({ error: "Invalid email or password" });
@@ -76,17 +70,15 @@ router.post("/signin", (req: Request, res: Response) => {
   }
 });
 
-router.get("/me", requireAuth, (req: Request, res: Response) => {
-  const user = db
-    .prepare("SELECT id, email, name, created_at FROM users WHERE id = ?")
-    .get(req.user!.userId) as { id: string; email: string; name: string; created_at: string } | undefined;
+router.get("/me", requireAuth, async (req: Request, res: Response) => {
+  const user = await getUserById(req.user!.userId);
 
   if (!user) {
     res.status(404).json({ error: "User not found" });
     return;
   }
 
-  res.json({ user });
+  res.json({ user: { id: user.id, email: user.email, name: user.name, created_at: user.created_at } });
 });
 
 export default router;

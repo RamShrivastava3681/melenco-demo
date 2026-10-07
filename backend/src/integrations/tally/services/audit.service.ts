@@ -1,5 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
-import db from "../../../db/index.js";
+import { writeAudit } from "../../../db/storesTally.js";
 
 /** Audit events recorded for compliance/traceability. */
 export type AuditEvent =
@@ -34,22 +33,15 @@ export interface AuditContext {
 /**
  * Write an audit event. Never throws — audit failures must not break the
  * request path. Detail payloads must already be sanitized (no financial data).
+ * Fire-and-forget: returns void so existing sync call sites keep working.
  */
 export function audit(event: AuditEvent, ctx: AuditContext): void {
-  try {
-    db.prepare(
-      `INSERT INTO tally_audit_logs (id, user_id, connector_id, sync_id, event, request_id, detail)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      uuidv4(),
-      ctx.userId,
-      ctx.connectorId ?? null,
-      ctx.syncId ?? null,
-      event,
-      ctx.requestId ?? null,
-      ctx.detail ? JSON.stringify(ctx.detail) : null
-    );
-  } catch (err) {
-    console.error(`[tally][audit] Failed to record event ${event}:`, err);
-  }
+  void writeAudit({
+    userId: ctx.userId,
+    connectorId: ctx.connectorId,
+    syncId: ctx.syncId,
+    event,
+    requestId: ctx.requestId,
+    detail: ctx.detail,
+  });
 }

@@ -5,15 +5,16 @@
  *   - 3 with valid GSTIN (registered dealers)
  *   - 2 with NULL GSTIN (B2C / unregistered — exercises the optional-GSTIN path)
  *
- * Usage (on the machine hosting the cloud DB):
+ * Usage (with DynamoDB credentials configured):
  *   npx tsx scripts/seed-test-customers.ts <userEmail> [--reset]
  *
  * With --reset, rows named 'Test Customer %' / 'Test B2C Customer %' for the
  * tenant are removed first so the script is re-runnable.
  */
 import "dotenv/config";
-import { randomUUID as uuidv4 } from "node:crypto";
-import db, { initializeDatabase, saveDb } from "../src/db/index.js";
+import { initializeDatabase, getUserByEmail, findCustomerByName, createCustomer } from "../src/db/index.js";
+import { dbQueryPk, dbDelete } from "../src/db/dynamo.js";
+import { userPk } from "../src/db/keys.js";
 
 const CUSTOMERS = [
   {
@@ -83,37 +84,37 @@ async function main(): Promise<void> {
 
   await initializeDatabase();
 
-  const user = db.prepare(`SELECT id, email FROM users WHERE email = ?`).get(userEmail) as
-    | { id: string; email: string }
-    | undefined;
+  const user = await getUserByEmail(userEmail);
   if (!user) {
     console.error(`No such user: ${userEmail}`);
     process.exit(1);
   }
 
   if (reset) {
-    db.prepare(`DELETE FROM customers WHERE user_id = ? AND (name LIKE 'Test Customer %' OR name LIKE 'Test B2C Customer %')`).run(user.id);
+    const rows = await dbQueryPk(userPk(user.id), "CUSTOMER#");
+    for (const r of rows) {
+      const n = String(r.name || "");
+      if (n.startsWith("Test Customer ") || n.startsWith("Test B2C Customer ")) {
+        await dbDelete(r.pk, r.sk);
+      }
+    }
   }
 
   let created = 0;
   let skipped = 0;
   for (const c of CUSTOMERS) {
-    const existing = db.prepare(`SELECT id FROM customers WHERE user_id = ? AND name = ?`).get(user.id, c.name) as
-      | { id: string }
-      | undefined;
+    const existing = await findCustomerByName(user.id, c.name);
     if (existing) {
       skipped++;
       console.log(`SKIP (already exists): ${c.name}`);
       continue;
     }
-    db.prepare(
-      `INSERT INTO customers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(uuidv4(), user.id, c.name, c.gstin, c.pan, c.address, c.state, c.pin, c.phone, c.email, c.payment_terms);
+    const { name, ...extra } = c;
+    await createCustomer(user.id, name, extra);
     created++;
     console.log(`CREATED: ${c.name} (gstin=${c.gstin ?? "NULL"})`);
   }
 
-  saveDb();
   console.log(`Seed for ${user.email}: ${created} created, ${skipped} already present.`);
 }
 

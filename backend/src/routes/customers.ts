@@ -1,6 +1,13 @@
 import { Router, Request, Response } from "express";
-import { v4 as uuidv4 } from "uuid";
-import db from "../db/index.js";
+import {
+  listCustomers,
+  createCustomer,
+  getCustomer,
+  deleteCustomer,
+  listInvoices,
+} from "../db/storesCore.js";
+import { dbQueryPk } from "../db/dynamo.js";
+import { userPk } from "../db/keys.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -9,40 +16,41 @@ const router = Router();
 router.use(requireAuth);
 
 // List customers with outstanding and remaining balances
-router.get("/", (req: Request, res: Response) => {
+router.get("/", async (req: Request, res: Response) => {
   const userId = req.user!.userId;
 
-  const rows = db
-    .prepare(
-      `SELECT
-         c.id,
-         c.name,
-         c.created_at,
-         COALESCE(open_sum.total_balance, 0) AS outstanding_balance,
-         COALESCE(rem_sum.total_remaining, 0) AS remaining_balance
-       FROM customers c
-       LEFT JOIN (
-         SELECT customer_id, SUM(balance) AS total_balance
-         FROM invoices
-         WHERE user_id = ? AND status = 'open'
-         GROUP BY customer_id
-       ) open_sum ON open_sum.customer_id = c.id
-       LEFT JOIN (
-         SELECT customer_id, SUM(remaining) AS total_remaining
-         FROM payments
-         WHERE user_id = ? AND remaining > 0
-         GROUP BY customer_id
-       ) rem_sum ON rem_sum.customer_id = c.id
-       WHERE c.user_id = ?
-       ORDER BY c.name`
-    )
-    .all(userId, userId, userId);
+  const [customers, invoices, payments] = await Promise.all([
+    listCustomers(userId),
+    listInvoices(userId, { status: "open" }),
+    dbQueryPk(userPk(userId), "PAYMENT#"),
+  ]);
+
+  const openByCustomer = new Map<string, number>();
+  for (const inv of invoices) {
+    const cid = inv.customer_id as string;
+    openByCustomer.set(cid, (openByCustomer.get(cid) || 0) + Number(inv.balance || 0));
+  }
+  const remByCustomer = new Map<string, number>();
+  for (const p of payments) {
+    if (Number(p.remaining) > 0) {
+      const cid = p.customer_id as string;
+      remByCustomer.set(cid, (remByCustomer.get(cid) || 0) + Number(p.remaining || 0));
+    }
+  }
+
+  const rows = customers.map((c) => ({
+    id: c.id,
+    name: c.name,
+    created_at: c.created_at,
+    outstanding_balance: openByCustomer.get(c.id as string) || 0,
+    remaining_balance: remByCustomer.get(c.id as string) || 0,
+  }));
 
   res.json({ customers: rows });
 });
 
 // Create customer
-router.post("/", (req: Request, res: Response) => {
+router.post("/", async (req: Request, res: Response) => {
   const { name } = req.body;
   if (!name || !name.trim()) {
     res.status(400).json({ error: "Name is required" });
@@ -50,16 +58,10 @@ router.post("/", (req: Request, res: Response) => {
   }
 
   try {
-    const id = uuidv4();
-    db.prepare(
-      "INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)"
-    ).run(id, req.user!.userId, name.trim());
-
-    const customer = db
-      .prepare("SELECT id, name, created_at FROM customers WHERE id = ?")
-      .get(id);
-
-    res.status(201).json({ customer });
+    const created = await createCustomer(req.user!.userId, name.trim());
+    res.status(201).json({
+      customer: { id: created.id, name: created.name, created_at: created.created_at },
+    });
   } catch (error: any) {
     const msg = error?.message || String(error);
     if (msg.includes("UNIQUE") || msg.includes("unique")) {
@@ -72,24 +74,25 @@ router.post("/", (req: Request, res: Response) => {
 });
 
 // Customer payment stats (avg, median, max, min pay days)
-router.get("/stats", (req: Request, res: Response) => {
+router.get("/stats", async (req: Request, res: Response) => {
   const userId = req.user!.userId;
 
   // Get all closed invoices with payment_days for this user
-  const rows = db
-    .prepare(
-      `SELECT customer_id, payment_days
-       FROM invoices
-       WHERE user_id = ? AND status = 'closed' AND payment_days IS NOT NULL
-       ORDER BY customer_id, payment_days`
-    )
-    .all(userId) as { customer_id: string; payment_days: number }[];
+  const closed = await listInvoices(userId, { status: "closed" });
+  const rows = closed
+    .filter((r) => r.payment_days !== null && r.payment_days !== undefined)
+    .sort((a, b) => {
+      const c = String(a.customer_id || "").localeCompare(String(b.customer_id || ""));
+      if (c !== 0) return c;
+      return Number(a.payment_days) - Number(b.payment_days);
+    });
 
   // Group by customer and compute stats
   const grouped: Record<string, number[]> = {};
   for (const row of rows) {
-    if (!grouped[row.customer_id]) grouped[row.customer_id] = [];
-    grouped[row.customer_id].push(Number(row.payment_days));
+    const cid = row.customer_id as string;
+    if (!grouped[cid]) grouped[cid] = [];
+    grouped[cid].push(Number(row.payment_days));
   }
 
   const stats: Record<string, { avg_pay_days: number | null; median_pay_days: number | null; max_pay_days: number | null; min_pay_days: number | null; closed_count: number }> = {};
@@ -120,19 +123,17 @@ router.get("/stats", (req: Request, res: Response) => {
 });
 
 // Delete customer
-router.delete("/:id", (req: Request, res: Response) => {
-  const { id } = req.params;
+router.delete("/:id", async (req: Request, res: Response) => {
+  const { id } = req.params as { id: string };
 
-  const customer = db
-    .prepare("SELECT id FROM customers WHERE id = ? AND user_id = ?")
-    .get(id, req.user!.userId);
+  const customer = await getCustomer(req.user!.userId, id);
 
   if (!customer) {
     res.status(404).json({ error: "Customer not found" });
     return;
   }
 
-  db.prepare("DELETE FROM customers WHERE id = ?").run(id);
+  await deleteCustomer(req.user!.userId, id);
   res.json({ success: true });
 });
 

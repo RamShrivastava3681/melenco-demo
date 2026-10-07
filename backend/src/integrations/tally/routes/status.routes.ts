@@ -1,5 +1,4 @@
 import { Router, Request, Response } from "express";
-import db from "../../../db/index.js";
 import { requireAuth } from "../../../middleware/auth.js";
 import { rateLimiters } from "../middleware/rateLimiter.js";
 import { sendError, errorHandler } from "../errors.js";
@@ -12,6 +11,13 @@ import { formatZodError, pairingCodeRequestSchema } from "../validators/schemas.
 import { logInfo, logError } from "../utils/logger.js";
 import { config } from "../utils/env.js";
 import { publicApiBaseUrl } from "../whizunik/baseUrl.js";
+import {
+  getWConnectorByPublicId,
+  getWConnectorByRowId,
+  updateWConnector,
+  listPendingWCommands,
+  updateWCommand,
+} from "../../../db/storesWhizunik.js";
 
 const router = Router();
 
@@ -24,13 +30,13 @@ const router = Router();
  * Returns a single-use, short-lived code (WZK-XXXX-XXXX). Plaintext is shown
  * once; only the hash is stored.
  */
-router.post("/pairing-code", requireAuth, rateLimiters.pairing, (req: Request, res: Response) => {
+router.post("/pairing-code", requireAuth, rateLimiters.pairing, async (req: Request, res: Response) => {
   try {
     const parsed = pairingCodeRequestSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return sendError(res, "INVALID_PAYLOAD", "Invalid request", formatZodError(parsed.error), req.requestId);
     }
-    const pairing = createPairingCode(req.user!.userId, req.requestId);
+    const pairing = await createPairingCode(req.user!.userId, req.requestId);
     logInfo("pairing", req, `Pairing code created for user ${req.user!.userId}`);
     res.status(201).json({
       success: true,
@@ -47,9 +53,9 @@ router.post("/pairing-code", requireAuth, rateLimiters.pairing, (req: Request, r
 /**
  * GET /status — everything the frontend Integrations panel needs. No secrets.
  */
-router.get("/status", requireAuth, (req: Request, res: Response) => {
+router.get("/status", requireAuth, async (req: Request, res: Response) => {
   try {
-    res.json({ success: true, apiBaseUrl: publicApiBaseUrl(), ...buildStatusPayload(req.user!.userId) });
+    res.json({ success: true, apiBaseUrl: publicApiBaseUrl(), ...(await buildStatusPayload(req.user!.userId)) });
   } catch (err) {
     errorHandler(err, req, res);
   }
@@ -58,11 +64,11 @@ router.get("/status", requireAuth, (req: Request, res: Response) => {
 /**
  * GET /connectors — connector list (frontend-safe shape).
  */
-router.get("/connectors", requireAuth, (req: Request, res: Response) => {
+router.get("/connectors", requireAuth, async (req: Request, res: Response) => {
   try {
     res.json({
       success: true,
-      connectors: listConnectorsForUser(req.user!.userId).map(toConnectorStatus),
+      connectors: (await listConnectorsForUser(req.user!.userId)).map(toConnectorStatus),
     });
   } catch (err) {
     errorHandler(err, req, res);
@@ -72,10 +78,10 @@ router.get("/connectors", requireAuth, (req: Request, res: Response) => {
 /**
  * GET /sync-history — session history with optional filters.
  */
-router.get("/sync-history", requireAuth, (req: Request, res: Response) => {
+router.get("/sync-history", requireAuth, async (req: Request, res: Response) => {
   try {
     const { connectorId, status, limit } = req.query as Record<string, string | undefined>;
-    const sessions = listSyncHistory(req.user!.userId, {
+    const sessions = await listSyncHistory(req.user!.userId, {
       connectorId,
       status,
       limit: limit ? parseInt(limit, 10) : undefined,
@@ -89,10 +95,10 @@ router.get("/sync-history", requireAuth, (req: Request, res: Response) => {
 /**
  * GET /audit — recent audit events for the activity feed.
  */
-router.get("/audit", requireAuth, (req: Request, res: Response) => {
+router.get("/audit", requireAuth, async (req: Request, res: Response) => {
   try {
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
-    res.json({ success: true, events: listAuditEvents(req.user!.userId, limit) });
+    res.json({ success: true, events: await listAuditEvents(req.user!.userId, limit) });
   } catch (err) {
     errorHandler(err, req, res);
   }
@@ -107,7 +113,7 @@ router.get("/audit", requireAuth, (req: Request, res: Response) => {
  * Active sessions are cancelled; the connector can no longer authenticate and
  * disappears from the device list.
  */
-router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
+router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
   try {
     const { connectorId } = req.body as { connectorId?: string };
     if (!connectorId || typeof connectorId !== "string") {
@@ -115,12 +121,12 @@ router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
     }
 
     // Resolve public id → row id within this tenant only (legacy table first)
-    const row = listConnectorsForUser(req.user!.userId).find(
+    const row = (await listConnectorsForUser(req.user!.userId)).find(
       (c) => c.connector_id === connectorId || c.id === connectorId
     );
     if (row) {
-      revokeConnector(req.user!.userId, row.id, req.requestId);
-      cancelActiveSessionsForConnector(row.id);
+      await revokeConnector(req.user!.userId, row.id, req.requestId);
+      await cancelActiveSessionsForConnector(row.id);
       audit("CONNECTOR_DISCONNECTED", {
         userId: req.user!.userId,
         connectorId: row.connector_id,
@@ -132,28 +138,25 @@ router.post("/disconnect", requireAuth, (req: Request, res: Response) => {
     }
 
     // New-spec (WhizUnik Cloud API) connector for this tenant?
-    const wz = db.prepare(
-      `SELECT id, connector_id, status FROM connectors WHERE tenant_id = ? AND (connector_id = ? OR id = ?)`
-    ).get(req.user!.userId, connectorId, connectorId) as
-      | { id: string; connector_id: string; status: string }
-      | undefined;
-    if (!wz) {
+    const wzByPublic = await getWConnectorByPublicId(connectorId);
+    const wzByRow = wzByPublic ? null : await getWConnectorByRowId(connectorId);
+    const wz = wzByPublic || wzByRow;
+    if (!wz || wz.tenant_id !== req.user!.userId) {
       return sendError(res, "AUTHORIZATION_FAILED", "Connector not found for this account", undefined, req.requestId);
     }
-    db.prepare(
-      `UPDATE connectors SET status = 'revoked', refresh_token_hash = NULL, updated_at = datetime('now') WHERE id = ?`
-    ).run(wz.id);
+    await updateWConnector(wz, { status: "revoked", refresh_token_hash: null });
     // Stale queued pushes for a dead device must not linger as PENDING.
     try {
-      db.prepare(
-        `UPDATE connector_commands SET status = 'CANCELLED', completed_at = datetime('now')
-         WHERE connector_id = ? AND status IN ('PENDING', 'DELIVERED')`
-      ).run(wz.connector_id);
-    } catch { /* commands table always exists with the whizunik schema; ignore */ }
+      const pending = await listPendingWCommands(wz.connector_id as string, 100);
+      const now = new Date().toISOString();
+      for (const cmd of pending) {
+        await updateWCommand(cmd, { status: "CANCELLED", completed_at: now });
+      }
+    } catch { /* ignore */ }
     try {
       audit("CONNECTOR_DISCONNECTED", {
         userId: req.user!.userId,
-        connectorId: wz.connector_id,
+        connectorId: wz.connector_id as string,
         requestId: req.requestId,
       });
     } catch { /* audit must never break disconnect */ }

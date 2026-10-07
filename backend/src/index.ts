@@ -1,14 +1,11 @@
 import "dotenv/config";
 import { createApp } from "./app.js";
-import { initializeDatabase, startAutoSave, stopAutoSave, saveDb } from "./db/index.js";
+import { initializeDatabase } from "./db/index.js";
 import { startTallyRetentionJob } from "./integrations/tally/services/rawStore.service.js";
 
 async function main() {
-  // Initialize database tables
+  // Verify DynamoDB table access + seed admin user
   await initializeDatabase();
-
-  // Auto-save SQLite database to disk every 5 seconds
-  startAutoSave();
 
   const app = createApp();
   const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -21,12 +18,10 @@ async function main() {
     console.log(`🚀 Ledgerly API server running at http://localhost:${PORT}`);
   });
 
-  // Graceful shutdown — save SQLite database before exit
+  // Graceful shutdown
   const shutdown = async (signal: string) => {
-    console.log(`\n📦 ${signal} received. Saving database and shutting down...`);
-    stopAutoSave();
+    console.log(`\n📦 ${signal} received. Shutting down...`);
     stopRetention();
-    saveDb();
     server.close(() => {
       console.log("👋 Server closed.");
       process.exit(0);

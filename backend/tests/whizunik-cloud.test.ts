@@ -4,7 +4,8 @@ import { createApp } from "../src/app.js";
 import { initTestDb } from "./setup.js";
 import { signupUser, freshRateLimits, type UserCtx } from "./helpers.js";
 import { resetWzRateLimits } from "../src/integrations/tally/whizunik/auth.js";
-import db from "../src/db/index.js";
+import { dbPut } from "../src/db/dynamo.js";
+import { userPk, customerSk, supplierSk, productSk, nowIso } from "../src/db/keys.js";
 
 let app: ReturnType<typeof createApp>;
 let user: UserCtx;
@@ -549,29 +550,31 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
     // seeded id is prefixed per test.
     async function seedPhase3Tenant(userId: string, p: string) {
       const cid = (s: string) => `${p}-${s}`;
-      db.prepare(`INSERT INTO customers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        cid("cust-1"), userId, "Phase3 Customer One", "29ABCDE1234F1Z5", "ABCDE1234F",
-        "42 Test Street", "Karnataka", "560001", "9876543210", "one@example.com", "Net 30"
-      );
-      db.prepare(`INSERT INTO customers (id, user_id, name) VALUES (?, ?, ?)`).run(
-        cid("cust-nogst"), userId, "Phase3 No GSTIN"
-      );
-      db.prepare(`INSERT INTO customers (id, user_id, name, gstin) VALUES (?, ?, ?, ?)`).run(
-        cid("cust-badgst"), userId, "Phase3 Bad GSTIN", "BOGUS"
-      );
-      db.prepare(`INSERT INTO suppliers (id, user_id, name, gstin, pan, address, state, pin, phone, email, payment_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        cid("supp-1"), userId, "Phase3 Supplier One", "27ABCDE1234F2Z3", "ABCDE1234G",
-        "7 Supply Lane", "Maharashtra", "400001", "9123456780", "supp@example.com", "Net 15"
-      );
-      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        cid("sku-1"), userId, "Phase3 Widget", "P3-WIDGET-001", "8471", 18, "Nos", "Phase3 Goods"
-      );
-      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        cid("sku-badrate"), userId, "Phase3 Bad Rate", "P3-BADRATE-001", "8471", 99, "Nos", "Phase3 Goods"
-      );
-      db.prepare(`INSERT INTO products (id, user_id, name, sku_code, hsn, gst_rate, base_unit, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        cid("sku-nounit"), userId, "Phase3 No Unit", "P3-NOUNIT-001", "8471", 12, null, "Phase3 Goods"
-      );
+      const put = (sk: string, recordType: string, id: string, attrs: Record<string, any>) =>
+        dbPut({ pk: userPk(userId), sk, recordType, id, user_id: userId, created_at: nowIso(), version: 1, ...attrs });
+      await put(customerSk(cid("cust-1")), "CUSTOMER", cid("cust-1"), {
+        name: "Phase3 Customer One", gstin: "29ABCDE1234F1Z5", pan: "ABCDE1234F",
+        address: "42 Test Street", state: "Karnataka", pin: "560001", phone: "9876543210",
+        email: "one@example.com", payment_terms: "Net 30",
+      });
+      await put(customerSk(cid("cust-nogst")), "CUSTOMER", cid("cust-nogst"), { name: "Phase3 No GSTIN" });
+      await put(customerSk(cid("cust-badgst")), "CUSTOMER", cid("cust-badgst"), {
+        name: "Phase3 Bad GSTIN", gstin: "BOGUS",
+      });
+      await put(supplierSk(cid("supp-1")), "SUPPLIER", cid("supp-1"), {
+        name: "Phase3 Supplier One", gstin: "27ABCDE1234F2Z3", pan: "ABCDE1234G",
+        address: "7 Supply Lane", state: "Maharashtra", pin: "400001", phone: "9123456780",
+        email: "supp@example.com", payment_terms: "Net 15",
+      });
+      await put(productSk(cid("sku-1")), "PRODUCT", cid("sku-1"), {
+        name: "Phase3 Widget", sku_code: "P3-WIDGET-001", hsn: "8471", gst_rate: 18, base_unit: "Nos", group_name: "Phase3 Goods",
+      });
+      await put(productSk(cid("sku-badrate")), "PRODUCT", cid("sku-badrate"), {
+        name: "Phase3 Bad Rate", sku_code: "P3-BADRATE-001", hsn: "8471", gst_rate: 99, base_unit: "Nos", group_name: "Phase3 Goods",
+      });
+      await put(productSk(cid("sku-nounit")), "PRODUCT", cid("sku-nounit"), {
+        name: "Phase3 No Unit", sku_code: "P3-NOUNIT-001", hsn: "8471", gst_rate: 12, base_unit: null, group_name: "Phase3 Goods",
+      });
       return cid;
     }
 
