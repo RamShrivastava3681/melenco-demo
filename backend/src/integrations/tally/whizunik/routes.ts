@@ -1466,4 +1466,124 @@ router.get("/masters/attempts", (req: Request, res: Response) => {
   });
 });
 
+/**
+ * POST /masters/retry — re-process a master item that was stuck in SENDING
+ * or FAILED. Sets the queue row status to QUEUED so the connector's poll loop
+ * will pick it up on the next cycle and re-process it through processRow().
+ */
+router.post("/masters/retry", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const { idempotencyKey } = req.body ?? {};
+        if (!idempotencyKey) {
+          return sendWzError(res, "INVALID_PAYLOAD", "idempotencyKey is required");
+        }
+        const { getMasterQueueRow, setMasterQueueRow } = await import("../../../db/storesTally.js");
+        const queueRow = await getMasterQueueRow(userId, idempotencyKey);
+        if (!queueRow) {
+          return sendWzError(res, "INVALID_PAYLOAD", "Master item not found for this idempotencyKey");
+        }
+        // Set status to QUEUED, reset lastError and attempts so the connector
+        // will reprocess it from scratch on the next poll cycle.
+        await setMasterQueueRow(userId, idempotencyKey, {
+          status: "QUEUED",
+          attempts: 0,
+          lastError: null,
+          tallyName: queueRow.tallyName,
+          tallyMasterId: queueRow.tallyMasterId,
+          matchSuggestion: null,
+          fieldDiff: null,
+          mappingOverride: null,
+          updatedAt: new Date().toISOString(),
+        });
+        // Note: the connector's resumeQueue() or pollOnce() will see the QUEUED
+        // status and reprocess the item. The command ack to cloud (DONE/CANCELLED)
+        // will be handled when the connector finishes processing.
+        res.status(200).json({ ok: true, message: "Item requeued. Connector will pick up on next poll." });
+      } catch (err) {
+        console.error("[whizunik][masters/retry] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
+  });
+});
+
+/**
+ * POST /masters/confirm-link — confirm a suggested Tally match for a master item
+ * that is in NEEDS_REVIEW status. Links the WhizUnik record to the suggested Tally
+ * record, saves the master_sync_link, and sets the queue row to SYNCED.
+ * The connector's poll loop will see SYNCED and not re-process.
+ * Note: the command ack to cloud (DONE) will be handled by the connector on its next
+ * poll cycle or via manual ack in the UI.
+ */
+router.post("/masters/confirm-link", (req: Request, res: Response) => {
+  requireAuth(req, res, () => {
+    void (async () => {
+      try {
+        const userId = req.user!.userId;
+        const { idempotencyKey } = req.body ?? {};
+        if (!idempotencyKey) {
+          return sendWzError(res, "INVALID_PAYLOAD", "idempotencyKey is required");
+        }
+        const { getMasterQueueRow, setMasterQueueRow } = await import("../../../db/storesTally.js");
+        const { putMasterLink } = await import("../../../db/storesWhizunik.js");
+        const queueRow = await getMasterQueueRow(userId, idempotencyKey);
+        if (!queueRow) {
+          return sendWzError(res, "INVALID_PAYLOAD", "Master item not found for this idempotencyKey");
+        }
+        // Extract the suggested Tally match from the queue row's matchSuggestion field
+        let matchSuggestion: { tallyName: string; tallyMasterId?: string | null; via: string } | null = null;
+        try {
+          const rawSuggestion = JSON.parse(queueRow.matchSuggestion as string);
+          if (rawSuggestion && typeof rawSuggestion.tallyName === 'string' && rawSuggestion.tallyName.length > 0) {
+            matchSuggestion = {
+              tallyName: rawSuggestion.tallyName,
+              tallyMasterId: typeof rawSuggestion.tallyMasterId === 'string' ? rawSuggestion.tallyMasterId : null,
+              via: typeof rawSuggestion.via === 'string' ? rawSuggestion.via : 'unknown',
+            };
+          }
+        } catch { }
+        if (!matchSuggestion?.tallyName) {
+          return sendWzError(res, "INVALID_PAYLOAD", "No suggested match to confirm");
+        }
+        // Save the master_sync_link so the dashboard shows SYNCED with the Tally name
+        // The kind is embedded in the idempotencyKey (e.g., "customer:ABC-123:1")
+        const kind = idempotencyKey.split(":")[0] || "customer";
+        await putMasterLink({
+          tenant_id: userId,
+          kind: kind as "customer" | "supplier" | "sku",
+          whizunik_id: queueRow.whizunikId,
+          tally_name: matchSuggestion.tallyName,
+          tally_master_id: matchSuggestion.tallyMasterId,
+          version: 1,
+          status: "SYNCED",
+          attempts: queueRow.attempts,
+          idempotency_key: idempotencyKey,
+          direction: "outbound",
+          request_id: queueRow.commandId,
+          approved_by: userId,
+        });
+        // Update the queue row to SYNCED, clear the match suggestion
+        await setMasterQueueRow(userId, idempotencyKey, {
+          status: "SYNCED",
+          attempts: queueRow.attempts,
+          lastError: null,
+          tallyName: matchSuggestion.tallyName,
+          tallyMasterId: matchSuggestion.tallyMasterId,
+          matchSuggestion: null,
+          fieldDiff: null,
+          mappingOverride: null,
+          updatedAt: new Date().toISOString(),
+        });
+        res.status(200).json({ ok: true, message: "Master linked and queue updated" });
+      } catch (err) {
+        console.error("[whizunik][masters/confirm-link] failed:", err);
+        sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+      }
+    })();
+  });
+});
+
 export default router;

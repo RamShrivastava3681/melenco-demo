@@ -531,3 +531,22 @@ export async function listSyncCommandsForUser(userId: string): Promise<DbItem[]>
   rows.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   return rows;
 }
+
+// --- Master sync queue ---
+export async function getMasterQueueRow(userId: string, idempotencyKey: string): Promise<DbItem | undefined> {
+  const rows = await dbScan(
+    (it) => it.recordType === "MASTER_SYNC_QUEUE" && it.user_id === userId && it.idempotencyKey === idempotencyKey,
+    2
+  );
+  return rows[0];
+}
+
+export async function setMasterQueueRow(
+  userId: string,
+  idempotencyKey: string,
+  attrs: Record<string, any>
+): Promise<DbItem | undefined> {
+  const row = await getMasterQueueRow(userId, idempotencyKey);
+  if (!row) return undefined;
+  return dbUpdate<DbItem>(row.pk, row.sk, { ...attrs, updated_at: nowIso() });
+}

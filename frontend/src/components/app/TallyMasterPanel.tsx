@@ -71,6 +71,24 @@ export function TallyMasterPanel() {
     onError: (err: Error) => toast.error(err.message || "Failed to queue masters"),
   });
 
+  const retryMut = useMutation({
+    mutationFn: (idempotencyKey: string) => api.retryMaster(idempotencyKey),
+    onSuccess: (d) => {
+      toast.success(d.ok ? "Item requeued for retry" : "Retry failed: " + (d.error || ""));
+      mastersQuery.refetch();
+    },
+    onError: (e: Error) => toast.error(e.message || "Failed to retry"),
+  });
+
+  const confirmLinkMut = useMutation({
+    mutationFn: (idempotencyKey: string) => api.confirmMasterLink(idempotencyKey),
+    onSuccess: (d) => {
+      toast.success(d.ok ? "Master linked successfully" : "Confirm link failed: " + (d.error || ""));
+      mastersQuery.refetch();
+    },
+    onError: (e: Error) => toast.error(e.message || "Failed to confirm link"),
+  });
+
   const toggle = (key: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -203,6 +221,16 @@ export function TallyMasterPanel() {
                           <Button variant="ghost" size="sm" onClick={() => setExpandedId(expandedId === key ? null : key)}>
                             <FileJson className="h-3.5 w-3.5" />
                           </Button>
+                          {m.status === "SENDING" && (
+                            <Button variant="outline" size="sm" onClick={() => retryMut.mutate(key)} className="gap-0.5">
+                              ↻
+                            </Button>
+                          )}
+                          {m.status === "NEEDS_REVIEW" && (
+                            <Button variant="outline" size="sm" onClick={() => confirmLinkMut.mutate(key)} className="gap-0.5">
+                              ✓
+                            </Button>
+                          )}
                         </td>
                       </tr>
                       {expandedId === key && (

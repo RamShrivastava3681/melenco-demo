@@ -293,6 +293,18 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  retryMaster: (idempotencyKey: string) =>
+    request<{ ok: boolean; error?: string }>("/integrations/tally/masters/retry", {
+      method: "POST",
+      body: JSON.stringify({ idempotencyKey }),
+    }),
+
+  confirmMasterLink: (idempotencyKey: string) =>
+    request<{ ok: boolean; error?: string }>("/integrations/tally/masters/confirm-link", {
+      method: "POST",
+      body: JSON.stringify({ idempotencyKey }),
+    }),
+
   getMasterAttempts: (kind: string, id: string) =>
     request<{
       attempts: Array<{
@@ -435,4 +447,116 @@ export const api = {
       deliveredAt: string | null;
       completedAt: string | null;
     }>(`/integrations/tally/commands/status/${id}`),
+
+  // ── Push studio: cloud-authored Tally vouchers + stock/groups ──
+  getPushVouchers: (params?: { type?: string; status?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.type) search.set("type", params.type);
+    if (params?.status) search.set("status", params.status);
+    const qs = search.toString();
+    return request<{
+      vouchers: Array<{
+        id: string;
+        voucherType: string;
+        voucherNumber: string;
+        voucherDate: string;
+        partyName: string;
+        amount: number;
+        narration: string;
+        status: string;
+        commandId: string | null;
+        createdAt: string;
+      }>;
+    }>(`/integrations/tally/push-data/vouchers${qs ? `?${qs}` : ""}`);
+  },
+
+  createPushVoucher: (data: {
+    voucherType: string;
+    voucherNumber: string;
+    voucherDate: string;
+    partyName: string;
+    amount: number;
+    narration?: string;
+  }) =>
+    request<{ voucher: any }>("/integrations/tally/push-data/vouchers", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  deletePushVoucher: (id: string) =>
+    request<{ success: boolean }>(`/integrations/tally/push-data/vouchers/${id}`, {
+      method: "DELETE",
+    }),
+
+  seedPushVouchers: () =>
+    request<{ created: number; skipped: number }>("/integrations/tally/push-data/vouchers/seed", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  pushPushVouchers: (data: { connectorId: string; companyId: string; voucherIds: string[] }) =>
+    request<{
+      id: string;
+      connectorId: string;
+      command: string;
+      status: string;
+      createdAt: string;
+      voucherCount: number;
+      vouchers: Array<any>;
+    }>("/integrations/tally/push-data/vouchers/push", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getPushStock: (params?: { kind?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.kind) search.set("kind", params.kind);
+    const qs = search.toString();
+    return request<{
+      stockItems: Array<{
+        kind: string;
+        id: string;
+        name: string;
+        group: string | null;
+        category: string | null;
+        unit: string | null;
+        description: string | null;
+        createdAt: string;
+      }>;
+      masters: Array<{
+        kind: string;
+        id: string;
+        name: string;
+        parent: string | null;
+        ledgerType: string | null;
+        openingBalance: number;
+        createdAt: string;
+      }>;
+      counts: { customers: number; suppliers: number; stockItems: number; masters: number };
+    }>(`/integrations/tally/push-data/stock${qs ? `?${qs}` : ""}`);
+  },
+
+  createPushStock: (data: {
+    kind: string;
+    name: string;
+    parent?: string;
+    unit?: string;
+    openingBalance?: number;
+    description?: string;
+  }) =>
+    request<{ item: any }>("/integrations/tally/push-data/stock", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  deletePushStock: (kind: string, id: string) =>
+    request<{ success: boolean }>(`/integrations/tally/push-data/stock/${kind}/${id}`, {
+      method: "DELETE",
+    }),
+
+  seedPushStock: () =>
+    request<{ created: number; skipped: number }>("/integrations/tally/push-data/stock/seed", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
 };
