@@ -39,7 +39,9 @@ export function TallyMasterPanel() {
       api.getMasterStatus({
         kind: kind || undefined,
         status: status || undefined,
-        limit: 100,
+        // Server budgets the limit fairly across kinds; ask for the full
+        // page so suppliers/SKUs are selectable alongside customers.
+        limit: 500,
       }),
     refetchInterval: 15_000,
     refetchOnWindowFocus: false,
@@ -89,6 +91,11 @@ export function TallyMasterPanel() {
     onError: (e: Error) => toast.error(e.message || "Failed to confirm link"),
   });
 
+  // One stable selection key everywhere (checkbox state AND queueing).
+  // Using the idempotency key here would silently select nothing, because
+  // NOT_SYNCED rows have no idempotency key yet.
+  const rowKey = (m: { kind: string; id: string }) => `${m.kind}|${m.id}`;
+
   const toggle = (key: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -100,7 +107,7 @@ export function TallyMasterPanel() {
 
   const queueSelected = () => {
     const items = masters
-      .filter((m) => selected.has(`${m.kind}|${m.id}`))
+      .filter((m) => selected.has(rowKey(m)))
       .map((m) => ({ kind: m.kind, id: m.id }));
     if (items.length === 0) {
       toast.error("Select at least one master record");
@@ -199,7 +206,7 @@ export function TallyMasterPanel() {
               </thead>
               <tbody>
                 {masters.map((m) => {
-                  const key = m.idempotencyKey || `${m.kind}|${m.id}`;
+                  const key = rowKey(m);
                   return (
                     <Fragment key={key}>
                       <tr className="border-b last:border-0">

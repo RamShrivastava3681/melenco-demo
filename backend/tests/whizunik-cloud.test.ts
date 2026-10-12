@@ -706,6 +706,28 @@ describe("WhizUnik Cloud API — exact 5-endpoint spec", () => {
       expect(att.body.attempts[0].requestPayload.master.fields.name).toBe("Phase3 Customer One");
     });
 
+    it("budgets masters/status fairly across kinds so suppliers/SKUs stay pushable", async () => {
+      const u = await signupUser(app, "masters-p3-fair@example.com");
+      const cid = await seedPhase3Tenant(u.userId, "t4");
+      // Flood customers past a small page: suppliers/SKUs must still appear.
+      for (let i = 0; i < 10; i++) {
+        await dbPut({
+          pk: userPk(u.userId), sk: customerSk(cid(`flood-${i}`)), recordType: "CUSTOMER",
+          id: cid(`flood-${i}`), user_id: u.userId, created_at: nowIso(), version: 1,
+          name: `Phase3 Flood ${i}`,
+        });
+      }
+      const st = await request(app)
+        .get("/api/integrations/tally/masters/status?limit=6")
+        .set("Authorization", `Bearer ${u.token}`);
+      expect(st.status).toBe(200);
+      expect(st.body.masters.length).toBeLessThanOrEqual(6);
+      const kinds = new Set(st.body.masters.map((m: { kind: string }) => m.kind));
+      expect(kinds.has("customer")).toBe(true);
+      expect(kinds.has("supplier")).toBe(true);
+      expect(kinds.has("sku")).toBe(true);
+    });
+
     it("rejects pushes for unknown connectors, companies and masters", async () => {
       const u = await signupUser(app, "masters-p3-neg@example.com");
       const cid = await seedPhase3Tenant(u.userId, "t3");

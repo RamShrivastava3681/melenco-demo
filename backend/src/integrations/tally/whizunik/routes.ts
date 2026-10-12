@@ -1388,6 +1388,11 @@ router.get("/masters/status", (req: Request, res: Response) => {
         }
         const { kind, status, limit } = q.data;
         const kinds: MasterKind[] = kind ? [kind] : ["customer", "supplier", "sku"];
+        // Fair budgeting across kinds: without it, a tenant with >= limit
+        // customers would never see suppliers/SKUs (customers fill the page
+        // first), making those kinds unpushable from the dashboard.
+        const perKindCap = kind ? limit : Math.max(1, Math.ceil(limit / kinds.length));
+        const perKindCount: Record<string, number> = {};
         const out: Array<Record<string, unknown>> = [];
         for (const k of kinds) {
           let rows: Array<Record<string, unknown>>;
@@ -1402,6 +1407,8 @@ router.get("/masters/status", (req: Request, res: Response) => {
             const link = await getMasterLink(userId, k, String(r.id));
             const st = (link?.status as string) ?? "NOT_SYNCED";
             if (status && st !== status) continue;
+            if ((perKindCount[k] ?? 0) >= perKindCap) continue;
+            perKindCount[k] = (perKindCount[k] ?? 0) + 1;
             out.push({
               kind: k,
               id: r.id,
