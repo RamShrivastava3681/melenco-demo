@@ -533,9 +533,12 @@ export async function listSyncCommandsForUser(userId: string): Promise<DbItem[]>
 }
 
 // --- Master sync queue ---
+// Cloud doesn't have a local queue; it has MSYNCLINK and WCOMMAND.
+// These helpers find the command/link by idempotencyKey (stored in payload/link).
 export async function getMasterQueueRow(userId: string, idempotencyKey: string): Promise<DbItem | undefined> {
+  // Find the WCOMMAND whose payload contains this idempotencyKey
   const rows = await dbScan(
-    (it) => it.recordType === "MASTER_SYNC_QUEUE" && it.user_id === userId && it.idempotencyKey === idempotencyKey,
+    (it) => it.recordType === "WCOMMAND" && it.tenant_id === userId && it.payload && it.payload.includes(idempotencyKey),
     2
   );
   return rows[0];
@@ -546,7 +549,12 @@ export async function setMasterQueueRow(
   idempotencyKey: string,
   attrs: Record<string, any>
 ): Promise<DbItem | undefined> {
-  const row = await getMasterQueueRow(userId, idempotencyKey);
-  if (!row) return undefined;
-  return dbUpdate<DbItem>(row.pk, row.sk, { ...attrs, updated_at: nowIso() });
+  // For cloud, we update the MSYNCLINK status
+  // The idempotencyKey format is "kind:id:version"
+  const kind = idempotencyKey.split(":")[0] || "customer";
+  const whizunikId = idempotencyKey.split(":")[1] || "";
+  const { updateMasterLink } = await import("./storesWhizunik.js");
+  const link = await import("./storesWhizunik.js").then((m) => m.getMasterLink(userId, kind, whizunikId));
+  if (!link) return undefined;
+  return updateMasterLink(userId, kind, whizunikId, { ...attrs, updated_at: nowIso() });
 }

@@ -49,7 +49,7 @@ export function TallyMasterPanel() {
   const attemptsQuery = useQuery({
     queryKey: ["tally-master-attempts", expandedId],
     queryFn: () => {
-      const [k, id] = (expandedId ?? "").split("|");
+      const [k, id] = (expandedId ?? "").split(":");
       return api.getMasterAttempts(k, id);
     },
     enabled: !!expandedId,
@@ -199,7 +199,7 @@ export function TallyMasterPanel() {
               </thead>
               <tbody>
                 {masters.map((m) => {
-                  const key = `${m.kind}|${m.id}`;
+                  const key = m.idempotencyKey || `${m.kind}|${m.id}`;
                   return (
                     <Fragment key={key}>
                       <tr className="border-b last:border-0">
@@ -221,13 +221,13 @@ export function TallyMasterPanel() {
                           <Button variant="ghost" size="sm" onClick={() => setExpandedId(expandedId === key ? null : key)}>
                             <FileJson className="h-3.5 w-3.5" />
                           </Button>
-                          {m.status === "SENDING" && (
-                            <Button variant="outline" size="sm" onClick={() => retryMut.mutate(key)} className="gap-0.5">
+                          {m.status === "SENDING" && m.idempotencyKey && (
+                            <Button variant="outline" size="sm" onClick={() => retryMut.mutate(m.idempotencyKey!)} className="gap-0.5">
                               ↻
                             </Button>
                           )}
-                          {m.status === "NEEDS_REVIEW" && (
-                            <Button variant="outline" size="sm" onClick={() => confirmLinkMut.mutate(key)} className="gap-0.5">
+                          {m.status === "NEEDS_REVIEW" && m.idempotencyKey && (
+                            <Button variant="outline" size="sm" onClick={() => confirmLinkMut.mutate(m.idempotencyKey!)} className="gap-0.5">
                               ✓
                             </Button>
                           )}
