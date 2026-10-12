@@ -39,9 +39,11 @@ export function TallyMasterPanel() {
       api.getMasterStatus({
         kind: kind || undefined,
         status: status || undefined,
-        // Server budgets the limit fairly across kinds; ask for the full
-        // page so suppliers/SKUs are selectable alongside customers.
-        limit: 500,
+        // Server caps limit at 200 (wzMasterStatusQuerySchema) and budgets
+        // it fairly across kinds; ask for the max page so suppliers/SKUs
+        // are selectable alongside customers. NOTE: sending > 200 makes the
+        // API return 400 and the tab renders permanently empty.
+        limit: 200,
       }),
     refetchInterval: 15_000,
     refetchOnWindowFocus: false,
