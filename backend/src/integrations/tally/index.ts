@@ -3,6 +3,7 @@ import connectorRoutes from "./routes/connector.routes.js";
 import statusRoutes from "./routes/status.routes.js";
 import pushDataRoutes from "./routes/pushData.routes.js";
 import irnRoutes from "./routes/irn.routes.js";
+import ewaybillRoutes from "./routes/ewaybill.routes.js";
 import whizunikRoutes from "./whizunik/routes.js";
 import { whizunikOpenApi } from "./whizunik/openapi.js";
 import { newRequestId } from "./utils/logger.js";
@@ -27,6 +28,7 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 router.use(statusRoutes);
 router.use(pushDataRoutes);
 router.use(irnRoutes);
+router.use(ewaybillRoutes);
 
 // WhizUnik Cloud API (exact desktop-connector spec: connect, token,
 // sync/batch, heartbeat, updates + admin pairing codes). Each handler only

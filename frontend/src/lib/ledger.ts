@@ -22,6 +22,13 @@ export type Invoice = {
   acknowledgementDate?: string | null;
   irnStatus?: string | null;
   irnErrorMessage?: string | null;
+  // Phase 6 e-way bill fields (present once dispatch is captured/generated).
+  ewayBillNumber?: string | null;
+  ewayBillStatus?: string | null;
+  ewayBillRequestId?: string | null;
+  ewayBillGeneratedAt?: string | null;
+  dispatchStatus?: string | null;
+  inventoryStatus?: string | null;
 };
 
 export type Payment = {

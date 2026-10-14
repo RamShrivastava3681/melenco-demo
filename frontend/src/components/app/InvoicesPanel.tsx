@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { fmtMoney, fmtDate, dedupeInvoices, sortInvoicesByDue, normInvoiceNumber, type Customer, type Invoice } from "@/lib/ledger";
-import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle, Sparkles, FileCheck } from "lucide-react";
+import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle, Sparkles, FileCheck, Truck, Printer } from "lucide-react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -59,6 +59,9 @@ export function InvoicesPanel() {
   const [filterStatus, setFilterStatus] = useState<"all" | "open" | "closed" | "COMPLETED">("all");
   const [search, setSearch] = useState("");
   const [irnPendingId, setIrnPendingId] = useState<string | null>(null);
+  const [ewbPendingId, setEwbPendingId] = useState<string | null>(null);
+  const [dispatchFor, setDispatchFor] = useState<Invoice | null>(null);
+  const [dispatchForm, setDispatchForm] = useState<Record<string, string>>({});
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -204,19 +207,123 @@ export function InvoicesPanel() {
     },
   });
 
-  function irnBadge(inv: Invoice) {
-    const st = String(inv.irnStatus ?? "IRN_PENDING");
+  function irnBadge(inv: Invoice) {    const st = String(inv.irnStatus ?? "IRN_PENDING");
     if (st === "IRN_GENERATED" && inv.irn) {
       return (
-        <div className="flex flex-col items-start gap-0.5" title={`Ack ${inv.acknowledgementNumber ?? ""} · Tally ${inv.tally_voucher_number ?? ""}`}>
+        <div className="flex flex-col items-start gap-0.5" title={`Tally voucher ${inv.tally_voucher_number ?? ""} · ref ${inv.tally_reference ?? ""}`}>
           <Badge className="bg-success text-success-foreground hover:bg-success font-mono">{inv.irn}</Badge>
           <span className="text-[10px] text-muted-foreground">test IRN · Tally {inv.tally_voucher_number ?? "—"}</span>
+          <span className="text-[10px] tabular-nums text-muted-foreground">Ack {inv.acknowledgementNumber ?? "—"}{inv.acknowledgementDate ? ` · ${inv.acknowledgementDate}` : ""}</span>
         </div>
       );
     }
     if (st === "IRN_FAILED") return <Badge variant="destructive">Failed</Badge>;
     if (st === "IRN_RETRYABLE") return <Badge className="bg-amber-500 text-white hover:bg-amber-500">Retryable</Badge>;
     if (st === "IRN_SUBMITTED" || st === "IRN_REQUEST_READY") return <Badge variant="secondary">Submitted</Badge>;
+    return <span className="text-muted-foreground">—</span>;
+  }
+
+  // ── Phase 6: dispatch + e-way bill (mock adapter — test results only) ──
+  const seedEwb = useMutation({
+    mutationFn: () => api.seedEwbDemo(),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      qc.invalidateQueries({ queryKey: ["customers"] });
+      if (res.created > 0) {
+        toast.success(`EWB demo ready: ${res.created} IRN-verified invoice(s) — click Request EWB`);
+      } else {
+        toast.success("EWB demo invoices already exist — click Request EWB");
+      }
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const DISPATCH_DEFAULTS: Record<string, string> = {
+    dispatchWarehouse: "Main Warehouse",
+    originAddress: "101 MG Road, Bengaluru, Karnataka 560001",
+    originPin: "560001",
+    destinationAddress: "201 Andheri West, Mumbai, Maharashtra 400072",
+    destinationPin: "400072",
+    transporterName: "Delhivery",
+    transporterId: "214243",
+    transportMode: "Road",
+    vehicleNumber: "",
+    transportDocNumber: "LR-1001",
+    transportDocDate: new Date().toISOString().slice(0, 10),
+    distanceKm: "23",
+    packageCount: "10",
+    packageType: "Boxes",
+    expectedDispatchDate: new Date().toISOString().slice(0, 10),
+  };
+
+  function openDispatch(inv: Invoice) {
+    setDispatchForm({ ...DISPATCH_DEFAULTS, packageCount: String((inv as any).quantity ?? "10") });
+    setDispatchFor(inv);
+  }
+
+  const ewbMut = useMutation({
+    mutationFn: async ({ inv, dispatch }: { inv: Invoice; dispatch?: Record<string, unknown> }) => {
+      const st = String(inv.ewayBillStatus ?? "EWB_PENDING");
+      if (st === "EWB_FAILED" || st === "EWB_RETRYABLE" || st === "EWB_SUBMITTED") {
+        return api.retryEwb({ invoiceId: inv.id });
+      }
+      const payload: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(dispatch ?? {})) {
+        if (v === "" || v === null || v === undefined) continue;
+        payload[k] = k === "distanceKm" || k === "packageCount" ? Number(v) : v;
+      }
+      return api.requestEwb({ invoiceId: inv.id, dispatch: payload });
+    },
+    onMutate: ({ inv }) => setEwbPendingId(inv.id),
+    onSettled: () => setEwbPendingId(null),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      setDispatchFor(null);
+      if (res.ewayBillStatus === "EWB_GENERATED") {
+        toast.success(
+          res.duplicate
+            ? `E-way bill already exists: ${res.ewayBillNumber} (no duplicate created)`
+            : `E-way bill generated: ${res.ewayBillNumber} — MOCK test result, not legally valid`
+        );
+      } else {
+        toast.error(`${res.ewayBillStatus} · dispatch ${res.dispatchStatus}: ${res.errorMessage ?? res.errorCode ?? "no e-way bill generated"}`);
+      }
+    },
+    onError: (e: Error) => {
+      const d = (e as ApiError).details;
+      const missing = d?.missingField ? ` Missing field: ${d.missingField}.` : "";
+      const action = d?.action ? ` ${d.action}` : "";
+      toast.error(`${e.message}${missing}${action}`, { duration: 6000 });
+    },
+  });
+
+  const pdfMut = useMutation({
+    mutationFn: (inv: Invoice) => api.downloadEwbPdf(inv.id),
+    onSuccess: ({ blob, filename }) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Invoice + e-way bill PDF downloaded (MOCK — not legally valid)");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  function ewbBadge(inv: Invoice) {
+    const st = String(inv.ewayBillStatus ?? "EWB_PENDING");
+    if (st === "EWB_GENERATED" && inv.ewayBillNumber) {
+      return (
+        <div className="flex flex-col items-start gap-0.5" title={`Dispatch ${inv.dispatchStatus ?? ""} · inventory ${inv.inventoryStatus ?? ""}`}>
+          <Badge className="bg-success text-success-foreground hover:bg-success font-mono">{inv.ewayBillNumber}</Badge>
+          <span className="text-[10px] text-muted-foreground">test EWB · {inv.dispatchStatus === "DISPATCH_RELEASED" ? "dispatched" : inv.dispatchStatus ?? ""}</span>
+        </div>
+      );
+    }
+    if (st === "EWB_FAILED") return <Badge variant="destructive">Failed</Badge>;
+    if (st === "EWB_RETRYABLE") return <Badge className="bg-amber-500 text-white hover:bg-amber-500">Retryable</Badge>;
+    if (st === "EWB_SUBMITTED" || st === "EWB_REQUEST_READY") return <Badge variant="secondary">Submitted</Badge>;
     return <span className="text-muted-foreground">—</span>;
   }
 
@@ -360,6 +467,9 @@ export function InvoicesPanel() {
             <Button variant="secondary" onClick={() => seedIrn.mutate()} disabled={seedIrn.isPending}>
               <Sparkles className="mr-2 h-4 w-4" />{seedIrn.isPending ? "Seeding..." : "Seed IRN demo"}
             </Button>
+            <Button variant="secondary" onClick={() => seedEwb.mutate()} disabled={seedEwb.isPending}>
+              <Truck className="mr-2 h-4 w-4" />{seedEwb.isPending ? "Seeding..." : "Seed EWB demo"}
+            </Button>
             <Button variant="outline" onClick={() => exportMut.mutate()} disabled={exportMut.isPending}>
               <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : `Export ${filterStatus === "all" ? "All" : filterStatus.charAt(0).toUpperCase() + filterStatus.slice(1)}`}
             </Button>
@@ -471,12 +581,15 @@ export function InvoicesPanel() {
                 <TableHead className="text-right">Pay days</TableHead>
                 <TableHead className="text-right">Late days</TableHead>
                 <TableHead>IRN</TableHead>
+                <TableHead>E-Way Bill</TableHead>
                 <TableHead />
               </TableRow>
             </TableHeader>
             <TableBody>
               {visibleInvoices.length === 0 ? (
-                <TableRow><TableCell colSpan={12} className="py-8 text-center text-sm text-muted-foreground">No invoices{search.trim() ? " match this search" : ""}</TableCell></TableRow>
+                <TableRow><TableCell colSpan={13} className="py-8 text-center text-sm text-muted-foreground">
+                  No invoices{search.trim() ? " match this search" : " yet — click “Seed IRN demo” above for Tally-posted test invoices"}
+                </TableCell></TableRow>
               ) : visibleInvoices.map((i) => (
                 <TableRow key={i.id}>
                   <TableCell className="font-medium font-mono">{String(i.invoice_number).trim()}</TableCell>
@@ -496,6 +609,7 @@ export function InvoicesPanel() {
                   <TableCell className="text-right tabular-nums">{i.payment_days ?? "—"}</TableCell>
                   <TableCell className="text-right tabular-nums">{i.late_payment_days ?? "—"}</TableCell>
                   <TableCell>{irnBadge(i)}</TableCell>
+                  <TableCell>{ewbBadge(i)}</TableCell>
                   <TableCell className="text-right whitespace-nowrap">
                     {String(i.irnStatus ?? "IRN_PENDING") === "IRN_GENERATED" ? (
                       <span className="mr-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
@@ -516,6 +630,44 @@ export function InvoicesPanel() {
                             : "Request IRN"}
                       </Button>
                     )}
+                    {String(i.ewayBillStatus ?? "EWB_PENDING") === "EWB_GENERATED" ? (
+                      <>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="mr-1"
+                          disabled={pdfMut.isPending}
+                          title="Download TAX INVOICE + e-Way Bill PDF (MOCK — not legally valid)"
+                          onClick={() => pdfMut.mutate(i)}
+                        >
+                          <Printer className="mr-1 h-4 w-4" />PDF
+                        </Button>
+                        <span className="mr-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
+                          {i.dispatchStatus === "DISPATCH_RELEASED" ? "Dispatched" : i.dispatchStatus ?? ""}
+                        </span>
+                      </>
+                    ) : String(i.irnStatus ?? "") === "IRN_GENERATED" ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mr-1"
+                        disabled={ewbPendingId === i.id || ewbMut.isPending}
+                        onClick={() => {
+                          const st = String(i.ewayBillStatus ?? "EWB_PENDING");
+                          if (st === "EWB_FAILED" || st === "EWB_RETRYABLE" || st === "EWB_SUBMITTED") {
+                            ewbMut.mutate({ inv: i });
+                          } else {
+                            openDispatch(i);
+                          }
+                        }}
+                      >
+                        {ewbPendingId === i.id
+                          ? "Requesting..."
+                          : ["EWB_FAILED", "EWB_RETRYABLE", "EWB_SUBMITTED"].includes(String(i.ewayBillStatus ?? ""))
+                            ? "Retry EWB"
+                            : "Request EWB"}
+                      </Button>
+                    ) : null}
                     <Button variant="ghost" size="icon" onClick={() => {
                       if (confirm(`Delete ${i.invoice_number}?`)) del.mutate(i.id);
                     }}><Trash2 className="h-4 w-4" /></Button>
@@ -529,6 +681,58 @@ export function InvoicesPanel() {
           <p className="text-xs text-muted-foreground">
             Showing {visibleInvoices.length} unique invoice{visibleInvoices.length !== 1 ? "s" : ""} · sorted by due date, then invoice # · duplicates hidden automatically.
           </p>
+        )}
+
+        {/* Phase 6: dispatch details for the e-way bill request */}
+        {dispatchFor && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+            <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-lg border bg-card p-5 shadow-lg">
+              <h4 className="text-sm font-semibold">
+                Dispatch details — {dispatchFor.invoice_number}
+              </h4>
+              <p className="mb-4 mt-1 text-xs text-muted-foreground">
+                Tally voucher {dispatchFor.tally_voucher_number ?? "—"} · IRN {dispatchFor.irn ? `${String(dispatchFor.irn).slice(0, 12)}…` : "—"} ·
+                dispatch is released only after the e-way bill is generated (mock test result, not legally valid).
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                {[
+                  ["dispatchWarehouse", "Dispatch warehouse"],
+                  ["transportMode", "Transport mode (Road/Rail/Air/Ship)"],
+                  ["originAddress", "Origin address"],
+                  ["originPin", "Origin PIN (6 digits)"],
+                  ["destinationAddress", "Destination address"],
+                  ["destinationPin", "Destination PIN (6 digits)"],
+                  ["transporterName", "Transporter name"],
+                  ["transporterId", "Transporter ID"],
+                  ["vehicleNumber", "Vehicle number"],
+                  ["transportDocNumber", "Transport document no."],
+                  ["transportDocDate", "Transport document date"],
+                  ["distanceKm", "Distance (km)"],
+                  ["packageCount", "Package count"],
+                  ["packageType", "Package type"],
+                  ["expectedDispatchDate", "Expected dispatch date"],
+                ].map(([key, label]) => (
+                  <div key={key} className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground">{label}</label>
+                    <input
+                      value={dispatchForm[key] ?? ""}
+                      onChange={(e) => setDispatchForm((f) => ({ ...f, [key]: e.target.value }))}
+                      className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none"
+                    />
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setDispatchFor(null)}>Cancel</Button>
+                <Button
+                  disabled={ewbMut.isPending}
+                  onClick={() => dispatchFor && ewbMut.mutate({ inv: dispatchFor, dispatch: dispatchForm })}
+                >
+                  <Truck className="mr-2 h-4 w-4" />{ewbMut.isPending ? "Submitting..." : "Submit e-way bill request"}
+                </Button>
+              </div>
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

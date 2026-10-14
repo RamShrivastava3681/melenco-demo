@@ -1181,6 +1181,11 @@ router.post("/commands/ack", (req: Request, res: Response) => {
       if (row.command === "REQUEST_IRN") {
         await applyIrnAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
       }
+      // Phase 6: e-way bill results land on the invoice via the connector
+      // ack — dispatch is released only on an acked GENERATED result.
+      if (row.command === "REQUEST_EWAYBILL") {
+        await applyEwbAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
+      }
       res.status(200).json({ id: row.id, status: parsed.data.status });
     } catch (err) {
       console.error("[whizunik][commands/ack] failed:", err);
@@ -1598,6 +1603,173 @@ async function applyIrnAck(
     });
   } catch (err) {
     console.error("[whizunik][irn/ack] invoice update failed:", err);
+  }
+}
+
+interface EwbAckResult {
+  outcome?: "synced" | "linked" | "failed" | "needs_review";
+  adapterStatus?: "SUCCESS" | "REJECTED" | "RETRYABLE_ERROR" | "DUPLICATE";
+  invoiceId?: string;
+  invoiceNumber?: string;
+  ewayBillNumber?: string | null;
+  generatedDate?: string | null;
+  validUntil?: string | null;
+  vehicleNumber?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  retryable?: boolean;
+  requestId?: string;
+  idempotencyKey?: string;
+}
+
+/**
+ * Phase 6 (target flow): apply a connector ack for a REQUEST_EWAYBILL
+ * command. The connector verified the Tally voucher + IRN, rebuilt the
+ * request, submitted via its adapter and reports the outcome here.
+ * Generated e-way bills are stored on the invoice and the dispatch is
+ * released (inventory deducted); failures map to EWB_FAILED (permanent) or
+ * EWB_RETRYABLE (transient) with the dispatch blocked and inventory
+ * untouched. A stored e-way bill is never overwritten by a different one
+ * (duplicate/redelivery guard).
+ */
+async function applyEwbAck(
+  tenantId: string,
+  connectorId: string,
+  cmd: { id: string },
+  ackStatus: string,
+  result: EwbAckResult | undefined,
+): Promise<void> {
+  try {
+    const invoiceId = typeof result?.invoiceId === "string" && result.invoiceId ? result.invoiceId : null;
+    if (!invoiceId) {
+      console.error("[whizunik][ewb/ack] missing invoiceId in connector result");
+      return;
+    }
+    let inv: Record<string, unknown> | undefined;
+    try {
+      inv = (await getInvoice(tenantId, invoiceId)) as Record<string, unknown> | undefined;
+    } catch {
+      return;
+    }
+    if (!inv) return;
+
+    const invoiceNumber = String(inv.invoice_number ?? result?.invoiceNumber ?? "");
+    const tallyVoucherNumber = (inv.tally_voucher_number as string) ?? null;
+    const tallyReference = (inv.tally_reference as string) ?? null;
+    const irn = (inv.irn as string) ?? null;
+    const requestId = typeof result?.requestId === "string" && result.requestId ? result.requestId : cmd.id;
+    const detailBase = {
+      whizunikInvoiceId: invoiceId,
+      whizunikInvoiceNumber: invoiceNumber,
+      tallyVoucherNumber,
+      tallyReference,
+      irn,
+    };
+
+    const generated =
+      ackStatus === "DONE" &&
+      result?.outcome === "synced" &&
+      (result?.adapterStatus === "SUCCESS" || result?.adapterStatus === "DUPLICATE") &&
+      typeof result?.ewayBillNumber === "string" &&
+      result.ewayBillNumber.length > 0;
+
+    audit("EWB_RESPONSE_RECEIVED", {
+      userId: tenantId,
+      requestId,
+      detail: {
+        ...detailBase,
+        ewayBillStatus: generated ? "EWB_GENERATED" : String(inv.ewayBillStatus ?? "EWB_SUBMITTED"),
+        adapterStatus: result?.adapterStatus ?? null,
+        errorCode: result?.errorCode ?? null,
+      },
+    });
+
+    if (generated) {
+      const incoming = String(result!.ewayBillNumber);
+      const existing = typeof inv.ewayBillNumber === "string" && inv.ewayBillNumber ? inv.ewayBillNumber : null;
+      if (existing && existing !== incoming) {
+        audit("EWB_RESULT_STORED", {
+          userId: tenantId,
+          requestId,
+          detail: { ...detailBase, ewayBillStatus: "EWB_GENERATED", ewayBillNumber: existing, note: "ack carried a different e-way bill; kept the stored value" },
+        });
+        return;
+      }
+      const now = new Date().toISOString();
+      const qty = Number(inv.quantity ?? 0);
+      await updateInvoice(tenantId, invoiceId, {
+        ewayBillStatus: "EWB_GENERATED",
+        ewayBillNumber: incoming,
+        ewayBillGeneratedDate: result!.generatedDate ?? null,
+        ewayBillValidUntil: result!.validUntil ?? null,
+        ewayBillVehicleNumber: result!.vehicleNumber ?? null,
+        ewayBillGeneratedAt: now,
+        ewayBillErrorCode: null,
+        ewayBillErrorMessage: null,
+        ewayBillEnvironment: "MOCK",
+        ewayBillLegallyValid: false,
+        dispatchStatus: "DISPATCH_RELEASED",
+        dispatchedAt: now,
+        inventoryStatus: "INVENTORY_DEDUCTED",
+        inventoryDeductedAt: now,
+        inventoryDeductedQty: Number.isFinite(qty) ? qty : null,
+        connector_id: connectorId,
+        push_command_id: cmd.id,
+      });
+      audit("EWB_GENERATED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, ewayBillStatus: "EWB_GENERATED", ewayBillNumber: incoming },
+      });
+      audit("EWB_RESULT_STORED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, ewayBillStatus: "EWB_GENERATED" },
+      });
+      audit("DISPATCH_RELEASED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, ewayBillStatus: "EWB_GENERATED", ewayBillNumber: incoming },
+      });
+      audit("INVENTORY_DEDUCTED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, ewayBillStatus: "EWB_GENERATED" },
+      });
+      return;
+    }
+
+    // Never regress an already-generated invoice with a late failure ack.
+    if (typeof inv.ewayBillNumber === "string" && inv.ewayBillNumber) return;
+
+    const retryable = result?.retryable === true || result?.errorCode === "EWB_SERVICE_UNAVAILABLE";
+    const nextStatus = retryable ? "EWB_RETRYABLE" : "EWB_FAILED";
+    await updateInvoice(tenantId, invoiceId, {
+      ewayBillStatus: nextStatus,
+      ewayBillErrorCode: result?.errorCode ?? null,
+      ewayBillErrorMessage: result?.errorMessage ?? null,
+      dispatchStatus: "DISPATCH_BLOCKED",
+      inventoryStatus: "INVENTORY_NOT_DEDUCTED",
+      connector_id: connectorId,
+      push_command_id: cmd.id,
+    });
+    audit(retryable ? "EWB_RETRYABLE_FAILURE" : "EWB_REJECTED", {
+      userId: tenantId,
+      requestId,
+      detail: {
+        ...detailBase,
+        ewayBillStatus: nextStatus,
+        errorCode: result?.errorCode ?? null,
+        errorMessage: result?.errorMessage ?? null,
+      },
+    });
+    audit("EWB_RESULT_STORED", {
+      userId: tenantId,
+      requestId,
+      detail: { ...detailBase, ewayBillStatus: nextStatus },
+    });
+  } catch (err) {
+    console.error("[whizunik][ewb/ack] invoice update failed:", err);
   }
 }
 

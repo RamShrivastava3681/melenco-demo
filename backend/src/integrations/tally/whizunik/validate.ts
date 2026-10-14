@@ -85,7 +85,7 @@ export const wzAdminPairingSchema = z.object({
 });
 
 // Platform push: POST /api/integrations/tally/commands (JWT)
-export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS", "PUSH_MASTERS", "REQUEST_IRN"] as const;
+export const WZ_COMMANDS = ["REQUEST_SYNC", "PAUSE_SYNC", "RESUME_SYNC", "UPDATE_CONFIG", "PUSH_VOUCHERS", "PUSH_MASTERS", "REQUEST_IRN", "REQUEST_EWAYBILL"] as const;
 
 export const wzPushCommandSchema = z.object({
   connectorId: z.string().trim().min(1).max(120),

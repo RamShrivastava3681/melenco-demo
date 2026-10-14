@@ -634,4 +634,101 @@ export const api = {
       errorMessage: string | null;
       testMode: boolean;
     }>(`/integrations/tally/irn/status/${encodeURIComponent(invoiceId)}`),
+
+  // ── Phase 6: E-way bill generation (mock adapter — test results only) ──
+  seedEwbDemo: () =>
+    request<{
+      created: number;
+      skipped: number;
+      invoices: Array<{
+        id: string;
+        invoice_number: string;
+        tally_voucher_number: string | null;
+        tally_reference: string | null;
+        irn: string | null;
+        irnStatus: string;
+        ewayBillStatus: string;
+      }>;
+    }>("/integrations/tally/ewaybill/seed", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  requestEwb: (data: { invoiceId: string; dispatch?: Record<string, unknown>; mockMode?: string }) =>
+    request<{
+      whizunikInvoiceId: string;
+      whizunikInvoiceNumber: string;
+      tallyVoucherNumber: string | null;
+      tallyReference: string | null;
+      irn: string | null;
+      ewayBillNumber: string | null;
+      ewayBillStatus: string;
+      ewayBillRequestId: string | null;
+      ewayBillGeneratedAt: string | null;
+      dispatchStatus: string;
+      inventoryStatus: string;
+      duplicate: boolean;
+      environment: string;
+      legallyValid: boolean;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    }>("/integrations/tally/ewaybill/request", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  retryEwb: (data: { invoiceId: string; mockMode?: string }) =>
+    request<{
+      whizunikInvoiceId: string;
+      ewayBillNumber: string | null;
+      ewayBillStatus: string;
+      dispatchStatus: string;
+      inventoryStatus: string;
+      duplicate: boolean;
+      environment: string;
+      legallyValid: boolean;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    }>("/integrations/tally/ewaybill/retry", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getEwbStatus: (invoiceId: string) =>
+    request<{
+      whizunikInvoiceId: string;
+      whizunikInvoiceNumber: string;
+      tallyVoucherNumber: string | null;
+      tallyReference: string | null;
+      irn: string | null;
+      ewayBillNumber: string | null;
+      ewayBillStatus: string;
+      dispatchStatus: string;
+      inventoryStatus: string;
+      environment: string;
+      legallyValid: boolean;
+      errorCode: string | null;
+      errorMessage: string | null;
+    }>(`/integrations/tally/ewaybill/status/${encodeURIComponent(invoiceId)}`),
+
+  /** Download the TAX INVOICE + e-Way Bill PDF (available after EWB_GENERATED). */
+  downloadEwbPdf: async (invoiceId: string): Promise<{ blob: Blob; filename: string }> => {
+    const token = getToken();
+    const res = await fetch(
+      `${API_BASE}/integrations/tally/ewaybill/invoice-pdf/${encodeURIComponent(invoiceId)}`,
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }));
+      throw new ApiError(
+        typeof body?.error === "string" ? body.error : res.statusText,
+        res.status,
+        body
+      );
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") ?? "";
+    const m = cd.match(/filename="?([^";]+)"?/);
+    return { blob, filename: m?.[1] ?? `invoice-${invoiceId}-ewaybill.pdf` };
+  },
 };
