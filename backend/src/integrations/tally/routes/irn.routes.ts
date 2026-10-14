@@ -16,6 +16,16 @@ import {
   createInvoice,
 } from "../../../db/storesCore.js";
 import { listAuditForUser } from "../../../db/storesTally.js";
+import {
+  createWCommand,
+  getWConnectorByPublicId,
+  getWCompany,
+} from "../../../db/storesWhizunik.js";
+import {
+  getConnectorByPublicId as getLegacyConnector,
+  getCompany as getLegacyCompany,
+  createSyncCommand,
+} from "../../../db/storesTally.js";
 import { audit, type AuditEvent } from "../services/audit.service.js";
 import {
   IRN_STATUSES,
@@ -71,6 +81,12 @@ const requestSchema = z.object({
   invoiceId: z.string().trim().min(1).max(128),
   compliance: complianceSchema.optional().default({}),
   mockMode: z.enum(["SUCCESS", "REJECTED", "RETRYABLE_ERROR", "DUPLICATE"]).optional(),
+  // Target flow: "queue" writes a REQUEST_IRN command for the connector
+  // (verify voucher → build request → submit → ack back). "direct" runs the
+  // same pipeline inline in the cloud (demo/testing without a connector).
+  mode: z.enum(["direct", "queue"]).optional().default("direct"),
+  connectorId: z.string().trim().min(1).max(120).optional(),
+  companyId: z.string().trim().min(1).max(128).optional(),
 });
 
 const retrySchema = z.object({
@@ -425,6 +441,174 @@ async function findDuplicateIrn(
 }
 
 // ---------------------------------------------------------------------------
+// Target flow: queue a REQUEST_IRN command for the connector
+// ---------------------------------------------------------------------------
+
+interface QueueIrnContext {
+  userId: string;
+  invoiceId: string;
+  invoiceNumber: string;
+  tallyVoucherNumber: string | null;
+  tallyReference: string | null;
+  connectorId?: string;
+  companyId?: string;
+  mockMode?: "SUCCESS" | "REJECTED" | "RETRYABLE_ERROR" | "DUPLICATE";
+  testMode: boolean;
+  data: AssembledData;
+  inv: Record<string, unknown>;
+  irnRequest: IrnRequest;
+  requestId: string;
+}
+
+/**
+ * Queue mode: the cloud never touches the IRP. The verified IRN dataset
+ * travels to the paired connector as a REQUEST_IRN command; the connector
+ * verifies the Tally voucher, rebuilds the request, submits via its own
+ * adapter and acks the result back (applied by applyIrnAck).
+ */
+async function queueIrnCommand(res: Response, ctx: QueueIrnContext): Promise<void> {
+  const { userId, invoiceId, invoiceNumber, tallyVoucherNumber, tallyReference } = ctx;
+  if (!ctx.connectorId || !ctx.companyId) {
+    sendWzError(res, "INVALID_PAYLOAD", "connectorId and companyId are required in queue mode");
+    return;
+  }
+
+  // Resolve connector (new-spec first, legacy tc_* fallback).
+  let target: { kind: "whizunik"; connectorId: string } | { kind: "legacy"; rowId: string; connectorId: string } | null = null;
+  const conn = await getWConnectorByPublicId(ctx.connectorId);
+  if (conn && conn.tenant_id === userId) {
+    target = { kind: "whizunik", connectorId: conn.connector_id as string };
+  } else {
+    try {
+      const legacy = await getLegacyConnector(ctx.connectorId);
+      if (legacy && legacy.user_id === userId) {
+        target = { kind: "legacy", rowId: legacy.id as string, connectorId: legacy.connector_id as string };
+      }
+    } catch { /* legacy table may not exist */ }
+  }
+  if (!target) {
+    sendWzError(res, "INVALID_COMPANY", "Connector not found for this account");
+    return;
+  }
+
+  // Resolve company (new-spec or legacy tally_companies).
+  let companyName = "";
+  let tallyGuid: string | null = null;
+  const wco = await getWCompany(ctx.companyId);
+  if (wco) {
+    companyName = (wco.name as string) ?? "";
+    tallyGuid = (wco.tally_guid as string) ?? null;
+  } else {
+    try {
+      const legacyCo = await getLegacyCompany(userId, ctx.companyId);
+      if (!legacyCo) {
+        sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+        return;
+      }
+      companyName = (legacyCo.tally_company_name as string) ?? "";
+      tallyGuid = (legacyCo.tally_company_guid as string) ?? null;
+    } catch {
+      sendWzError(res, "INVALID_COMPANY", "Company not found for this account");
+      return;
+    }
+  }
+
+  const d = ctx.data;
+  const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+  const payload = {
+    companyId: ctx.companyId,
+    companyName,
+    tallyCompanyGuid: tallyGuid,
+    connectorId: target.connectorId,
+    irn: {
+      invoiceId: ctx.invoiceId,
+      invoiceNumber: String(ctx.inv.invoice_number ?? ""),
+      invoiceDate: String(ctx.inv.issue_date ?? "").slice(0, 10),
+      tallyVoucherNumber: String(ctx.inv.tally_voucher_number ?? ""),
+      tallyReference: String(ctx.inv.tally_reference ?? ""),
+      buyerName: d.buyerName,
+      sellerGstin: d.sellerGstin,
+      buyerGstin: d.buyerGstin,
+      billingAddress: d.billingAddress,
+      shippingAddress: d.shippingAddress,
+      placeOfSupply: d.placeOfSupply,
+      skuCode: d.skuCode,
+      description: d.description,
+      hsn: d.hsn,
+      quantity: d.quantity,
+      unit: d.unit,
+      unitPrice: d.unitPrice,
+      taxableValue: d.taxableValue,
+      gstRate: d.gstRate,
+      cgst: d.cgst,
+      sgst: d.sgst,
+      igst: d.igst,
+      cess: d.cess,
+      grandTotal: d.grandTotal,
+      supplyType: d.supplyType,
+      documentType: d.documentType,
+      idempotencyKey: ctx.irnRequest.idempotencyKey,
+      requestId: ctx.requestId,
+    },
+    // Test hook: forwarded so E2E retry paths work through the connector.
+    ...(ctx.mockMode ? { mockMode: ctx.mockMode } : {}),
+  };
+
+  if (target.kind === "whizunik") {
+    await createWCommand({
+      id,
+      tenant_id: userId,
+      connector_id: target.connectorId,
+      command: "REQUEST_IRN",
+      payload: JSON.stringify(payload),
+    });
+  } else {
+    await createSyncCommand({
+      id,
+      user_id: userId,
+      connector_id: target.rowId,
+      command: "REQUEST_IRN",
+      payload: JSON.stringify(payload),
+    });
+  }
+
+  await updateInvoice(userId, invoiceId, {
+    irnStatus: "IRN_SUBMITTED",
+    irnRequestId: ctx.requestId,
+    irn_idempotency_key: ctx.irnRequest.idempotencyKey,
+    connector_id: target.connectorId,
+    push_command_id: id,
+  });
+  irnAudit("IRN_REQUEST_CREATED", {
+    userId,
+    invoiceId,
+    invoiceNumber,
+    tallyVoucherNumber,
+    tallyReference,
+    requestId: ctx.requestId,
+    irnStatus: "IRN_REQUEST_READY",
+    extra: { idempotencyKey: ctx.irnRequest.idempotencyKey },
+  });
+  irnAudit("IRN_SUBMITTED", {
+    userId,
+    invoiceId,
+    invoiceNumber,
+    tallyVoucherNumber,
+    tallyReference,
+    requestId: ctx.requestId,
+    irnStatus: "IRN_SUBMITTED",
+    extra: { commandId: id, connectorId: target.connectorId },
+  });
+
+  const fresh = ((await getInvoice(userId, invoiceId)) ?? ctx.inv) as Record<string, unknown>;
+  res.status(202).json({
+    ...toLinkedView(fresh, false, ctx.testMode),
+    commandId: id,
+    message: "IRN request queued for the connector. The IRN lands on the invoice when the connector acks the result.",
+  });
+}
+
+// ---------------------------------------------------------------------------
 // POST /irn/request
 // ---------------------------------------------------------------------------
 
@@ -436,7 +620,7 @@ router.post("/irn/request", requireAuth, async (req: Request, res: Response) => 
   }
   try {
     const userId = req.user!.userId;
-    const { invoiceId, compliance, mockMode } = parsed.data;
+    const { invoiceId, compliance, mockMode, mode, connectorId, companyId } = parsed.data;
 
     const inv = (await getInvoice(userId, invoiceId)) as Record<string, unknown> | undefined;
     if (!inv) {
@@ -530,6 +714,29 @@ router.post("/irn/request", requireAuth, async (req: Request, res: Response) => 
     if (dup) {
       const view = toLinkedView(dup.id === invoiceId ? { ...inv, ...dup } : dup, true, adapter.testMode);
       res.status(200).json({ ...view, message: "IRN already exists. Returning the existing IRN — no second request submitted." });
+      return;
+    }
+
+    // Target flow (queue mode): hand the verified request to the connector
+    // as a REQUEST_IRN command. The connector verifies the Tally voucher,
+    // rebuilds the request, submits via its adapter and acks the result —
+    // the IRN lands on the invoice via applyIrnAck, never inline here.
+    if (mode === "queue") {
+      await queueIrnCommand(res, {
+        userId,
+        invoiceId,
+        invoiceNumber,
+        tallyVoucherNumber,
+        tallyReference,
+        connectorId,
+        companyId,
+        mockMode,
+        testMode: adapter.testMode,
+        data,
+        inv,
+        irnRequest,
+        requestId,
+      });
       return;
     }
 

@@ -8,10 +8,11 @@
  *   → submitted via the configured IRNAdapter (MockIRNAdapter today)
  *   → response stored on the invoice, irnStatus transitions
  *
- * TEST-IRN-001 and friends are mock values. They are NEVER legally valid
- * IRNs — the status view and audit trail always carry `testMode: true`
- * while the mock adapter is in use.
+ * TEST values are deterministically generated per invoice (never hardcoded,
+ * never legally valid IRNs) — the status view and audit trail always carry
+ * `testMode: true` while the mock adapter is in use.
  */
+import { createHash } from "node:crypto";
 import { GSTIN_REGEX } from "../whizunik/validate.js";
 
 // ---------------------------------------------------------------------------
@@ -110,6 +111,10 @@ export type MockIrpMode = "SUCCESS" | "REJECTED" | "RETRYABLE_ERROR" | "DUPLICAT
  * Mock IRP for current testing (§5). In AUTO mode it behaves like a strict
  * IRP: structurally invalid GSTINs are REJECTED, everything well-formed
  * succeeds. A forced mode simulates IRP outages / duplicates in tests.
+ *
+ * Nothing is hardcoded: every SUCCESS response is deterministically
+ * generated from the request (same input → same IRN, different invoices →
+ * different IRNs), mirroring how the real IRP derives the IRN.
  */
 export class MockIRNAdapter implements IRNAdapter {
   readonly name = "MockIRNAdapter";
@@ -121,14 +126,7 @@ export class MockIRNAdapter implements IRNAdapter {
     const mode: MockIrpMode = this.forcedMode === "AUTO" ? this.autoMode(request) : this.forcedMode;
     switch (mode) {
       case "SUCCESS":
-        return {
-          status: "SUCCESS",
-          irn: "TEST-IRN-001",
-          ackNumber: "TEST-ACK-001",
-          ackDate: "2026-10-13",
-          signedInvoice: "TEST-SIGNED-DATA",
-          signedQrCode: "TEST-QR-DATA",
-        };
+        return { status: "SUCCESS", ...generateMockIrn(request) };
       case "REJECTED":
         return {
           status: "REJECTED",
@@ -141,12 +139,14 @@ export class MockIRNAdapter implements IRNAdapter {
           errorCode: "IRP_UNAVAILABLE",
           errorMessage: "IRP temporarily unavailable",
         };
-      case "DUPLICATE":
+      case "DUPLICATE": {
+        const generated = generateMockIrn(request);
         return {
           status: "DUPLICATE",
-          irn: "TEST-IRN-001",
-          ackNumber: "TEST-ACK-001",
+          irn: generated.irn,
+          ackNumber: generated.ackNumber,
         };
+      }
     }
   }
 
@@ -157,6 +157,94 @@ export class MockIRNAdapter implements IRNAdapter {
     if (!sellerOk || !buyerOk) return "REJECTED";
     return "SUCCESS";
   }
+}
+
+/**
+ * Deterministic mock-IRP value generation. Mirrors the real IRP derivation:
+ * the IRN is a SHA-256 hash of supplier GSTIN + document number + document
+ * type + financial year (April–March), so re-submitting the same invoice
+ * always yields the same IRN while different invoices yield different IRNs.
+ * The signed payloads are self-describing mocks (`src: "MOCK-IRP"`) —
+ * never legally valid IRNs.
+ */
+export interface GeneratedMockIrn {
+  irn: string;
+  ackNumber: string;
+  ackDate: string;
+  signedInvoice: string;
+  signedQrCode: string;
+}
+
+export function financialYearOf(invoiceDate: string): string {
+  const m = String(invoiceDate || "").slice(0, 10).match(/^(\d{4})-(\d{2})-\d{2}$/);
+  const year = m ? Number(m[1]) : new Date().getUTCFullYear();
+  const month = m ? Number(m[2]) : 1;
+  const start = month >= 4 ? year : year - 1;
+  return `${start}-${String((start + 1) % 100).padStart(2, "0")}`;
+}
+
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+function base64Url(input: string): string {
+  return Buffer.from(input, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+export function generateMockIrn(request: Pick<
+  IrnRequest,
+  "sellerGstin" | "whizunikInvoiceNumber" | "documentType" | "invoiceDate" | "buyerGstin" | "invoiceTotal"
+>): GeneratedMockIrn {
+  const sellerGstin = String(request.sellerGstin || "").trim().toUpperCase();
+  const invoiceNumber = String(request.whizunikInvoiceNumber || "").trim();
+  const documentType = String(request.documentType || "INV").trim().toUpperCase() || "INV";
+  const invoiceDate = String(request.invoiceDate || "").slice(0, 10);
+  const financialYear = financialYearOf(invoiceDate);
+
+  const irn = sha256Hex(`${sellerGstin}|${invoiceNumber}|${documentType}|${financialYear}`).toUpperCase();
+
+  // 15-digit numeric acknowledgement number, deterministically derived.
+  const ackDigits = sha256Hex(`${irn}|ACK`)
+    .split("")
+    .map((ch) => String(Number.parseInt(ch, 16) % 10))
+    .join("")
+    .slice(0, 15);
+  const ackNumber = ackDigits.padStart(15, "0");
+
+  const header = base64Url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payload = base64Url(
+    JSON.stringify({
+      irn,
+      ackNo: ackNumber,
+      ackDt: invoiceDate,
+      sellerGstin,
+      buyerGstin: request.buyerGstin ? String(request.buyerGstin).trim().toUpperCase() : null,
+      docNo: invoiceNumber,
+      docTyp: documentType,
+      docDt: invoiceDate,
+      finYear: financialYear,
+      totInvVal: request.invoiceTotal ?? null,
+      src: "MOCK-IRP",
+    })
+  );
+  const signedInvoice = `${header}.${payload}.${sha256Hex(`${header}.${payload}|MOCK-IRP-SIGNING-KEY`)}`;
+  const signedQrCode = base64Url(
+    JSON.stringify({
+      sellerGstin,
+      buyerGstin: request.buyerGstin ? String(request.buyerGstin).trim().toUpperCase() : null,
+      docNo: invoiceNumber,
+      docDt: invoiceDate,
+      totVal: request.invoiceTotal ?? null,
+      irn,
+      src: "MOCK-IRP",
+    })
+  );
+
+  return { irn, ackNumber, ackDate: invoiceDate, signedInvoice, signedQrCode };
 }
 
 /**

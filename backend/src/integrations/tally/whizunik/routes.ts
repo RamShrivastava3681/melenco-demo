@@ -90,6 +90,7 @@ import {
 } from "../../../db/storesCore.js";
 import { listVouchers } from "../../../db/storesTally.js";
 import { dbUpdate } from "../../../db/dynamo.js";
+import { audit } from "../services/audit.service.js";
 
 const router = Router();
 
@@ -1175,6 +1176,11 @@ router.post("/commands/ack", (req: Request, res: Response) => {
           }
         } catch { /* draft flip must never break the ack */ }
       }
+      // Phase 5: IRN results land on the invoice via the connector ack —
+      // the cloud never generates inline in queue mode.
+      if (row.command === "REQUEST_IRN") {
+        await applyIrnAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
+      }
       res.status(200).json({ id: row.id, status: parsed.data.status });
     } catch (err) {
       console.error("[whizunik][commands/ack] failed:", err);
@@ -1447,6 +1453,151 @@ async function applyVoucherAck(
     }
   } catch (err) {
     console.error("[whizunik][vouchers/ack] invoice update failed:", err);
+  }
+}
+
+interface IrnAckResult {
+  outcome?: "synced" | "linked" | "failed" | "needs_review";
+  adapterStatus?: "SUCCESS" | "REJECTED" | "RETRYABLE_ERROR" | "DUPLICATE";
+  invoiceId?: string;
+  invoiceNumber?: string;
+  irn?: string | null;
+  ackNumber?: string | null;
+  ackDate?: string | null;
+  signedInvoice?: string | null;
+  signedQrCode?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  retryable?: boolean;
+  requestId?: string;
+  idempotencyKey?: string;
+}
+
+/**
+ * Phase 5 (target flow): apply a connector ack for a REQUEST_IRN command.
+ * The connector verified the Tally voucher, rebuilt the request, submitted
+ * via its adapter and reports the outcome here. Generated IRNs are stored on
+ * the invoice; failures map to IRN_FAILED (permanent) or IRN_RETRYABLE
+ * (transient) and never generate. A stored IRN is never overwritten by a
+ * different one (duplicate/redelivery guard).
+ */
+async function applyIrnAck(
+  tenantId: string,
+  connectorId: string,
+  cmd: { id: string },
+  ackStatus: string,
+  result: IrnAckResult | undefined,
+): Promise<void> {
+  try {
+    const invoiceId = typeof result?.invoiceId === "string" && result.invoiceId ? result.invoiceId : null;
+    if (!invoiceId) {
+      console.error("[whizunik][irn/ack] missing invoiceId in connector result");
+      return;
+    }
+    let inv: Record<string, unknown> | undefined;
+    try {
+      inv = (await getInvoice(tenantId, invoiceId)) as Record<string, unknown> | undefined;
+    } catch {
+      return;
+    }
+    if (!inv) return;
+
+    const invoiceNumber = String(inv.invoice_number ?? result?.invoiceNumber ?? "");
+    const tallyVoucherNumber = (inv.tally_voucher_number as string) ?? null;
+    const tallyReference = (inv.tally_reference as string) ?? null;
+    const requestId = typeof result?.requestId === "string" && result.requestId ? result.requestId : cmd.id;
+    const detailBase = {
+      whizunikInvoiceId: invoiceId,
+      whizunikInvoiceNumber: invoiceNumber,
+      tallyVoucherNumber,
+      tallyReference,
+    };
+
+    const generated =
+      ackStatus === "DONE" &&
+      result?.outcome === "synced" &&
+      (result?.adapterStatus === "SUCCESS" || result?.adapterStatus === "DUPLICATE") &&
+      typeof result?.irn === "string" &&
+      result.irn.length > 0;
+
+    audit("IRN_RESPONSE_RECEIVED", {
+      userId: tenantId,
+      requestId,
+      detail: {
+        ...detailBase,
+        irnStatus: generated ? "IRN_GENERATED" : String(inv.irnStatus ?? "IRN_SUBMITTED"),
+        adapterStatus: result?.adapterStatus ?? null,
+        errorCode: result?.errorCode ?? null,
+      },
+    });
+
+    if (generated) {
+      const incoming = String(result!.irn);
+      const existing = typeof inv.irn === "string" && inv.irn ? inv.irn : null;
+      if (existing && existing !== incoming) {
+        audit("IRN_RESULT_STORED", {
+          userId: tenantId,
+          requestId,
+          detail: { ...detailBase, irnStatus: "IRN_GENERATED", irn: existing, note: "ack carried a different IRN; kept the stored value" },
+        });
+        return;
+      }
+      const now = new Date().toISOString();
+      await updateInvoice(tenantId, invoiceId, {
+        irnStatus: "IRN_GENERATED",
+        irn: incoming,
+        acknowledgementNumber: result!.ackNumber ?? null,
+        acknowledgementDate: result!.ackDate ?? null,
+        signedInvoice: result!.signedInvoice ?? null,
+        signedQrCode: result!.signedQrCode ?? null,
+        irnGeneratedAt: now,
+        irnErrorCode: null,
+        irnErrorMessage: null,
+        connector_id: connectorId,
+        push_command_id: cmd.id,
+      });
+      audit("IRN_GENERATED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, irnStatus: "IRN_GENERATED", irn: incoming, ackNumber: result!.ackNumber ?? null },
+      });
+      audit("IRN_RESULT_STORED", {
+        userId: tenantId,
+        requestId,
+        detail: { ...detailBase, irnStatus: "IRN_GENERATED" },
+      });
+      return;
+    }
+
+    // Never regress an already-generated invoice with a late failure ack.
+    if (typeof inv.irn === "string" && inv.irn) return;
+
+    const retryable = result?.retryable === true || result?.errorCode === "IRP_UNAVAILABLE";
+    const nextStatus = retryable ? "IRN_RETRYABLE" : "IRN_FAILED";
+    await updateInvoice(tenantId, invoiceId, {
+      irnStatus: nextStatus,
+      irnErrorCode: result?.errorCode ?? null,
+      irnErrorMessage: result?.errorMessage ?? null,
+      connector_id: connectorId,
+      push_command_id: cmd.id,
+    });
+    audit(retryable ? "IRN_RETRYABLE_FAILURE" : "IRN_REJECTED", {
+      userId: tenantId,
+      requestId,
+      detail: {
+        ...detailBase,
+        irnStatus: nextStatus,
+        errorCode: result?.errorCode ?? null,
+        errorMessage: result?.errorMessage ?? null,
+      },
+    });
+    audit("IRN_RESULT_STORED", {
+      userId: tenantId,
+      requestId,
+      detail: { ...detailBase, irnStatus: nextStatus },
+    });
+  } catch (err) {
+    console.error("[whizunik][irn/ack] invoice update failed:", err);
   }
 }
 

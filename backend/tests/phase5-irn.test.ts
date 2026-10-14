@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import request from "supertest";
+import { createHash } from "node:crypto";
 import { createApp } from "../src/app.js";
 import { initTestDb } from "./setup.js";
 import { signupUser, freshRateLimits, type UserCtx } from "./helpers.js";
@@ -125,7 +126,7 @@ async function postedInvoice(
       },
     });
   expect(ack.status).toBe(200);
-  return { invoiceId, connectorId, companyId };
+  return { invoiceId, connectorId, companyId, accessToken };
 }
 
 describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
@@ -137,15 +138,18 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
       .set("Authorization", `Bearer ${user.token}`)
       .send({ invoiceId, compliance: COMPLIANCE });
     expect(res.status).toBe(201);
-    expect(res.body.irn).toBe("TEST-IRN-001");
-    expect(res.body.acknowledgementNumber).toBe("TEST-ACK-001");
+    // Generated, not hardcoded: 64-char hash IRN + 15-digit ack number.
+    expect(res.body.irn).toMatch(/^[0-9A-F]{64}$/);
+    expect(res.body.acknowledgementNumber).toMatch(/^[0-9]{15}$/);
     expect(res.body.irnStatus).toBe("IRN_GENERATED");
     expect(res.body.whizunikInvoiceNumber).toBe("INV-TEST-002");
     expect(res.body.tallyVoucherNumber).toBe("27");
     expect(res.body.tallyReference).toBe("INV-TEST-002");
     expect(res.body.duplicate).toBe(false);
     expect(res.body.testMode).toBe(true);
-    expect(res.body.signedQrCode).toBe("TEST-QR-DATA");
+    expect(typeof res.body.signedInvoice).toBe("string");
+    expect(res.body.signedInvoice.split(".")).toHaveLength(3);
+    expect(typeof res.body.signedQrCode).toBe("string");
 
     // Tally + WhizUnik references linked and visible.
     const status = await request(app)
@@ -155,8 +159,28 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
     expect(status.body.whizunikInvoiceNumber).toBe("INV-TEST-002");
     expect(status.body.tallyVoucherNumber).toBe("27");
     expect(status.body.tallyReference).toBe("INV-TEST-002");
-    expect(status.body.irn).toBe("TEST-IRN-001");
+    expect(status.body.irn).toBe(res.body.irn);
     expect(status.body.irnStatus).toBe("IRN_GENERATED");
+  });
+
+  it("different invoices get different generated IRNs (nothing shared/hardcoded)", async () => {
+    const a = await postedInvoice("INV-GEN-A", "Phase5 Gen Co A", "Phase5 Gen Customer A");
+    const b = await postedInvoice("INV-GEN-B", "Phase5 Gen Co B", "Phase5 Gen Customer B");
+    const auth = { Authorization: `Bearer ${user.token}` };
+    const ra = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set(auth)
+      .send({ invoiceId: a.invoiceId, compliance: COMPLIANCE });
+    const rb = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set(auth)
+      .send({ invoiceId: b.invoiceId, compliance: COMPLIANCE });
+    expect(ra.status).toBe(201);
+    expect(rb.status).toBe(201);
+    expect(ra.body.irn).toMatch(/^[0-9A-F]{64}$/);
+    expect(rb.body.irn).toMatch(/^[0-9A-F]{64}$/);
+    expect(ra.body.irn).not.toBe(rb.body.irn);
+    expect(ra.body.acknowledgementNumber).not.toBe(rb.body.acknowledgementNumber);
   });
 
   it("duplicate protection: second request returns the existing IRN", async () => {
@@ -174,7 +198,7 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
       .send({ invoiceId, compliance: COMPLIANCE });
     expect(second.status).toBe(200);
     expect(second.body.duplicate).toBe(true);
-    expect(second.body.irn).toBe("TEST-IRN-001");
+    expect(second.body.irn).toBe(first.body.irn);
     expect(second.body.irnRequestId).toBe(firstRequestId);
 
     // Retry is also blocked once generated.
@@ -231,7 +255,7 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
       .send({ invoiceId, mockMode: "SUCCESS" });
     expect(retry.status).toBe(200);
     expect(retry.body.irnStatus).toBe("IRN_GENERATED");
-    expect(retry.body.irn).toBe("TEST-IRN-001");
+    expect(retry.body.irn).toMatch(/^[0-9A-F]{64}$/);
   });
 
   it("retryable IRP outage stays retryable and never generates", async () => {
@@ -354,7 +378,7 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
       .set("Authorization", `Bearer ${user.token}`)
       .send({ invoiceId: firstId });
     expect(res.status).toBe(201);
-    expect(res.body.irn).toBe("TEST-IRN-001");
+    expect(res.body.irn).toMatch(/^[0-9A-F]{64}$/);
     expect(res.body.irnStatus).toBe("IRN_GENERATED");
 
     // Reseeding never duplicates.
@@ -364,5 +388,140 @@ describe("Phase 5: IRN generation through Tally (mock IRP)", () => {
       .send({});
     expect(again.body.created).toBe(0);
     expect(again.body.skipped).toBe(2);
+  });
+
+  it("target flow: queue REQUEST_IRN → connector poll → ack → IRN_GENERATED", async () => {
+    const { invoiceId, connectorId, companyId, accessToken } = await postedInvoice(
+      "INV-Q-001", "Phase5 Queue Co", "Phase5 Queue Customer"
+    );
+
+    const queued = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId, compliance: COMPLIANCE, mode: "queue", connectorId, companyId });
+    expect(queued.status).toBe(202);
+    expect(queued.body.irnStatus).toBe("IRN_SUBMITTED");
+    expect(queued.body.irn).toBeNull();
+    const commandId = queued.body.commandId as string;
+    expect(commandId).toBeTruthy();
+
+    // Connector polls and receives the REQUEST_IRN command.
+    const pending = await request(app)
+      .get("/api/integrations/tally/commands/pending")
+      .set("Authorization", `Bearer ${accessToken}`);
+    expect(pending.status).toBe(200);
+    const found = (pending.body.commands as any[]).find((c) => c.id === commandId);
+    expect(found).toBeTruthy();
+    expect(found.command).toBe("REQUEST_IRN");
+    expect(found.payload.irn.invoiceNumber).toBe("INV-Q-001");
+    expect(found.payload.irn.tallyReference).toBe("INV-Q-001");
+    expect(String(found.payload.irn.idempotencyKey)).toMatch(/^irn:/);
+
+    // Connector submits via its adapter and acks the generated result.
+    // (Simulates the connector's MockIRNAdapter output: 64-char hash IRN.)
+    const generatedIrn = createHash("sha256")
+      .update("27AAPCS1234F1Z5|INV-Q-001|INV|2026-27")
+      .digest("hex")
+      .toUpperCase();
+    const ack = await request(app)
+      .post("/api/integrations/tally/commands/ack")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        commandId,
+        status: "DONE",
+        result: {
+          outcome: "synced",
+          adapterStatus: "SUCCESS",
+          invoiceId,
+          invoiceNumber: "INV-Q-001",
+          irn: generatedIrn,
+          ackNumber: "123456789012345",
+          ackDate: "2026-10-13",
+          signedInvoice: "mock-signed-invoice",
+          signedQrCode: "mock-signed-qr",
+          requestId: found.payload.irn.requestId,
+          idempotencyKey: found.payload.irn.idempotencyKey,
+        },
+      });
+    expect(ack.status).toBe(200);
+
+    const st = await request(app)
+      .get(`/api/integrations/tally/irn/status/${invoiceId}`)
+      .set("Authorization", `Bearer ${user.token}`);
+    expect(st.body.irnStatus).toBe("IRN_GENERATED");
+    expect(st.body.irn).toBe(generatedIrn);
+    expect(st.body.tallyVoucherNumber).toBe("INV-Q-001");
+  });
+
+  it("target flow: connector failure ack blocks, retryable stays retryable", async () => {
+    const q1 = await postedInvoice("INV-QF-001", "Phase5 QFail Co", "Phase5 QFail Customer");
+    const queued = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: q1.invoiceId, compliance: COMPLIANCE, mode: "queue", connectorId: q1.connectorId, companyId: q1.companyId });
+    expect(queued.status).toBe(202);
+
+    const ackFail = await request(app)
+      .post("/api/integrations/tally/commands/ack")
+      .set("Authorization", `Bearer ${q1.accessToken}`)
+      .send({
+        commandId: queued.body.commandId,
+        status: "CANCELLED",
+        result: {
+          outcome: "failed",
+          adapterStatus: "REJECTED",
+          invoiceId: q1.invoiceId,
+          errorCode: "INVALID_GSTIN",
+          errorMessage: "Buyer GSTIN is invalid",
+        },
+      });
+    expect(ackFail.status).toBe(200);
+    const failed = await request(app)
+      .get(`/api/integrations/tally/irn/status/${q1.invoiceId}`)
+      .set("Authorization", `Bearer ${user.token}`);
+    expect(failed.body.irnStatus).toBe("IRN_FAILED");
+    expect(failed.body.irn).toBeNull();
+
+    // A late failure ack never regresses an already-generated invoice.
+    const q2 = await postedInvoice("INV-QR-001", "Phase5 QRetry Co", "Phase5 QRetry Customer");
+    const queued2 = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: q2.invoiceId, compliance: COMPLIANCE, mode: "queue", connectorId: q2.connectorId, companyId: q2.companyId });
+    await request(app)
+      .post("/api/integrations/tally/commands/ack")
+      .set("Authorization", `Bearer ${q2.accessToken}`)
+      .send({
+        commandId: queued2.body.commandId,
+        status: "DONE",
+        result: {
+          outcome: "failed",
+          adapterStatus: "RETRYABLE_ERROR",
+          invoiceId: q2.invoiceId,
+          errorCode: "IRP_UNAVAILABLE",
+          errorMessage: "IRP temporarily unavailable",
+          retryable: true,
+        },
+      });
+    const retryable = await request(app)
+      .get(`/api/integrations/tally/irn/status/${q2.invoiceId}`)
+      .set("Authorization", `Bearer ${user.token}`);
+    expect(retryable.body.irnStatus).toBe("IRN_RETRYABLE");
+    expect(retryable.body.irn).toBeNull();
+  });
+
+  it("queue mode requires a connector and company", async () => {
+    const { invoiceId } = await postedInvoice("INV-QV-001", "Phase5 QVal Co", "Phase5 QVal Customer");
+    const res = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId, compliance: COMPLIANCE, mode: "queue" });
+    expect(res.status).toBe(400);
+
+    const bad = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId, compliance: COMPLIANCE, mode: "queue", connectorId: "nope", companyId: "nope" });
+    expect(bad.status).toBe(404);
   });
 });
