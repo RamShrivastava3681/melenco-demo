@@ -649,9 +649,44 @@ export const api = {
         irnStatus: string;
         ewayBillStatus: string;
       }>;
+      nextSteps: string[];
     }>("/integrations/tally/ewaybill/seed", {
       method: "POST",
       body: JSON.stringify({}),
+    }),
+
+  /** Brand-new customers + OPEN invoices for the full push → IRN → EWB flow. */
+  seedEwbFreshFlow: () =>
+    request<{
+      created: number;
+      skipped: number;
+      invoices: Array<{
+        id: string;
+        invoice_number: string;
+        status: string;
+        amount: number;
+        irnStatus: string;
+        ewayBillStatus: string;
+      }>;
+      nextSteps: string[];
+    }>("/integrations/tally/ewaybill/seed-fresh", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  /** Simulate a Tally posting ack (no live connector needed for testing). */
+  simulateEwbPost: (data: { invoiceId: string; tallyVoucherNumber?: string }) =>
+    request<{
+      invoiceId: string;
+      invoiceNumber: string;
+      tallyVoucherNumber: string | null;
+      tallyReference: string | null;
+      status: string;
+      simulated: boolean;
+      note: string;
+    }>("/integrations/tally/ewaybill/simulate-post", {
+      method: "POST",
+      body: JSON.stringify(data),
     }),
 
   requestEwb: (data: { invoiceId: string; dispatch?: Record<string, unknown>; mockMode?: string }) =>

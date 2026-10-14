@@ -230,10 +230,33 @@ export function InvoicesPanel() {
       qc.invalidateQueries({ queryKey: ["invoices"] });
       qc.invalidateQueries({ queryKey: ["customers"] });
       if (res.created > 0) {
-        toast.success(`EWB demo ready: ${res.created} IRN-verified invoice(s) — click Request EWB`);
+        toast.success(`EWB demo ready: ${res.created} Tally-posted invoice(s) — Request IRN first, then Request EWB`);
       } else {
-        toast.success("EWB demo invoices already exist — click Request EWB");
+        toast.success("EWB demo invoices already exist — Request IRN first, then Request EWB");
       }
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const seedFresh = useMutation({
+    mutationFn: () => api.seedEwbFreshFlow(),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      qc.invalidateQueries({ queryKey: ["customers"] });
+      if (res.created > 0) {
+        toast.success(`Flow ready: ${res.created} new OPEN invoice(s) — post to Tally, then IRN, then EWB`);
+      } else {
+        toast.success("Flow invoices already exist — post to Tally, then IRN, then EWB");
+      }
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const simPost = useMutation({
+    mutationFn: (inv: Invoice) => api.simulateEwbPost({ invoiceId: inv.id }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      toast.success(`Posted to Tally (simulated): voucher ${res.tallyVoucherNumber} — now Request IRN`);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -470,6 +493,9 @@ export function InvoicesPanel() {
             <Button variant="secondary" onClick={() => seedEwb.mutate()} disabled={seedEwb.isPending}>
               <Truck className="mr-2 h-4 w-4" />{seedEwb.isPending ? "Seeding..." : "Seed EWB demo"}
             </Button>
+            <Button variant="secondary" onClick={() => seedFresh.mutate()} disabled={seedFresh.isPending} title="New customers + OPEN invoices: push → IRN → EWB">
+              <Sparkles className="mr-2 h-4 w-4" />{seedFresh.isPending ? "Seeding..." : "Seed flow demo"}
+            </Button>
             <Button variant="outline" onClick={() => exportMut.mutate()} disabled={exportMut.isPending}>
               <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : `Export ${filterStatus === "all" ? "All" : filterStatus.charAt(0).toUpperCase() + filterStatus.slice(1)}`}
             </Button>
@@ -611,6 +637,18 @@ export function InvoicesPanel() {
                   <TableCell>{irnBadge(i)}</TableCell>
                   <TableCell>{ewbBadge(i)}</TableCell>
                   <TableCell className="text-right whitespace-nowrap">
+                    {String(i.status ?? "") !== "COMPLETED" && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mr-1"
+                        disabled={simPost.isPending}
+                        title="Simulate the connector ack (marks Tally-posted) — use a live push instead when Tally is connected"
+                        onClick={() => simPost.mutate(i)}
+                      >
+                        Simulate post
+                      </Button>
+                    )}
                     {String(i.irnStatus ?? "IRN_PENDING") === "IRN_GENERATED" ? (
                       <span className="mr-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
                         <FileCheck className="h-4 w-4" />Done

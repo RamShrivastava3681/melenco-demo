@@ -10,12 +10,13 @@
  *   → response stored on the invoice, ewayBillStatus transitions
  *   → dispatch released ONLY on EWB_GENERATED → inventory deducted
  *
- * TEST values are deterministically generated per invoice (never hardcoded
- * except the INV-DEMO-001 acceptance value TEST-EWB-001, never legally
- * valid) — the status view, PDF and audit trail always carry
- * `environment: "MOCK"` + `legallyValid: false` while the mock adapter is in use.
+ * TEST values are freshly generated per request (random 12-digit e-way bill
+ * numbers like the real portal issues, generation date = today, validity
+ * derived from distance — never hardcoded, never legally valid) — the status
+ * view, PDF and audit trail always carry `environment: "MOCK"` +
+ * `legallyValid: false` while the mock adapter is in use.
  */
-import { createHash } from "node:crypto";
+import { randomInt } from "node:crypto";
 import { GSTIN_REGEX } from "../whizunik/validate.js";
 
 // ---------------------------------------------------------------------------
@@ -208,10 +209,6 @@ export interface GeneratedMockEwb {
   vehicleNumber: string;
 }
 
-function sha256Hex(input: string): string {
-  return createHash("sha256").update(input, "utf8").digest("hex");
-}
-
 function addDays(dateIso: string, days: number): string {
   const m = String(dateIso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
   const base = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : new Date();
@@ -219,29 +216,35 @@ function addDays(dateIso: string, days: number): string {
   return base.toISOString().slice(0, 10);
 }
 
+/** Portal rule of thumb: 1 day of validity per 200 km (minimum 1 day). */
+export function validityDaysForDistance(distanceKm: number | null | undefined): number {
+  const km = Number(distanceKm);
+  if (!Number.isFinite(km) || km <= 0) return 1;
+  return Math.max(1, Math.ceil(km / 200));
+}
+
+/** Random 12-digit e-way bill number, as the real portal issues. */
+export function randomEwayBillNumber(): string {
+  return String(randomInt(100000000000, 1000000000000));
+}
+
 /**
- * Deterministic mock e-way bill values: same invoice → same number,
- * different invoices → different numbers. The Phase 6 acceptance invoice
- * INV-DEMO-001 always yields TEST-EWB-001.
+ * Fresh mock e-way bill values per request — nothing is hardcoded and
+ * nothing is reused: every SUCCESS call mints a new random 12-digit number
+ * with generation date = today and distance-based validity. Retries and
+ * duplicate deliveries stay safe because the route persists the FIRST
+ * generated number on the invoice (idempotency key
+ * `ewb:{sellerGstin}:{invoiceNumber}:{invoiceDate}`) and returns the stored
+ * value instead of minting a second one.
  */
 export function generateMockEwb(
-  request: Pick<EwbRequest, "sellerGstin" | "whizunikInvoiceNumber" | "invoiceDate" | "vehicleNumber">
+  request: Pick<EwbRequest, "vehicleNumber" | "distanceKm">
 ): GeneratedMockEwb {
-  const invoiceNumber = String(request.whizunikInvoiceNumber || "").trim();
-  const invoiceDate = String(request.invoiceDate || "").slice(0, 10);
-  const ewayBillNumber =
-    invoiceNumber === "INV-DEMO-001"
-      ? "TEST-EWB-001"
-      : `TEST-EWB-${sha256Hex(
-          `${String(request.sellerGstin || "").trim().toUpperCase()}|${invoiceNumber}|${invoiceDate}`
-        )
-          .replace(/\D/g, "")
-          .padEnd(3, "0")
-          .slice(0, 3)}`;
+  const generatedDate = new Date().toISOString().slice(0, 10);
   return {
-    ewayBillNumber,
-    generatedDate: invoiceDate,
-    validUntil: addDays(invoiceDate, 2),
+    ewayBillNumber: randomEwayBillNumber(),
+    generatedDate,
+    validUntil: addDays(generatedDate, validityDaysForDistance(request.distanceKm)),
     vehicleNumber: String(request.vehicleNumber || "").trim() || "TEST-1234",
   };
 }

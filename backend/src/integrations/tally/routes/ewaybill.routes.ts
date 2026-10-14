@@ -52,12 +52,16 @@ const router = Router();
  *   POST /ewaybill/retry          — resubmit a FAILED / RETRYABLE / SUBMITTED EWB
  *   GET  /ewaybill/status/:id     — linked WhizUnik ↔ Tally ↔ IRN ↔ EWB view
  *   GET  /ewaybill/audit          — EWB audit history (?invoiceId=, ?limit=)
- *   POST /ewaybill/seed           — one-click IRN-verified demo invoices
+ *   POST /ewaybill/seed           — Tally-posted demo invoices (IRN + EWB still to generate)
+ *   POST /ewaybill/seed-fresh     — brand-new customers + OPEN invoices for the full
+ *                                   push → IRN → EWB single-transaction flow
+ *   POST /ewaybill/simulate-post  — mark an OPEN invoice Tally-posted (simulates the
+ *                                   connector ack when no live Tally/connector is running)
  *   GET  /ewaybill/invoice-pdf/:id — TAX INVOICE + e-Way Bill PDF (MOCK-labelled)
  *
- * TEST-EWB-001 responses are mock results, never legally valid e-way bills.
- * Every response carries `environment: "MOCK"` + `legallyValid: false` while
- * the mock adapter is active.
+ * Mock responses mint a fresh random 12-digit e-way bill number per request —
+ * nothing is hardcoded. Every response carries `environment: "MOCK"` +
+ * `legallyValid: false` while the mock adapter is active.
  */
 
 const dispatchSchema = z.object({
@@ -1363,38 +1367,69 @@ router.get("/ewaybill/invoice-pdf/:invoiceId", requireAuth, async (req: Request,
 });
 
 // ---------------------------------------------------------------------------
-// POST /ewaybill/seed — one-click IRN-verified + dispatch-ready demo invoices
+// Demo data helpers — buyer master data lives in WhizUnik (customers table),
+// NOT in Tally. Tally is only ever asked "does this voucher exist?" (DayBook
+// lookup by voucher number/date/party/amount). Names, GSTINs and addresses
+// below are WhizUnik customer masters + invoice snapshots.
+// ---------------------------------------------------------------------------
+
+async function ensureDemoCustomers(userId: string, names: string[]): Promise<Record<string, string>> {
+  const ids: Record<string, string> = {};
+  for (const name of names) {
+    const existing = await findCustomerByName(userId, name).catch(() => undefined);
+    if (existing) {
+      ids[name] = String(existing.id);
+    } else {
+      try {
+        const created = await createCustomer(userId, name);
+        ids[name] = String(created.id);
+      } catch {
+        const retry = await findCustomerByName(userId, name).catch(() => undefined);
+        if (!retry) throw new Error(`Could not create demo customer "${name}"`);
+        ids[name] = String(retry.id);
+      }
+    }
+  }
+  return ids;
+}
+
+const DEMO_SELLER = {
+  tally_company_name: "Demo Company",
+  seller_gstin: "27AAPCS1234F1Z5",
+  billing_address: "101 MG Road, Bengaluru, Karnataka 560001",
+  origin_address: "101 MG Road, Bengaluru, Karnataka 560001",
+  origin_pin: "560001",
+};
+
+const DEMO_DISPATCH = {
+  dispatch_warehouse: "Main Warehouse",
+  transporter_name: "Delhivery",
+  transporter_id: "214243",
+  transport_mode: "Road",
+  vehicle_number: "KA01AB1234",
+  transport_doc_number: "LR-1001",
+  distance_km: 23,
+  package_type: "Boxes",
+};
+
+// ---------------------------------------------------------------------------
+// POST /ewaybill/seed — Tally-posted demo invoices (IRN + EWB still generated)
 // ---------------------------------------------------------------------------
 
 /**
  * Demo seed: two customers + two sales invoices that look exactly like
- * Phase 5-completed vouchers (status COMPLETED, Tally voucher number +
- * reference captured, IRN_GENERATED) with the dispatch snapshot already
- * filled in — so "Request e-way bill" succeeds in one click. Idempotent:
- * existing invoice numbers are updated (never duplicated) so a re-seed
- * repairs the demo state.
+ * Phase 4-posted vouchers (status COMPLETED, Tally voucher number +
+ * reference captured) with the IRN compliance + dispatch snapshots already
+ * filled in — but with NO hardcoded IRN and NO e-way bill. The full flow is
+ * exercised for real: POST /irn/request generates the IRN, then POST
+ * /ewaybill/request mints a fresh random e-way bill number. Idempotent:
+ * existing invoice numbers are repaired gap-by-gap (never duplicated, never
+ * clobbering an already-generated IRN/EWB).
  */
 router.post("/ewaybill/seed", requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.userId;
-
-    const customerNames = ["Sharma Traders", "Gupta Enterprises"];
-    const customerIds: Record<string, string> = {};
-    for (const name of customerNames) {
-      const existing = await findCustomerByName(userId, name).catch(() => undefined);
-      if (existing) {
-        customerIds[name] = String(existing.id);
-      } else {
-        try {
-          const created = await createCustomer(userId, name);
-          customerIds[name] = String(created.id);
-        } catch {
-          const retry = await findCustomerByName(userId, name).catch(() => undefined);
-          if (!retry) throw new Error(`Could not create demo customer "${name}"`);
-          customerIds[name] = String(retry.id);
-        }
-      }
-    }
+    const customerIds = await ensureDemoCustomers(userId, ["Sharma Traders", "Gupta Enterprises"]);
 
     const demos = [
       {
@@ -1408,11 +1443,15 @@ router.post("/ewaybill/seed", requireAuth, async (req: Request, res: Response) =
         unit_price: 1000,
         gst_rate: 18,
         sku_code: "Demo Widget",
+        hsn: "8471",
         grand_total: 11800,
         tally_voucher_number: "27",
         tally_reference: "INV-DEMO-001",
-        irn: "TEST-IRN-001",
         buyer_gstin: "29AADCB1234A1Z5",
+        place_of_supply: "27-Maharashtra",
+        shipping_address: "201 Andheri West, Mumbai, Maharashtra 400072",
+        destination_address: "201 Andheri West, Mumbai, Maharashtra 400072",
+        destination_pin: "400072",
       },
       {
         customerName: "Gupta Enterprises",
@@ -1425,75 +1464,63 @@ router.post("/ewaybill/seed", requireAuth, async (req: Request, res: Response) =
         unit_price: 2000,
         gst_rate: 18,
         sku_code: "Demo Widget Pro",
+        hsn: "8471",
         grand_total: 11800,
         tally_voucher_number: "28",
         tally_reference: "INV-DEMO-002",
-        irn: "TEST-IRN-002",
         buyer_gstin: "27AAHCG1234B1Z5",
+        place_of_supply: "27-Maharashtra",
+        shipping_address: "201 Andheri West, Mumbai, Maharashtra 400072",
+        destination_address: "201 Andheri West, Mumbai, Maharashtra 400072",
+        destination_pin: "400072",
       },
     ];
-
-    // Dispatch snapshot shared by the demo invoices (one-click EWB request).
-    const dispatchSnapshot = {
-      tally_company_name: "Demo Company",
-      seller_gstin: "27AAPCS1234F1Z5",
-      billing_address: "101 MG Road, Bengaluru, Karnataka 560001",
-      shipping_address: "201 Andheri West, Mumbai, Maharashtra 400072",
-      place_of_supply: "27-Maharashtra",
-      hsn: "8471",
-      taxable_value: 10000,
-      gst_amount: 1800,
-      cgst: 900,
-      sgst: 900,
-      igst: 0,
-      cess: 0,
-      dispatch_warehouse: "Main Warehouse",
-      origin_address: "101 MG Road, Bengaluru, Karnataka 560001",
-      origin_pin: "560001",
-      destination_address: "201 Andheri West, Mumbai, Maharashtra 400072",
-      destination_pin: "400072",
-      transporter_name: "Delhivery",
-      transporter_id: "214243",
-      transport_mode: "Road",
-      vehicle_number: "KA01AB1234",
-      transport_doc_number: "LR-1001",
-      distance_km: 23,
-      package_count: 10,
-      package_type: "Boxes",
-      irnStatus: "IRN_GENERATED",
-      ewayBillStatus: "EWB_PENDING",
-      dispatchStatus: "DISPATCH_PENDING",
-      inventoryStatus: "INVENTORY_NOT_DEDUCTED",
-    };
 
     let created = 0;
     let skipped = 0;
     const invoices: Array<Record<string, unknown>> = [];
     for (const d of demos) {
       const customerId = customerIds[d.customerName];
+      const taxable = d.quantity * d.unit_price;
+      const gst = Math.round((taxable * d.gst_rate) / 100);
       const snapshot = {
-        ...dispatchSnapshot,
+        ...DEMO_SELLER,
+        ...DEMO_DISPATCH,
+        place_of_supply: d.place_of_supply,
+        shipping_address: d.shipping_address,
+        destination_address: d.destination_address,
+        destination_pin: d.destination_pin,
+        buyer_gstin: d.buyer_gstin,
+        hsn: d.hsn,
+        taxable_value: taxable,
+        gst_amount: gst,
+        cgst: Math.round(gst / 2),
+        sgst: gst - Math.round(gst / 2),
+        igst: 0,
+        cess: 0,
         transport_doc_date: d.issue_date,
         expected_dispatch_date: d.issue_date,
-        taxable_value: d.quantity * d.unit_price,
         package_count: d.quantity,
       };
       const dupe = await findInvoiceByNumber(userId, customerId, d.invoice_number).catch(() => undefined);
       if (dupe) {
-        // Repair the demo state (IRN + dispatch snapshot) without duplicating.
-        // Never clobber an already-generated e-way bill or its dispatch state.
-        const repair: Record<string, unknown> = {
-          status: "COMPLETED",
-          tally_voucher_number: d.tally_voucher_number,
-          tally_reference: d.tally_reference,
-          irn: d.irn,
-          ...snapshot,
+        // Gap-fill repair: only fill fields that are still empty, never
+        // overwrite an IRN/EWB the flow already generated.
+        const cur = dupe as Record<string, unknown>;
+        const repair: Record<string, unknown> = { status: "COMPLETED" };
+        const fill = (k: string, v: unknown): void => {
+          if (cur[k] === null || cur[k] === undefined || cur[k] === "") repair[k] = v;
         };
-        if (str(dupe.ewayBillNumber)) {
-          delete repair.ewayBillStatus;
-          delete repair.dispatchStatus;
-          delete repair.inventoryStatus;
+        fill("tally_voucher_number", d.tally_voucher_number);
+        fill("tally_reference", d.tally_reference);
+        for (const [k, v] of Object.entries(snapshot)) {
+          if (k === "irnStatus" || k.startsWith("ewayBill") || k === "ewb_idempotency_key" || k.startsWith("dispatch") || k.startsWith("inventory")) continue;
+          fill(k, v);
         }
+        if (!str(cur.irnStatus)) repair.irnStatus = "IRN_PENDING";
+        if (!str(cur.ewayBillStatus)) repair.ewayBillStatus = "EWB_PENDING";
+        if (!str(cur.dispatchStatus)) repair.dispatchStatus = "DISPATCH_PENDING";
+        if (!str(cur.inventoryStatus)) repair.inventoryStatus = "INVENTORY_NOT_DEDUCTED";
         await updateInvoice(userId, String(dupe.id), repair);
         skipped++;
         invoices.push(((await getInvoice(userId, String(dupe.id))) ?? dupe) as Record<string, unknown>);
@@ -1519,12 +1546,11 @@ router.post("/ewaybill/seed", requireAuth, async (req: Request, res: Response) =
         tally_reference: d.tally_reference,
         sync_status: "COMPLETED",
         synced_at: new Date().toISOString(),
-        // Phase 5 IRN (as the IRN flow would store it).
-        irn: d.irn,
-        acknowledgementNumber: "123456789012345",
-        acknowledgementDate: d.issue_date,
-        irnGeneratedAt: new Date().toISOString(),
-        buyer_gstin: d.buyer_gstin,
+        // IRN + EWB are deliberately absent: generate them via the flow.
+        irnStatus: "IRN_PENDING",
+        ewayBillStatus: "EWB_PENDING",
+        dispatchStatus: "DISPATCH_PENDING",
+        inventoryStatus: "INVENTORY_NOT_DEDUCTED",
         ...snapshot,
       });
       created++;
@@ -1539,13 +1565,259 @@ router.post("/ewaybill/seed", requireAuth, async (req: Request, res: Response) =
         invoice_number: r.invoice_number,
         tally_voucher_number: r.tally_voucher_number,
         tally_reference: r.tally_reference,
-        irn: r.irn,
-        irnStatus: r.irnStatus ?? "IRN_GENERATED",
+        irn: r.irn ?? null,
+        irnStatus: r.irnStatus ?? "IRN_PENDING",
         ewayBillStatus: r.ewayBillStatus ?? "EWB_PENDING",
       })),
+      nextSteps: [
+        "POST /irn/request { invoiceId } → IRN_GENERATED (mock IRP generates a per-invoice IRN)",
+        "POST /ewaybill/request { invoiceId } → EWB_GENERATED (mock portal mints a random 12-digit number)",
+        "GET /ewaybill/invoice-pdf/:invoiceId → TAX INVOICE + e-Way Bill PDF",
+      ],
     });
   } catch (err) {
     console.error("[ewb][seed] failed:", err);
+    sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /ewaybill/seed-fresh — brand-new customers + OPEN single transactions
+// ---------------------------------------------------------------------------
+
+/**
+ * Fresh flow seed: three NEW customers, each with one OPEN (not yet pushed to
+ * Tally) invoice carrying realistic line detail plus IRN-compliance and
+ * dispatch snapshots — but no vehicle number (enter it in the UI dialog to
+ * exercise preflight), no Tally refs, no IRN, no e-way bill. Test one full
+ * single transaction end to end:
+ *
+ *   1. push the invoice to Tally (live connector) — or POST /simulate-post
+ *      when no Tally/connector is running
+ *   2. POST /irn/request → IRN_GENERATED
+ *   3. POST /ewaybill/request (+ vehicle number) → EWB_GENERATED + dispatch
+ *      released + inventory deducted
+ *   4. GET /ewaybill/invoice-pdf/:id → the invoice + e-way bill PDF
+ *
+ * Idempotent: existing invoice numbers are skipped, never duplicated.
+ */
+router.post("/ewaybill/seed-fresh", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const names = ["Patel Distributors", "Iyer Foods", "Khan Suppliers"];
+    const customerIds = await ensureDemoCustomers(userId, names);
+    const today = new Date().toISOString().slice(0, 10);
+
+    const flows = [
+      {
+        customerName: "Patel Distributors",
+        invoice_number: "INV-FLOW-001",
+        buyer_gstin: "24AAHCG1234F1Z5",
+        buyer_address: "14 CG Road, Ahmedabad, Gujarat 380009",
+        destination_pin: "380009",
+        place_of_supply: "24-Gujarat",
+        sku_code: "Flow Widget S",
+        hsn: "8471",
+        quantity: 10,
+        unit: "Nos",
+        unit_price: 1000,
+        gst_rate: 18,
+        distance_km: 120,
+      },
+      {
+        customerName: "Iyer Foods",
+        invoice_number: "INV-FLOW-002",
+        buyer_gstin: "33AABCI9012M1Z4",
+        buyer_address: "77 Anna Salai, Chennai, Tamil Nadu 600002",
+        destination_pin: "600002",
+        place_of_supply: "33-Tamil Nadu",
+        sku_code: "Flow Pack M",
+        hsn: "6404",
+        quantity: 5,
+        unit: "Box",
+        unit_price: 2000,
+        gst_rate: 18,
+        distance_km: 350,
+      },
+      {
+        customerName: "Khan Suppliers",
+        invoice_number: "INV-FLOW-003",
+        buyer_gstin: "07AAKFK3456N1Z9",
+        buyer_address: "9 Chandni Chowk, Delhi 110006",
+        destination_pin: "110006",
+        place_of_supply: "07-Delhi",
+        sku_code: "Flow Care Kit",
+        hsn: "3004",
+        quantity: 4,
+        unit: "Nos",
+        unit_price: 2500,
+        gst_rate: 12,
+        distance_km: 1400,
+      },
+    ];
+
+    let created = 0;
+    let skipped = 0;
+    const invoices: Array<Record<string, unknown>> = [];
+    for (const f of flows) {
+      const customerId = customerIds[f.customerName];
+      const dupe = await findInvoiceByNumber(userId, customerId, f.invoice_number).catch(() => undefined);
+      if (dupe) {
+        skipped++;
+        invoices.push(dupe as Record<string, unknown>);
+        continue;
+      }
+      const taxable = f.quantity * f.unit_price;
+      const gst = Math.round((taxable * f.gst_rate) / 100);
+      const total = taxable + gst;
+      const row = await createInvoice(userId, {
+        customer_id: customerId,
+        invoice_number: f.invoice_number,
+        issue_date: today,
+        due_date: today,
+        amount: total,
+        balance: total,
+        status: "open",
+        quantity: f.quantity,
+        unit: f.unit,
+        unit_price: f.unit_price,
+        gst_rate: f.gst_rate,
+        sku_code: f.sku_code,
+        grand_total: total,
+        version: 1,
+        // IRN-compliance snapshot (buyer master lives in WhizUnik, not Tally).
+        ...DEMO_SELLER,
+        buyer_gstin: f.buyer_gstin,
+        shipping_address: f.buyer_address,
+        place_of_supply: f.place_of_supply,
+        hsn: f.hsn,
+        taxable_value: taxable,
+        gst_amount: gst,
+        cgst: Math.round(gst / 2),
+        sgst: gst - Math.round(gst / 2),
+        igst: 0,
+        cess: 0,
+        irnStatus: "IRN_PENDING",
+        // Dispatch snapshot minus the vehicle number (enter it to test preflight).
+        dispatch_warehouse: DEMO_DISPATCH.dispatch_warehouse,
+        origin_address: DEMO_SELLER.origin_address,
+        origin_pin: DEMO_SELLER.origin_pin,
+        destination_address: f.buyer_address,
+        destination_pin: f.destination_pin,
+        transporter_name: DEMO_DISPATCH.transporter_name,
+        transporter_id: DEMO_DISPATCH.transporter_id,
+        transport_mode: "Road",
+        transport_doc_number: `LR-${f.invoice_number.slice(-3)}`,
+        transport_doc_date: today,
+        distance_km: f.distance_km,
+        package_count: f.quantity,
+        package_type: "Boxes",
+        expected_dispatch_date: today,
+        ewayBillStatus: "EWB_PENDING",
+        dispatchStatus: "DISPATCH_PENDING",
+        inventoryStatus: "INVENTORY_NOT_DEDUCTED",
+      });
+      created++;
+      invoices.push(row as Record<string, unknown>);
+    }
+
+    res.status(201).json({
+      created,
+      skipped,
+      invoices: invoices.map((r) => ({
+        id: r.id,
+        invoice_number: r.invoice_number,
+        status: r.status,
+        amount: r.amount,
+        irnStatus: r.irnStatus ?? "IRN_PENDING",
+        ewayBillStatus: r.ewayBillStatus ?? "EWB_PENDING",
+      })),
+      nextSteps: [
+        "Push the invoice to Tally (live connector) — or POST /ewaybill/simulate-post { invoiceId }",
+        "POST /irn/request { invoiceId } → IRN_GENERATED",
+        "POST /ewaybill/request { invoiceId, dispatch: { vehicleNumber } } → EWB_GENERATED",
+        "GET /ewaybill/invoice-pdf/:invoiceId → TAX INVOICE + e-Way Bill PDF",
+      ],
+    });
+  } catch (err) {
+    console.error("[ewb][seed-fresh] failed:", err);
+    sendWzError(res, "SERVER_ERROR", "An internal error occurred");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /ewaybill/simulate-post — Tally posting without a live connector
+// ---------------------------------------------------------------------------
+
+const simulatePostSchema = z.object({
+  invoiceId: z.string().trim().min(1).max(128),
+  tallyVoucherNumber: z.string().trim().min(1).max(100).optional(),
+});
+
+/**
+ * Test-only posting simulation: stores exactly what a connector ack would
+ * store on a PUSH_VOUCHERS DONE (tally_voucher_number, tally_reference,
+ * status COMPLETED) so the push → IRN → EWB flow can be tested end to end
+ * with no live Tally/connector. With a real connector, push for real and
+ * skip this endpoint.
+ */
+router.post("/ewaybill/simulate-post", requireAuth, async (req: Request, res: Response) => {
+  const parsed = simulatePostSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    sendWzError(res, "INVALID_PAYLOAD", formatWzIssues(parsed.error));
+    return;
+  }
+  try {
+    const userId = req.user!.userId;
+    const { invoiceId, tallyVoucherNumber } = parsed.data;
+    const inv = (await getInvoice(userId, invoiceId)) as Record<string, unknown> | undefined;
+    if (!inv) {
+      sendWzError(res, "INVALID_PAYLOAD", "Invoice not found for this account");
+      return;
+    }
+    if (String(inv.status ?? "") === "COMPLETED" && str(inv.tally_voucher_number)) {
+      res.status(200).json({
+        invoiceId,
+        invoiceNumber: String(inv.invoice_number ?? ""),
+        tallyVoucherNumber: str(inv.tally_voucher_number),
+        tallyReference: str(inv.tally_reference),
+        status: "COMPLETED",
+        simulated: true,
+        note: "Already posted to Tally — nothing changed.",
+      });
+      return;
+    }
+    let voucherNumber = (tallyVoucherNumber ?? "").trim();
+    if (!voucherNumber) {
+      // Next free integer voucher number (demo Tally series starts at 27).
+      const rows = await listInvoices(userId);
+      const used = new Set(
+        rows.map((r) => Number(r.tally_voucher_number)).filter((n) => Number.isInteger(n) && n > 0)
+      );
+      let next = 27;
+      while (used.has(next)) next++;
+      voucherNumber = String(next);
+    }
+    const now = new Date().toISOString();
+    await updateInvoice(userId, invoiceId, {
+      status: "COMPLETED",
+      tally_voucher_number: voucherNumber,
+      tally_reference: String(inv.invoice_number ?? "").trim(),
+      tally_company_name: str(inv.tally_company_name) ?? "Demo Company",
+      sync_status: "COMPLETED",
+      synced_at: now,
+    });
+    res.status(200).json({
+      invoiceId,
+      invoiceNumber: String(inv.invoice_number ?? ""),
+      tallyVoucherNumber: voucherNumber,
+      tallyReference: String(inv.invoice_number ?? "").trim(),
+      status: "COMPLETED",
+      simulated: true,
+      note: "Simulated the connector ack (no live Tally touched). Next: POST /irn/request.",
+    });
+  } catch (err) {
+    console.error("[ewb][simulate-post] failed:", err);
     sendWzError(res, "SERVER_ERROR", "An internal error occurred");
   }
 });

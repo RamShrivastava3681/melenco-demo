@@ -3,7 +3,8 @@
  * page 1 = TAX INVOICE e-Invoice, page 2 = e-Way Bill).
  *
  * Zero-dependency PDF writer (raw PDF 1.4, Helvetica only) so the endpoint
- * works without new native packages. Every mock result is labelled
+ * works without new native packages. Tables use real grid lines with wrapped
+ * text and right-aligned money columns. Every mock result is labelled
  * `Environment: MOCK / Legally Valid: NO` — a TEST e-way bill is never
  * presented as legally valid.
  */
@@ -106,6 +107,8 @@ function ascii(s: unknown): string {
   return String(s ?? "")
     .replace(/₹/g, "Rs. ")
     .replace(/[—–]/g, "-")
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
     .replace(/[^ -~]/g, "")
     .trim();
 }
@@ -116,6 +119,39 @@ function esc(s: string): string {
 
 const PAGE_W = 595;
 const PAGE_H = 842;
+
+/** Rough Helvetica advance: average glyph ≈ 0.52 × font size. */
+function textWidth(s: string, size: number): number {
+  return ascii(s).length * size * 0.52;
+}
+
+/** Wrap text to lines that fit maxW points at the given size. */
+function wrapText(s: string, size: number, maxW: number): string[] {
+  const words = ascii(s).split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [""];
+  const maxChars = Math.max(6, Math.floor(maxW / (size * 0.52)));
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    if (w.length > maxChars) {
+      if (cur) {
+        lines.push(cur);
+        cur = "";
+      }
+      for (let i = 0; i < w.length; i += maxChars) lines.push(w.slice(i, i + maxChars));
+      continue;
+    }
+    const next = cur ? `${cur} ${w}` : w;
+    if (next.length > maxChars) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = next;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
 
 class Page {
   ops: string[] = [];
@@ -132,18 +168,28 @@ class Page {
     this.ops.push(`BT /${bold ? "HB" : "H"} ${size} Tf ${x.toFixed(1)} ${yy.toFixed(1)} Td (${esc(ascii(str))}) Tj ET`);
   }
 
-  gap(h: number): void {
-    this.y -= h;
+  /** Right-aligned text ending at xRight, at absolute position. */
+  atRight(xRight: number, yFromTop: number, str: string, size = 9, bold = false): void {
+    this.at(xRight - textWidth(str, size), yFromTop, str, size, bold);
   }
 
-  hline(x1: number, x2: number, width = 0.7): void {
-    this.ops.push(`${width} w ${x1.toFixed(1)} ${this.y.toFixed(1)} m ${x2.toFixed(1)} ${this.y.toFixed(1)} l S`);
+  /** Centered text within [x, x+w], at absolute position. */
+  atCenter(x: number, w: number, yFromTop: number, str: string, size = 9, bold = false): void {
+    this.at(x + (w - textWidth(str, size)) / 2, yFromTop, str, size, bold);
+  }
+
+  gap(h: number): void {
+    this.y -= h;
   }
 
   line(x1: number, y1Top: number, x2: number, y2Top: number, width = 0.7): void {
     this.ops.push(
       `${width} w ${x1.toFixed(1)} ${(PAGE_H - y1Top).toFixed(1)} m ${x2.toFixed(1)} ${(PAGE_H - y2Top).toFixed(1)} l S`
     );
+  }
+
+  vline(x: number, yTop: number, h: number, width = 0.5): void {
+    this.line(x, yTop, x, yTop + h, width);
   }
 
   box(x: number, yTop: number, w: number, h: number, width = 0.7): void {
@@ -155,19 +201,136 @@ class Page {
   }
 }
 
-function kvRow(p: Page, label: string, value: string, x: number, labelW: number, size = 8.5): void {
-  p.text(x, label, size, true);
-  const v = ascii(value) || "-";
-  // crude two-column: value after label width
-  const maxChars = 88;
-  p.at(x + labelW, PAGE_H - p.y, v.slice(0, maxChars), size, false);
-  p.gap(12);
-}
-
 const money = (n: number | null | undefined): string =>
   n === null || n === undefined || !Number.isFinite(Number(n))
     ? "-"
     : Number(n).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// ---------------------------------------------------------------------------
+// Grid table with wrapped cells, column dividers and aligned numerics
+// ---------------------------------------------------------------------------
+
+interface GridCol {
+  w: number;
+  head: string;
+  align?: "l" | "r" | "c";
+}
+
+function gridTable(
+  p: Page,
+  x: number,
+  yTop: number,
+  cols: GridCol[],
+  rows: string[][],
+  opts: { size?: number; headSize?: number; lineH?: number; pad?: number } = {}
+): number {
+  const size = opts.size ?? 7.5;
+  const headSize = opts.headSize ?? 7;
+  const lineH = opts.lineH ?? size + 3.5;
+  const pad = opts.pad ?? 3;
+  const totalW = cols.reduce((s, c) => s + c.w, 0);
+
+  // Header (auto-sized for wrapped headings)
+  const headWrapped = cols.map((c) => wrapText(c.head, headSize, c.w - pad * 2).slice(0, 3));
+  const headH = Math.max(1, ...headWrapped.map((w) => w.length)) * lineH + pad;
+  p.fillBar(x, yTop, totalW, headH, 0.88);
+  let cx = x;
+  cols.forEach((c, ci) => {
+    headWrapped[ci].forEach((ln, li) => {
+      if (c.align === "r") p.atRight(cx + c.w - pad, yTop + 3 + li * lineH, ln, headSize, true);
+      else if (c.align === "c") p.atCenter(cx, c.w, yTop + 3 + li * lineH, ln, headSize, true);
+      else p.at(cx + pad, yTop + 3 + li * lineH, ln, headSize, true);
+    });
+    cx += c.w;
+  });
+  let ry = yTop + headH;
+
+  // Body rows
+  rows.forEach((row) => {
+    const wrapped = row.map((cell, i) => wrapText(cell, size, cols[i].w - pad * 2));
+    const maxLines = Math.max(1, ...wrapped.map((w) => w.length));
+    const rowH = maxLines * lineH + pad;
+    // vertical dividers (span header + all rows: drawn per row segment)
+    let vx = x;
+    cols.forEach((c) => {
+      p.vline(vx, ry, rowH, 0.5);
+      vx += c.w;
+    });
+    p.vline(vx, ry, rowH, 0.5);
+    wrapped.forEach((lines, i) => {
+      lines.forEach((ln, li) => {
+        if (cols[i].align === "r") p.atRight(x + colX(cols, i) + cols[i].w - pad, ry + 2 + li * lineH, ln, size, false);
+        else if (cols[i].align === "c") p.atCenter(x + colX(cols, i), cols[i].w, ry + 2 + li * lineH, ln, size, false);
+        else p.at(x + colX(cols, i) + pad, ry + 2 + li * lineH, ln, size, false);
+      });
+    });
+    // row bottom line
+    p.line(x, ry + rowH, x + totalW, ry + rowH, 0.5);
+    ry += rowH;
+  });
+
+  // header vertical dividers + top/bottom frame lines
+  let hx = x;
+  cols.forEach((c) => {
+    p.vline(hx, yTop, headH, 0.5);
+    hx += c.w;
+  });
+  p.vline(hx, yTop, headH, 0.5);
+  p.line(x, yTop, x + totalW, yTop, 0.7);
+  return ry;
+}
+
+function colX(cols: GridCol[], i: number): number {
+  let s = 0;
+  for (let k = 0; k < i; k++) s += cols[k].w;
+  return s;
+}
+
+/** Label + wrapped value row inside a bordered box; returns new yTop. */
+function fieldBox(
+  p: Page,
+  x: number,
+  yTop: number,
+  w: number,
+  fields: Array<[string, string]>,
+  opts: { size?: number; labelW?: number } = {}
+): number {
+  const size = opts.size ?? 7.5;
+  const labelW = opts.labelW ?? 118;
+  const lineH = size + 3.5;
+  const pad = 4;
+  let ry = yTop + pad;
+  // measure
+  const blocks = fields.map(([k, v]) => ({ k, lines: wrapText(v || "-", size, w - labelW - pad * 2) }));
+  const totalH = blocks.reduce((s, b) => s + Math.max(1, b.lines.length) * lineH, 0) + pad * 2;
+  p.box(x, yTop, w, totalH, 0.7);
+  p.vline(x + labelW, yTop, totalH, 0.5);
+  blocks.forEach((b) => {
+    p.at(x + pad, ry + 1, b.k, size, true);
+    b.lines.forEach((ln, li) => {
+      p.at(x + labelW + pad, ry + 1 + li * lineH, ln, size, false);
+    });
+    ry += Math.max(1, b.lines.length) * lineH;
+  });
+  return yTop + totalH;
+}
+
+/** Mock banner strip; returns height consumed. */
+function mockBanner(p: Page, x: number, yTop: number, w: number, text: string): number {
+  p.fillBar(x, yTop, w, 17, 0.82);
+  p.box(x, yTop, w, 17, 0.7);
+  p.atCenter(x, w, yTop + 4.5, text, 8, true);
+  return 17;
+}
+
+/** Title bar; returns height consumed. */
+function titleBar(p: Page, x: number, yTop: number, w: number, title: string, right: string): number {
+  p.fillBar(x, yTop, w, 22, 0.88);
+  p.box(x, yTop, w, 22, 0.7);
+  p.atCenter(x, w, yTop + 5, title, 13, true);
+  p.atRight(x + w - 6, yTop + 7, right, 8, true);
+  return 22;
+}
 
 // ---------------------------------------------------------------------------
 // Page 1: TAX INVOICE
@@ -178,38 +341,47 @@ function renderInvoicePage(d: InvoiceEwbPdfData): Page {
   const L = 36;
   const R = PAGE_W - 36;
   const W = R - L;
+  let y = 28;
 
   if (d.environment === "MOCK") {
-    p.fillBar(L, 28, W, 16, 0.9);
-    p.at(L + 6, 32, "TEST DOCUMENT - MOCK E-WAY BILL WORKFLOW - NOT LEGALLY VALID", 8.5, true);
-    p.y = PAGE_H - 52;
+    y += mockBanner(p, L, y, W, "TEST DOCUMENT - MOCK E-WAY BILL WORKFLOW - NOT LEGALLY VALID") + 4;
   }
+  y += titleBar(p, L, y, W, "TAX INVOICE", "e-Invoice") + 4;
 
-  // Title bar
-  p.fillBar(L, PAGE_H - p.y - 20, W, 20, 0.88);
-  p.at(L + W / 2 - 52, PAGE_H - p.y - 6, "TAX INVOICE", 13, true);
-  p.at(R - 52, PAGE_H - p.y - 4, "e-Invoice", 8, true);
-  p.gap(26);
-
-  p.box(L, PAGE_H - p.y - 46, W, 46);
-  kvRow(p, "IRN  : ", d.irn ?? "-", L + 4, 200, 7.5);
-  kvRow(p, "Ack No. : ", d.ackNumber ?? "-", L + 4, 200, 7.5);
-  kvRow(p, "Ack Date : ", d.ackDate ?? d.invoiceDate, L + 4, 200, 7.5);
-  p.gap(2);
-  p.box(R - 74, PAGE_H - p.y - 18, 62, 52);
-  p.at(R - 66, PAGE_H - p.y - 6, "QR", 9, true);
-  p.gap(58);
+  // IRN block (full width, QR box docked right)
+  const irnFields: Array<[string, string]> = [
+    ["IRN", d.irn ?? "-"],
+    ["Ack No.", d.ackNumber ?? "-"],
+    ["Ack Date", d.ackDate ?? d.invoiceDate],
+  ];
+  const qrW = 66;
+  const irnBoxY = y;
+  // measure IRN block height without drawing first
+  const size = 7.5;
+  const lineH = size + 3.5;
+  const irnLines = irnFields.map(([, v]) => wrapText(v, size, W - qrW - 130));
+  const irnH = irnLines.reduce((s, l) => s + Math.max(1, l.length) * lineH, 0) + 10;
+  const boxH = Math.max(irnH, 52);
+  p.box(L, irnBoxY, W, boxH, 0.7);
+  let iy = irnBoxY + 5;
+  irnFields.forEach(([k], fi) => {
+    p.at(L + 5, iy + 1, `${k} :`, size, true);
+    irnLines[fi].forEach((ln, li) => {
+      p.at(L + 62, iy + 1 + li * lineH, ln, size, false);
+    });
+    iy += Math.max(1, irnLines[fi].length) * lineH;
+  });
+  // QR placeholder docked right
+  const qrX = R - qrW - 5;
+  const qrY = irnBoxY + (boxH - 44) / 2;
+  p.box(qrX, qrY, qrW - 10, 44, 0.5);
+  p.atCenter(qrX, qrW - 10, qrY + 8, "QR", 10, true);
+  p.atCenter(qrX, qrW - 10, qrY + 24, "mock", 7, false);
+  y = irnBoxY + boxH + 4;
 
   // Seller (left) + invoice meta (right)
-  const metaX = L + 300;
-  const metaTop = PAGE_H - p.y;
-  p.box(L, metaTop, 290, 62);
-  p.at(L + 4, metaTop + 4, d.sellerName, 9, true);
-  p.at(L + 4, metaTop + 16, `GSTIN/UIN: ${d.sellerGstin || "-"}`, 7.5, false);
-  p.at(L + 4, metaTop + 27, `State Name : ${d.sellerState}`, 7.5, false);
-  p.at(L + 4, metaTop + 38, `E-Mail : ${d.sellerEmail || "-"}`, 7.5, false);
-
-  const meta: Array<[string, string]> = [
+  const leftW = 296;
+  const metaFields: Array<[string, string]> = [
     ["Invoice No.", d.invoiceNumber],
     ["e-Way Bill No.", d.ewayBillNumber ?? "PENDING"],
     ["Dated", d.invoiceDate],
@@ -218,87 +390,140 @@ function renderInvoicePage(d: InvoiceEwbPdfData): Page {
     ["Dispatched through", d.dispatchedThrough || "-"],
     ["Destination", d.destination || "-"],
   ];
-  let my = metaTop;
-  p.box(metaX, my, W - 300, meta.length * 13 + 4);
-  meta.forEach(([k, v]) => {
-    p.at(metaX + 4, my + 3, k, 7, true);
-    p.at(metaX + 118, my + 3, ascii(v).slice(0, 34), 7.5, false);
-    my += 13;
-  });
-  p.y = PAGE_H - (my + 6);
-
-  // Consignee + Buyer
-  const cbTop = PAGE_H - p.y;
-  p.box(L, cbTop, W, 76);
-  p.at(L + 4, cbTop + 3, "Consignee (Ship to)", 8, true);
-  p.at(L + 4, cbTop + 15, d.buyerName, 8, true);
-  p.at(L + 4, cbTop + 27, ascii(d.buyerAddress).slice(0, 95), 7.5, false);
-  p.at(L + 4, cbTop + 39, `GSTIN/UIN : ${d.buyerGstin || "-"}`, 7.5, false);
-  p.at(L + 4, cbTop + 51, `State Name : ${d.buyerState}`, 7.5, false);
-  p.at(L + 4, cbTop + 63, "Buyer (Bill to)  —  same as consignee", 7, false);
-  p.y = PAGE_H - (cbTop + 82);
-
-  // Items table
-  const cols = [28, 220, 62, 52, 62, 52, 34, 62]; // Sl, Desc, HSN, Qty, RateIncl, Rate, per, Amount
-  const tTop = PAGE_H - p.y;
-  const head = ["Sl No.", "Description of Goods", "HSN/SAC", "Quantity", "Rate (Incl. of Tax)", "Rate", "per", "Amount"];
-  let cx = L;
-  p.fillBar(L, tTop, W, 24, 0.88);
-  head.forEach((h, i) => {
-    p.at(cx + 2, tTop + 5, h, 6.5, true);
-    cx += cols[i];
-  });
-  let ry = tTop + 24;
-  const rowH = 26;
-  d.items.forEach((it, idx) => {
-    p.box(L, ry, W, rowH, 0.5);
-    let x = L;
-    const cells = [
-      String(idx + 1),
-      ascii(it.description).slice(0, 52),
-      ascii(it.hsn),
-      `${it.quantity} ${ascii(it.unit)}`,
-      money(it.rateInclTax),
-      money(it.rate),
-      ascii(it.unit),
-      money(it.amount),
-    ];
-    cells.forEach((c, i) => {
-      p.at(x + 2, ry + 6, c, i === 1 ? 6.5 : 7.5, false);
-      x += cols[i];
+  const sellerLines = [
+    d.sellerName,
+    `GSTIN/UIN: ${d.sellerGstin || "-"}`,
+    `State Name : ${d.sellerState}`,
+    `E-Mail : ${d.sellerEmail || "-"}`,
+  ];
+  const sellerH = sellerLines.length * (8 + 4) + 12;
+  const metaSize = 7;
+  const metaLineH = metaSize + 3.5;
+  const metaWrapped = metaFields.map(([, v]) => wrapText(v, metaSize, W - leftW - 4 - 122));
+  const metaH = metaWrapped.reduce((s, l) => s + Math.max(1, l.length) * metaLineH, 0) + 10;
+  const rowH = Math.max(sellerH, metaH);
+  p.box(L, y, leftW, rowH, 0.7);
+  let sy = y + 5;
+  p.at(L + 5, sy, sellerLines[0], 9.5, true);
+  sy += 13;
+  sellerLines.slice(1).forEach((ln) => {
+    wrapText(ln, 7.5, leftW - 12).forEach((wl) => {
+      p.at(L + 5, sy, wl, 7.5, false);
+      sy += 11;
     });
-    ry += rowH;
   });
-  // totals
-  p.box(L, ry, W, 16, 0.5);
-  p.at(L + cols[0] + cols[1] + cols[2] + cols[3] + 2, ry + 3, "IGST OUTPUT TAX", 7.5, true);
-  p.at(L + W - 60, ry + 3, money(d.gstAmount), 7.5, true);
-  ry += 16;
-  p.fillBar(L, ry, W, 16, 0.88);
-  p.at(L + 4, ry + 3, "Total", 8, true);
-  p.at(L + W - 60, ry + 3, money(d.invoiceTotal), 8, true);
-  ry += 16;
-  p.y = PAGE_H - (ry + 4);
+  const mx = L + leftW;
+  const mw = W - leftW;
+  p.box(mx, y, mw, rowH, 0.7);
+  p.vline(mx + 116, y, rowH, 0.5);
+  let my = y + 5;
+  metaFields.forEach(([k], fi) => {
+    p.at(mx + 5, my, k, metaSize, true);
+    metaWrapped[fi].forEach((ln, li) => {
+      p.at(mx + 121, my + li * metaLineH, ln, metaSize, false);
+    });
+    my += Math.max(1, metaWrapped[fi].length) * metaLineH;
+  });
+  y += rowH + 4;
 
-  p.text(L, `Amount Chargeable (in words): ${amountInWords(d.invoiceTotal)}`, 7.5, true);
-  p.gap(14);
-  p.text(L, `HSN ${d.items[0]?.hsn ?? "-"}  Taxable ${money(d.taxableValue)}  Rate ${d.gstRate}%  IGST ${money(d.gstAmount)}`, 7.5, false);
-  p.gap(13);
-  p.text(L, `Tax Amount (in words) : ${amountInWords(d.gstAmount)}`, 7.5, true);
-  p.gap(14);
-  const dTop = PAGE_H - p.y;
-  p.box(L, dTop, W, 40);
-  p.at(L + 4, dTop + 3, "Declaration / Company's Bank Details", 7.5, true);
-  p.at(R - 120, dTop + 20, `for ${d.sellerName}`, 8, true);
-  p.at(R - 118, dTop + 32, "Authorised Signatory", 7, false);
-  p.y = PAGE_H - (dTop + 46);
-  p.text(L, "This is a Computer Generated Invoice", 7.5, false);
-  p.gap(10);
+  // Consignee (Ship to) + Buyer (Bill to), stacked full width like the example
+  const party = (title: string, name: string, addr: string, gstin: string, state: string, yy: number): number => {
+    const lines = [name, addr, `GSTIN/UIN : ${gstin || "-"}`, `State Name : ${state}`];
+    const wrapped = lines.map((ln) => wrapText(ln, 7.5, W - 14));
+    const h = 15 + wrapped.reduce((s, l) => s + Math.max(1, l.length) * 11, 0) + 5;
+    p.box(L, yy, W, h, 0.7);
+    p.at(L + 5, yy + 3, title, 8, true);
+    let ly = yy + 15;
+    wrapped.forEach((wl, idx) => {
+      wl.forEach((ln) => {
+        p.at(L + 5, ly, ln, 7.5, idx === 0);
+        ly += 11;
+      });
+    });
+    return yy + h;
+  };
+  y = party("Consignee (Ship to)", d.buyerName, d.buyerAddress, d.buyerGstin, d.buyerState, y) + 4;
+  y = party("Buyer (Bill to)", d.buyerName, d.buyerAddress, d.buyerGstin, d.buyerState, y) + 4;
+
+  // Items grid
+  const itemCols: GridCol[] = [
+    { w: 30, head: "Sl No.", align: "c" },
+    { w: 188, head: "Description of Goods", align: "l" },
+    { w: 54, head: "HSN/SAC", align: "c" },
+    { w: 56, head: "Quantity", align: "r" },
+    { w: 62, head: "Rate Incl. Tax", align: "r" },
+    { w: 56, head: "Rate", align: "r" },
+    { w: 30, head: "per", align: "c" },
+    { w: 62, head: "Amount", align: "r" },
+  ];
+  const itemRows = d.items.map((it, idx) => [
+    String(idx + 1),
+    it.description,
+    it.hsn,
+    `${it.quantity} ${it.unit}`,
+    money(it.rateInclTax),
+    money(it.rate),
+    it.unit,
+    money(it.amount),
+  ]);
+  y = gridTable(p, L, y, itemCols, itemRows, { size: 7.5 });
+
+  // IGST + Total rows (aligned to the grid's right edge)
+  const amtX = L + W;
+  const igstY = y;
+  p.box(L, igstY, W, 16, 0.5);
+  p.at(L + 5, igstY + 3.5, "IGST OUTPUT TAX @ 18%", 7.5, true);
+  p.atRight(amtX - 4, igstY + 3.5, money(d.gstAmount), 7.5, true);
+  const totY = igstY + 16;
+  p.fillBar(L, totY, W, 17, 0.88);
+  p.box(L, totY, W, 17, 0.7);
+  p.at(L + 5, totY + 4, "Total", 8.5, true);
+  const totQty = d.items.reduce((s, it) => s + Number(it.quantity || 0), 0);
+  const totUnit = d.items[0]?.unit ?? "";
+  p.at(L + 200, totY + 4, `${totQty} ${totUnit}`, 8, true);
+  p.atRight(amtX - 4, totY + 4, money(d.invoiceTotal), 8.5, true);
+  y = totY + 17 + 3;
+
+  // Amount in words
+  y = fieldBox(p, L, y, W, [["Amount Chargeable (in words)", amountInWords(d.invoiceTotal)]], { labelW: 170 }) + 3;
+
+  // HSN tax grid
+  const taxCols: GridCol[] = [
+    { w: 105, head: "HSN/SAC", align: "c" },
+    { w: 130, head: "Taxable Value", align: "r" },
+    { w: 80, head: "Rate", align: "c" },
+    { w: 105, head: "IGST Amount", align: "r" },
+    { w: 103, head: "Total Tax Amount", align: "r" },
+  ];
+  y = gridTable(
+    p, L, y, taxCols,
+    [
+      [d.items[0]?.hsn ?? "-", money(d.taxableValue), `${d.gstRate}%`, money(d.gstAmount), money(d.gstAmount)],
+      ["Total", money(d.taxableValue), "", money(d.gstAmount), money(d.gstAmount)],
+    ],
+    { size: 7.5 }
+  ) + 3;
+  y = fieldBox(p, L, y, W, [["Tax Amount (in words)", amountInWords(d.gstAmount)]], { labelW: 170 }) + 3;
+
+  // Declaration + Bank details + signatory
+  const declH = 52;
+  p.box(L, y, W, declH, 0.7);
+  p.vline(L + W / 2, y, declH, 0.5);
+  p.at(L + 5, y + 3, "Declaration", 7.5, true);
+  p.at(L + 5, y + 15, "Company's Bank Details", 7.5, false);
+  p.at(L + 5, y + 27, "We declare that this invoice shows the actual price", 7, false);
+  p.at(L + 5, y + 37, "of the goods described and all particulars are true.", 7, false);
+  p.atCenter(L + W / 2, W / 2, y + 6, `for ${d.sellerName}`, 8.5, true);
+  p.atCenter(L + W / 2, W / 2, y + 36, "Authorised Signatory", 7.5, false);
+  y += declH + 6;
+
+  p.atCenter(L, W, y, "This is a Computer Generated Invoice", 7.5, false);
+  y += 13;
   if (d.environment === "MOCK") {
-    p.text(L, `Environment: MOCK   Legally Valid: NO   IRN: ${d.irn ?? "-"}`, 7.5, true);
-    p.gap(12);
+    p.atCenter(L, W, y, `Environment: MOCK    Legally Valid: NO    IRN: ${d.irn ?? "-"}`, 7.5, true);
+    y += 13;
   }
-  p.text(L, "Page 1 of 2 - TAX INVOICE", 7, false);
+  p.atCenter(L, W, y, "Page 1 of 2 - TAX INVOICE", 7, false);
   return p;
 }
 
@@ -311,131 +536,147 @@ function renderEwbPage(d: InvoiceEwbPdfData): Page {
   const L = 36;
   const R = PAGE_W - 36;
   const W = R - L;
+  let y = 28;
 
   if (d.environment === "MOCK") {
-    p.fillBar(L, 28, W, 16, 0.9);
-    p.at(L + 6, 32, "TEST E-WAY BILL - MOCK - NOT LEGALLY VALID", 8.5, true);
-    p.y = PAGE_H - 52;
+    y += mockBanner(p, L, y, W, "TEST E-WAY BILL - MOCK - NOT LEGALLY VALID") + 4;
   }
+  y += titleBar(p, L, y, W, "e-Way Bill", "e-Way Bill") + 4;
 
-  p.fillBar(L, PAGE_H - p.y - 20, W, 20, 0.88);
-  p.at(L + W / 2 - 42, PAGE_H - p.y - 6, "e-Way Bill", 13, true);
-  p.at(R - 52, PAGE_H - p.y - 4, "e-Way Bill", 8, true);
-  p.gap(26);
-
-  const head: Array<[string, string]> = [
-    ["Doc No.", `Tax Invoice - ${d.invoiceNumber}`],
-    ["Date", d.invoiceDate],
-    ["IRN", d.irn ?? "-"],
-    ["Ack Date", d.ackDate ?? d.invoiceDate],
-  ];
-  head.forEach(([k, v]) => {
-    p.text(L, `${k} : ${ascii(v).slice(0, 80)}`, 8, false);
-    p.gap(12);
-  });
-  p.gap(2);
+  y = fieldBox(
+    p, L, y, W,
+    [
+      ["Doc No.", `Tax Invoice - ${d.invoiceNumber}`],
+      ["Date", d.invoiceDate],
+      ["IRN", d.irn ?? "-"],
+      ["Ack Date", d.ackDate ?? d.invoiceDate],
+    ],
+    { labelW: 70 }
+  ) + 4;
 
   // 1. e-Way Bill Details
-  p.fillBar(L, PAGE_H - p.y - 16, W, 16, 0.88);
-  p.at(L + 4, PAGE_H - p.y - 12, "1. e-Way Bill Details", 8.5, true);
-  p.gap(18);
-  const det: Array<[string, string, string, string]> = [
-    ["e-Way Bill No.", d.ewayBillNumber ?? "PENDING", "Mode", d.transportMode],
-    [`Generated Date`, d.generatedDate ?? "-", "Approx Distance", d.distanceKm != null ? `${d.distanceKm} KM` : "-"],
-    ["Generated By", d.sellerName.slice(0, 30), "Valid Upto", d.validUntil ?? "-"],
-    ["Supply Type", d.supplyType, "Transaction Type", d.transactionType],
+  p.fillBar(L, y, W, 17, 0.88);
+  p.box(L, y, W, 17, 0.7);
+  p.at(L + 5, y + 4, "1. e-Way Bill Details", 8.5, true);
+  y += 17;
+  const detRows: Array<[[string, string], [string, string]]> = [
+    [["e-Way Bill No.", d.ewayBillNumber ?? "PENDING"], ["Mode", d.transportMode]],
+    [["Generated Date", d.generatedDate ?? "-"], ["Approx Distance", d.distanceKm != null ? `${d.distanceKm} KM` : "-"]],
+    [["Generated By", d.sellerName], ["Valid Upto", d.validUntil ?? "-"]],
+    [["Supply Type", d.supplyType], ["Transaction Type", d.transactionType]],
   ];
-  det.forEach(([k1, v1, k2, v2]) => {
-    p.at(L + 4, PAGE_H - p.y - 9, k1, 7.5, true);
-    p.at(L + 92, PAGE_H - p.y - 9, ascii(v1).slice(0, 26), 7.5, false);
-    p.at(L + 250, PAGE_H - p.y - 9, k2, 7.5, true);
-    p.at(L + 340, PAGE_H - p.y - 9, ascii(v2).slice(0, 26), 7.5, false);
-    p.gap(13);
+  const size = 7.5;
+  const lineH = size + 3.5;
+  const detH = detRows.length * lineH + 8;
+  p.box(L, y, W, detH, 0.7);
+  p.vline(L + W / 2, y, detH, 0.7);
+  let dy = y + 4;
+  detRows.forEach(([a, b]) => {
+    p.at(L + 5, dy, a[0], size, true);
+    wrapText(a[1], size, W / 2 - 105).slice(0, 1).forEach((ln) => p.at(L + 96, dy, ln, size, false));
+    p.at(L + W / 2 + 5, dy, b[0], size, true);
+    wrapText(b[1], size, W / 2 - 118).slice(0, 1).forEach((ln) => p.at(L + W / 2 + 96, dy, ln, size, false));
+    dy += lineH;
   });
-  p.gap(2);
+  y += detH + 4;
 
   // 2. Address Details
-  p.fillBar(L, PAGE_H - p.y - 16, W, 16, 0.88);
-  p.at(L + 4, PAGE_H - p.y - 12, "2. Address Details", 8.5, true);
-  p.gap(18);
-  const aTop = PAGE_H - p.y;
-  p.box(L, aTop, W / 2, 52);
-  p.box(L + W / 2, aTop, W / 2, 52);
-  p.at(L + 4, aTop + 3, "From", 8, true);
-  p.at(L + 4, aTop + 15, ascii(d.sellerName).slice(0, 40), 7.5, false);
-  p.at(L + 4, aTop + 27, `GSTIN : ${d.sellerGstin || "-"}`, 7.5, false);
-  p.at(L + 4, aTop + 39, "Dispatch From", 7.5, false);
-  p.at(L + W / 2 + 4, aTop + 3, "To", 8, true);
-  p.at(L + W / 2 + 4, aTop + 15, ascii(d.buyerName).slice(0, 40), 7.5, false);
-  p.at(L + W / 2 + 4, aTop + 27, `GSTIN : ${d.buyerGstin || "-"}`, 7.5, false);
-  p.at(L + W / 2 + 4, aTop + 39, ascii(d.buyerAddress).slice(0, 44), 7.5, false);
-  p.y = PAGE_H - (aTop + 58);
+  p.fillBar(L, y, W, 17, 0.88);
+  p.box(L, y, W, 17, 0.7);
+  p.at(L + 5, y + 4, "2. Address Details", 8.5, true);
+  y += 17;
+  const fromLines = [d.sellerName, `GSTIN : ${d.sellerGstin || "-"}`, "Dispatch From", d.sellerState];
+  const toLines = [d.buyerName, `GSTIN : ${d.buyerGstin || "-"}`, "Ship To", d.buyerAddress];
+  const halfW = W / 2;
+  const fromWrapped = fromLines.map((ln) => wrapText(ln, 7.5, halfW - 12));
+  const toWrapped = toLines.map((ln) => wrapText(ln, 7.5, halfW - 12));
+  const addrH =
+    Math.max(
+      14 + fromWrapped.reduce((s, l) => s + Math.max(1, l.length) * 11, 0),
+      14 + toWrapped.reduce((s, l) => s + Math.max(1, l.length) * 11, 0)
+    ) + 6;
+  p.box(L, y, halfW, addrH, 0.7);
+  p.box(L + halfW, y, halfW, addrH, 0.7);
+  p.at(L + 5, y + 3, "From", 8, true);
+  p.at(L + halfW + 5, y + 3, "To", 8, true);
+  let fy = y + 15;
+  const fromFlat = fromWrapped.map((wl, idx) => ({ wl, bold: idx === 0 }));
+  fromFlat.forEach(({ wl, bold }) => {
+    wl.forEach((ln) => {
+      p.at(L + 5, fy, ln, 7.5, bold);
+      fy += 11;
+    });
+  });
+  let ty = y + 15;
+  toWrapped.forEach((wl, idx) => {
+    wl.forEach((ln) => {
+      p.at(L + halfW + 5, ty, ln, 7.5, idx === 0);
+      ty += 11;
+    });
+  });
+  y += addrH + 4;
 
   // 3. Goods Details
-  p.fillBar(L, PAGE_H - p.y - 16, W, 16, 0.88);
-  p.at(L + 4, PAGE_H - p.y - 12, "3. Goods Details", 8.5, true);
-  p.gap(18);
-  const gcols = [70, 255, 70, 80, 48];
-  const gTop = PAGE_H - p.y;
-  p.fillBar(L, gTop, W, 22, 0.9);
-  const ghead = ["HSN Code", "Product Name & Desc", "Quantity", "Taxable Amt", "Tax Rate"];
-  let gx = L;
-  ghead.forEach((h, i) => {
-    p.at(gx + 2, gTop + 5, h, 6.5, true);
-    gx += gcols[i];
-  });
-  let gy = gTop + 22;
-  d.items.forEach((it) => {
-    p.box(L, gy, W, 24, 0.5);
-    let x = L;
-    const cells = [
-      ascii(it.hsn),
-      ascii(it.description).slice(0, 60),
-      `${it.quantity} ${ascii(it.unit)}`,
-      money(it.amount),
-      String(d.gstRate),
-    ];
-    cells.forEach((c, i) => {
-      p.at(x + 2, gy + 5, c, 7, false);
-      x += gcols[i];
-    });
-    gy += 24;
-  });
-  p.at(L + 4, gy + 3, `Tot.Taxable Amt : ${money(d.taxableValue)}  Other Amt : 0  Total Inv Amt : ${money(d.invoiceTotal)}`, 7.5, true);
-  gy += 14;
-  p.at(L + 4, gy + 3, `IGST Amt : ${money(d.gstAmount)}`, 7.5, true);
-  gy += 16;
-  p.y = PAGE_H - (gy + 2);
+  p.fillBar(L, y, W, 17, 0.88);
+  p.box(L, y, W, 17, 0.7);
+  p.at(L + 5, y + 4, "3. Goods Details", 8.5, true);
+  y += 17;
+  const goodsCols: GridCol[] = [
+    { w: 62, head: "HSN Code", align: "c" },
+    { w: 248, head: "Product Name & Desc", align: "l" },
+    { w: 68, head: "Quantity", align: "r" },
+    { w: 82, head: "Taxable Amt", align: "r" },
+    { w: 63, head: "Tax Rate %", align: "c" },
+  ];
+  y = gridTable(
+    p, L, y, goodsCols,
+    d.items.map((it) => [it.hsn, it.description, `${it.quantity} ${it.unit}`, money(it.amount), String(d.gstRate)]),
+    { size: 7.5 }
+  );
+  y = fieldBox(
+    p, L, y, W,
+    [
+      ["Totals", `Taxable: ${money(d.taxableValue)}   Other: 0.00   Invoice: ${money(d.invoiceTotal)}`],
+      ["IGST Amt", money(d.gstAmount)],
+    ],
+    { labelW: 70 }
+  ) + 4;
 
   // 4. Transportation Details
-  p.fillBar(L, PAGE_H - p.y - 16, W, 16, 0.88);
-  p.at(L + 4, PAGE_H - p.y - 12, "4. Transportation Details", 8.5, true);
-  p.gap(18);
-  p.at(L + 4, PAGE_H - p.y - 9, "Transporter ID", 7.5, true);
-  p.at(L + 100, PAGE_H - p.y - 9, ascii(d.transporterId ?? "-"), 7.5, false);
-  p.at(L + 250, PAGE_H - p.y - 9, "Doc No.", 7.5, true);
-  p.at(L + 340, PAGE_H - p.y - 9, ascii(d.transportDocNumber ?? "-"), 7.5, false);
-  p.gap(13);
-  p.at(L + 4, PAGE_H - p.y - 9, "Name", 7.5, true);
-  p.at(L + 100, PAGE_H - p.y - 9, ascii(d.transporterName ?? "-").slice(0, 26), 7.5, false);
-  p.at(L + 250, PAGE_H - p.y - 9, "Date", 7.5, true);
-  p.at(L + 340, PAGE_H - p.y - 9, ascii(d.transportDocDate ?? "-"), 7.5, false);
-  p.gap(16);
+  p.fillBar(L, y, W, 17, 0.88);
+  p.box(L, y, W, 17, 0.7);
+  p.at(L + 5, y + 4, "4. Transportation Details", 8.5, true);
+  y += 17;
+  y = fieldBox(
+    p, L, y, W,
+    [
+      ["Transporter", `${d.transporterName ?? "-"}${d.transporterId ? `  (ID: ${d.transporterId})` : ""}`],
+      ["Transport Doc", `${d.transportDocNumber ?? "-"}${d.transportDocDate ? `  dated ${d.transportDocDate}` : ""}`],
+    ],
+    { labelW: 110 }
+  ) + 4;
 
   // 5. Vehicle Details
-  p.fillBar(L, PAGE_H - p.y - 16, W, 16, 0.88);
-  p.at(L + 4, PAGE_H - p.y - 12, "5. Vehicle Details", 8.5, true);
-  p.gap(18);
-  p.at(L + 4, PAGE_H - p.y - 9, "Vehicle No.", 7.5, true);
-  p.at(L + 100, PAGE_H - p.y - 9, ascii(d.vehicleNumber ?? "-"), 7.5, false);
-  p.gap(16);
+  p.fillBar(L, y, W, 17, 0.88);
+  p.box(L, y, W, 17, 0.7);
+  p.at(L + 5, y + 4, "5. Vehicle Details", 8.5, true);
+  y += 17;
+  y = fieldBox(
+    p, L, y, W,
+    [
+      ["Vehicle No.", d.vehicleNumber ?? "-"],
+      ["Distance", d.distanceKm != null ? `${d.distanceKm} KM` : "-"],
+    ],
+    { labelW: 110 }
+  ) + 6;
 
   if (d.environment === "MOCK") {
-    p.fillBar(L, PAGE_H - p.y - 18, W, 18, 0.9);
-    p.at(L + 6, PAGE_H - p.y - 13, "Environment: MOCK    Legally Valid: NO", 8, true);
-    p.gap(22);
+    p.fillBar(L, y, W, 18, 0.82);
+    p.box(L, y, W, 18, 0.7);
+    p.atCenter(L, W, y + 5, "Environment: MOCK    Legally Valid: NO", 8, true);
+    y += 24;
   }
-  p.text(L, "Page 2 of 2 - e-Way Bill", 7, false);
+  p.atCenter(L, W, y, "Page 2 of 2 - e-Way Bill", 7, false);
   return p;
 }
 

@@ -156,7 +156,9 @@ async function irnVerifiedInvoice(
 }
 
 describe("Phase 6: E-way bill generation (mock adapter)", () => {
-  it("successful test: seeded INV-DEMO-001 → TEST-EWB-001, dispatch released, inventory deducted", async () => {
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  it("successful test: seeded INV-DEMO-001 → IRN generated, then random 12-digit EWB, dispatch released", async () => {
     const seed = await request(app)
       .post("/api/integrations/tally/ewaybill/seed")
       .set("Authorization", `Bearer ${user.token}`)
@@ -167,17 +169,30 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
     )!;
     expect(first).toBeTruthy();
 
+    // The seed presets NOTHING hardcoded: IRN is generated through the flow.
+    const irnRes = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: first.id });
+    expect(irnRes.status).toBe(201);
+    expect(irnRes.body.irn).toMatch(/^[0-9A-F]{64}$/);
+    const irn = irnRes.body.irn as string;
+
     const res = await request(app)
       .post("/api/integrations/tally/ewaybill/request")
       .set("Authorization", `Bearer ${user.token}`)
       .send({ invoiceId: first.id });
     expect(res.status).toBe(201);
-    expect(res.body.ewayBillNumber).toBe("TEST-EWB-001");
+    // Fresh random 12-digit number like the real portal issues — never hardcoded.
+    expect(res.body.ewayBillNumber).toMatch(/^\d{12}$/);
     expect(res.body.ewayBillStatus).toBe("EWB_GENERATED");
     expect(res.body.whizunikInvoiceNumber).toBe("INV-DEMO-001");
     expect(res.body.tallyVoucherNumber).toBe("27");
     expect(res.body.tallyReference).toBe("INV-DEMO-001");
-    expect(res.body.irn).toBe("TEST-IRN-001");
+    expect(res.body.irn).toBe(irn);
+    expect(res.body.generatedDate).toBe(today());
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    expect(res.body.validUntil).toBe(tomorrow); // 23 km → 1 day validity
     expect(res.body.dispatchStatus).toBe("DISPATCH_RELEASED");
     expect(res.body.inventoryStatus).toBe("INVENTORY_DEDUCTED");
     expect(res.body.duplicate).toBe(false);
@@ -192,8 +207,8 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
     expect(status.status).toBe(200);
     expect(status.body.whizunikInvoiceNumber).toBe("INV-DEMO-001");
     expect(status.body.tallyVoucherNumber).toBe("27");
-    expect(status.body.irn).toBe("TEST-IRN-001");
-    expect(status.body.ewayBillNumber).toBe("TEST-EWB-001");
+    expect(status.body.irn).toBe(irn);
+    expect(status.body.ewayBillNumber).toBe(res.body.ewayBillNumber);
     expect(status.body.ewayBillStatus).toBe("EWB_GENERATED");
     expect(status.body.dispatchStatus).toBe("DISPATCH_RELEASED");
   });
@@ -206,11 +221,20 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
     const first = (seed.body.invoices as Array<{ id: string; invoice_number: string }>).find(
       (i) => i.invoice_number === "INV-DEMO-001"
     )!;
-    // Ensure generated (idempotent — returns existing when already generated).
+    // Ensure IRN + EWB generated (idempotent — returns existing when done).
+    await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: first.id });
     await request(app)
       .post("/api/integrations/tally/ewaybill/request")
       .set("Authorization", `Bearer ${user.token}`)
       .send({ invoiceId: first.id });
+
+    const st = await request(app)
+      .get(`/api/integrations/tally/ewaybill/status/${first.id}`)
+      .set("Authorization", `Bearer ${user.token}`);
+    expect(st.body.ewayBillStatus).toBe("EWB_GENERATED");
 
     const pdf = await request(app)
       .get(`/api/integrations/tally/ewaybill/invoice-pdf/${first.id}`)
@@ -227,8 +251,8 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
     expect(raw.slice(0, 8)).toBe("%PDF-1.4");
     expect(raw).toContain("TAX INVOICE");
     expect(raw).toContain("e-Way Bill");
-    expect(raw).toContain("TEST-EWB-001");
-    expect(raw).toContain("TEST-IRN-001");
+    expect(raw).toContain(st.body.ewayBillNumber as string);
+    expect(raw).toContain(st.body.irn as string);
     expect(raw).toContain("INV-DEMO-001");
     expect(raw).toContain("MOCK");
     expect(raw).toContain("Legally Valid: NO");
@@ -248,8 +272,8 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
       .send({ invoiceId: b.invoiceId, dispatch: DISPATCH });
     expect(ra.status).toBe(201);
     expect(rb.status).toBe(201);
-    expect(ra.body.ewayBillNumber).toMatch(/^TEST-EWB-/);
-    expect(rb.body.ewayBillNumber).toMatch(/^TEST-EWB-/);
+    expect(ra.body.ewayBillNumber).toMatch(/^\d{12}$/);
+    expect(rb.body.ewayBillNumber).toMatch(/^\d{12}$/);
     expect(ra.body.ewayBillNumber).not.toBe(rb.body.ewayBillNumber);
     expect(ra.body.dispatchStatus).toBe("DISPATCH_RELEASED");
     expect(ra.body.inventoryStatus).toBe("INVENTORY_DEDUCTED");
@@ -340,7 +364,7 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
       .send({ invoiceId, mockMode: "SUCCESS" });
     expect(retry.status).toBe(200);
     expect(retry.body.ewayBillStatus).toBe("EWB_GENERATED");
-    expect(retry.body.ewayBillNumber).toMatch(/^TEST-EWB-/);
+    expect(retry.body.ewayBillNumber).toMatch(/^\d{12}$/);
     expect(retry.body.dispatchStatus).toBe("DISPATCH_RELEASED");
     expect(retry.body.inventoryStatus).toBe("INVENTORY_DEDUCTED");
   });
@@ -519,14 +543,40 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
     }
   });
 
-  it("seed creates one-click dispatch-ready invoices; reseed never duplicates", async () => {
+  it("seed creates posted invoices with no hardcoded IRN/EWB; IRN then EWB generate through the flow", async () => {
     const seed = await request(app)
       .post("/api/integrations/tally/ewaybill/seed")
       .set("Authorization", `Bearer ${user.token}`)
       .send({});
     expect(seed.status).toBe(201);
     expect(seed.body.invoices).toHaveLength(2);
-    const firstId = (seed.body.invoices as Array<{ id: string }>)[0].id as string;
+    // Nothing hardcoded: seeded rows carry no TEST-IRN-*/TEST-EWB-* values.
+    // (INV-DEMO-001 may already hold a flow-generated IRN from the test above —
+    // the reseed repair preserves it; INV-DEMO-002 is still untouched.)
+    const byNumber = Object.fromEntries(
+      (seed.body.invoices as Array<{ invoice_number: string; irn: string | null; irnStatus: string; ewayBillStatus: string }>).map(
+        (i) => [i.invoice_number, i]
+      )
+    );
+    for (const inv of Object.values(byNumber)) {
+      expect(inv.irn == null || /^[0-9A-F]{64}$/.test(inv.irn)).toBe(true);
+    }
+    expect(byNumber["INV-DEMO-002"].irn).toBeNull();
+    expect(byNumber["INV-DEMO-002"].irnStatus).toBe("IRN_PENDING");
+    expect(byNumber["INV-DEMO-002"].ewayBillStatus).toBe("EWB_PENDING");
+    expect(seed.body.nextSteps).toHaveLength(3);
+    // Exercise the flow on INV-DEMO-002 (untouched by earlier tests).
+    const firstId = (seed.body.invoices as Array<{ id: string; invoice_number: string }>).find(
+      (i) => i.invoice_number === "INV-DEMO-002"
+    )!.id;
+
+    // IRN is generated (per-invoice hash), then the EWB mints a random number.
+    const irnRes = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: firstId });
+    expect(irnRes.status).toBe(201);
+    expect(irnRes.body.irn).toMatch(/^[0-9A-F]{64}$/);
 
     // No dispatch needed — the seed carries the snapshot.
     const res = await request(app)
@@ -535,14 +585,103 @@ describe("Phase 6: E-way bill generation (mock adapter)", () => {
       .send({ invoiceId: firstId });
     expect([200, 201]).toContain(res.status);
     expect(res.body.ewayBillStatus).toBe("EWB_GENERATED");
+    expect(res.body.ewayBillNumber).toMatch(/^\d{12}$/);
 
-    // Reseeding repairs state without duplicating invoice numbers.
+    // Reseeding repairs gaps without duplicating invoice numbers or
+    // clobbering generated IRN/EWB state.
     const again = await request(app)
       .post("/api/integrations/tally/ewaybill/seed")
       .set("Authorization", `Bearer ${user.token}`)
       .send({});
     expect(again.body.created).toBe(0);
     expect(again.body.skipped).toBe(2);
+    const kept = (again.body.invoices as Array<{ invoice_number: string; irn: string | null }>).find(
+      (i) => i.invoice_number === "INV-DEMO-002"
+    )!;
+    expect(kept.irn).toBe(irnRes.body.irn);
+  });
+
+  it("fresh flow: new customers + OPEN invoices → simulate-post → IRN → random EWB (single transaction)", async () => {
+    const seed = await request(app)
+      .post("/api/integrations/tally/ewaybill/seed-fresh")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({});
+    expect(seed.status).toBe(201);
+    expect(seed.body.created).toBe(3);
+    expect(seed.body.invoices).toHaveLength(3);
+    const flow = (seed.body.invoices as Array<{ id: string; invoice_number: string; status: string }>).find(
+      (i) => i.invoice_number === "INV-FLOW-001"
+    )!;
+    expect(flow.status).toBe("open");
+
+    // Reseed is a no-op for existing numbers.
+    const again = await request(app)
+      .post("/api/integrations/tally/ewaybill/seed-fresh")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({});
+    expect(again.body.created).toBe(0);
+    expect(again.body.skipped).toBe(3);
+
+    // 1. Push to Tally — simulated here (no live connector in test).
+    const posted = await request(app)
+      .post("/api/integrations/tally/ewaybill/simulate-post")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow.id });
+    expect(posted.status).toBe(200);
+    expect(posted.body.status).toBe("COMPLETED");
+    expect(posted.body.tallyReference).toBe("INV-FLOW-001");
+    expect(posted.body.simulated).toBe(true);
+
+    // Posting twice changes nothing.
+    const repost = await request(app)
+      .post("/api/integrations/tally/ewaybill/simulate-post")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow.id });
+    expect(repost.body.tallyVoucherNumber).toBe(posted.body.tallyVoucherNumber);
+
+    // 2. IRN generates through the mock IRP (nothing hardcoded).
+    const irnRes = await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow.id });
+    expect(irnRes.status).toBe(201);
+    expect(irnRes.body.irn).toMatch(/^[0-9A-F]{64}$/);
+
+    // 3. EWB mints a fresh random 12-digit number (only the vehicle is sent —
+    // the rest comes from the persisted dispatch snapshot).
+    const ewbRes = await request(app)
+      .post("/api/integrations/tally/ewaybill/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow.id, dispatch: { vehicleNumber: "GJ01XY9876" } });
+    expect(ewbRes.status).toBe(201);
+    expect(ewbRes.body.ewayBillNumber).toMatch(/^\d{12}$/);
+    expect(ewbRes.body.ewayBillStatus).toBe("EWB_GENERATED");
+    expect(ewbRes.body.dispatchStatus).toBe("DISPATCH_RELEASED");
+    expect(ewbRes.body.inventoryStatus).toBe("INVENTORY_DEDUCTED");
+    expect(ewbRes.body.generatedDate).toBe(today());
+
+    // 4. A second transaction mints a DIFFERENT number — nothing is reused.
+    const flow2 = (seed.body.invoices as Array<{ id: string; invoice_number: string }>).find(
+      (i) => i.invoice_number === "INV-FLOW-003"
+    )!;
+    await request(app)
+      .post("/api/integrations/tally/ewaybill/simulate-post")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow2.id });
+    await request(app)
+      .post("/api/integrations/tally/irn/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow2.id });
+    const ewb2 = await request(app)
+      .post("/api/integrations/tally/ewaybill/request")
+      .set("Authorization", `Bearer ${user.token}`)
+      .send({ invoiceId: flow2.id, dispatch: { vehicleNumber: "DL08AB1234" } });
+    expect(ewb2.status).toBe(201);
+    expect(ewb2.body.ewayBillNumber).toMatch(/^\d{12}$/);
+    expect(ewb2.body.ewayBillNumber).not.toBe(ewbRes.body.ewayBillNumber);
+    // 1400 km → 7 days validity from today.
+    const plus7 = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    expect(ewb2.body.validUntil).toBe(plus7);
   });
 
   it("target flow: queue REQUEST_EWAYBILL → connector poll → ack → EWB_GENERATED", async () => {
