@@ -1,17 +1,18 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { toast } from "sonner";
-import { fmtMoney, type Customer } from "@/lib/ledger";
+import { fmtMoney, dedupeCustomers, sortByName, normName, type Customer } from "@/lib/ledger";
 import { Trash2, TrendingUp } from "lucide-react";
 
 export function CustomersPanel() {
   const qc = useQueryClient();
   const [name, setName] = useState("");
+  const [search, setSearch] = useState("");
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -52,12 +53,31 @@ export function CustomersPanel() {
     onError: (e: Error) => toast.error(e.message),
   });
 
+  // Exact, duplicate-free, A→Z arrangement with search.
+  const visibleCustomers = useMemo(() => {
+    const q = normName(search);
+    const unique = dedupeCustomers(customers);
+    const filtered = q ? unique.filter((c) => normName(c.name).includes(q)) : unique;
+    return sortByName(filtered);
+  }, [customers, search]);
+
+  const totals = useMemo(
+    () => ({
+      count: visibleCustomers.length,
+      outstanding: visibleCustomers.reduce((s, c) => s + Number((c as { outstanding_balance: number }).outstanding_balance || 0), 0),
+    }),
+    [visibleCustomers]
+  );
+
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <TrendingUp className="h-5 w-5" />
           Customers
+          <span className="text-xs font-normal text-muted-foreground">
+            {totals.count} unique · {fmtMoney(totals.outstanding)} outstanding
+          </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
@@ -65,10 +85,11 @@ export function CustomersPanel() {
           <Input placeholder="Customer name" value={name} onChange={(e) => setName(e.target.value)} />
           <Button type="submit" disabled={add.isPending}>Add</Button>
         </form>
-        <div className="overflow-x-auto">
+        <Input placeholder="Search customers…" value={search} onChange={(e) => setSearch(e.target.value)} className="max-w-64" />
+        <div className="overflow-x-auto rounded-lg border">
           <Table>
             <TableHeader>
-              <TableRow>
+              <TableRow className="bg-muted/50">
                 <TableHead>Name</TableHead>
                 <TableHead className="text-right">Avg days</TableHead>
                 <TableHead className="text-right">Median days</TableHead>
@@ -81,11 +102,11 @@ export function CustomersPanel() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {customers.length === 0 ? (
+              {visibleCustomers.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="text-center text-sm text-muted-foreground">No customers yet</TableCell>
+                  <TableCell colSpan={9} className="py-8 text-center text-sm text-muted-foreground">No customers yet{search.trim() ? " match this search" : ""}</TableCell>
                 </TableRow>
-              ) : customers.map((c) => {
+              ) : visibleCustomers.map((c) => {
                 const s = stats[c.id];
                 return (
                   <TableRow key={c.id}>

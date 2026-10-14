@@ -11,7 +11,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
-import { fmtMoney, daysBetween, type Customer, type Invoice } from "@/lib/ledger";
+import { fmtMoney, fmtDate, dedupeInvoices, sortInvoicesByDue, type Customer, type Invoice } from "@/lib/ledger";
 
 export function ApplyPaymentPanel() {
   const qc = useQueryClient();
@@ -33,7 +33,7 @@ export function ApplyPaymentPanel() {
     },
   });
 
-  const { data: openInvoices = [] } = useQuery({
+  const { data: openInvoicesRaw = [] } = useQuery({
     queryKey: ["open-invoices", customerId, paymentDate],
     enabled: !!customerId && !!paymentDate && !autoFifo,
     queryFn: async () => {
@@ -42,7 +42,7 @@ export function ApplyPaymentPanel() {
     },
   });
 
-  const { data: allOpenInvoices = [] } = useQuery({
+  const { data: allOpenInvoicesRaw = [] } = useQuery({
     queryKey: ["open-invoices-all", customerId],
     enabled: !!customerId && autoFifo,
     queryFn: async () => {
@@ -59,6 +59,15 @@ export function ApplyPaymentPanel() {
       return res.remaining;
     },
   });
+
+  const openInvoices = useMemo(
+    () => sortInvoicesByDue(dedupeInvoices(openInvoicesRaw)),
+    [openInvoicesRaw]
+  );
+  const allOpenInvoices = useMemo(
+    () => sortInvoicesByDue(dedupeInvoices(allOpenInvoicesRaw)),
+    [allOpenInvoicesRaw]
+  );
 
   const paymentAmount = parseFloat(amount) || 0;
   const availableAmount = paymentAmount + (useBalance ? previousRemaining : 0);
@@ -343,10 +352,10 @@ export function ApplyPaymentPanel() {
                       return (
                         <TableRow key={inv.id}>
                           <TableCell className="font-medium">{inv.invoice_number}</TableCell>
-                          <TableCell>{inv.issue_date}</TableCell>
+                          <TableCell className="whitespace-nowrap">{fmtDate(inv.issue_date)}</TableCell>
                           <TableCell>
                             <div className="flex items-center gap-2">
-                              {inv.due_date}
+                              {fmtDate(inv.due_date)}
                               {isOverdue(inv.due_date) && <Badge variant="destructive" className="text-xs">overdue</Badge>}
                             </div>
                           </TableCell>
@@ -411,10 +420,10 @@ export function ApplyPaymentPanel() {
                           <Checkbox checked={checked} onCheckedChange={() => toggle(inv.id)} />
                         </TableCell>
                         <TableCell className="font-medium">{inv.invoice_number}</TableCell>
-                        <TableCell>{inv.issue_date}</TableCell>
+                        <TableCell className="whitespace-nowrap">{fmtDate(inv.issue_date)}</TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2">
-                            {inv.due_date}
+                            {fmtDate(inv.due_date)}
                             {isOverdue(inv.due_date) && <Badge variant="destructive" className="text-xs">overdue</Badge>}
                           </div>
                         </TableCell>

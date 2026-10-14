@@ -10,10 +10,13 @@ const API_BASE = import.meta.env.VITE_URL
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /** Full parsed error body (e.g. IRN { missingField, action, failures }). */
+  details?: any;
+  constructor(message: string, status: number, details?: any) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -38,7 +41,11 @@ async function request<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new ApiError(body.error || res.statusText, res.status);
+    const message =
+      typeof body?.error === "string"
+        ? body.error
+        : body?.error?.message || res.statusText;
+    throw new ApiError(message, res.status, body);
   }
 
   return res.json();
@@ -559,4 +566,72 @@ export const api = {
       method: "POST",
       body: JSON.stringify({}),
     }),
+
+  // ── Phase 5: IRN generation (mock IRP — test results only) ──
+  seedIrnDemo: () =>
+    request<{
+      created: number;
+      skipped: number;
+      invoices: Array<{
+        id: string;
+        invoice_number: string;
+        tally_voucher_number: string | null;
+        tally_reference: string | null;
+        irnStatus: string;
+      }>;
+    }>("/integrations/tally/irn/seed", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  requestIrn: (data: { invoiceId: string; compliance?: Record<string, unknown>; mockMode?: string }) =>
+    request<{
+      whizunikInvoiceId: string;
+      whizunikInvoiceNumber: string;
+      tallyVoucherNumber: string | null;
+      tallyReference: string | null;
+      irn: string | null;
+      acknowledgementNumber: string | null;
+      acknowledgementDate: string | null;
+      irnStatus: string;
+      irnRequestId: string | null;
+      irnGeneratedAt: string | null;
+      duplicate: boolean;
+      testMode: boolean;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    }>("/integrations/tally/irn/request", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  retryIrn: (data: { invoiceId: string; mockMode?: string }) =>
+    request<{
+      whizunikInvoiceId: string;
+      irn: string | null;
+      irnStatus: string;
+      duplicate: boolean;
+      testMode: boolean;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    }>("/integrations/tally/irn/retry", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getIrnStatus: (invoiceId: string) =>
+    request<{
+      whizunikInvoiceId: string;
+      whizunikInvoiceNumber: string;
+      tallyVoucherNumber: string | null;
+      tallyReference: string | null;
+      irn: string | null;
+      acknowledgementNumber: string | null;
+      acknowledgementDate: string | null;
+      irnStatus: string;
+      invoiceStatus: string;
+      errorCode: string | null;
+      errorMessage: string | null;
+      testMode: boolean;
+    }>(`/integrations/tally/irn/status/${encodeURIComponent(invoiceId)}`),
 };

@@ -1,11 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { fmtMoney, type Customer, type Payment, type Allocation, type Invoice } from "@/lib/ledger";
+import { fmtMoney, fmtDate, dedupeBy, type Customer, type Payment, type Allocation, type Invoice } from "@/lib/ledger";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 
@@ -63,13 +63,40 @@ export function PaymentsPanel() {
   const cName = (id: string) => customers.find((c) => c.id === id)?.name ?? "\u2014";
   const iNum = (id: string) => invoices.find((i) => i.id === id)?.invoice_number ?? "\u2014";
 
+  // Exact, duplicate-free, newest-first arrangement with totals.
+  const visiblePayments = useMemo(() => {
+    const unique = dedupeBy(payments, (pp) => String(pp.id));
+    return [...unique].sort((a, b) => {
+      const d = String(b.payment_date || "").localeCompare(String(a.payment_date || ""));
+      if (d !== 0) return d;
+      return String((b as any).created_at || "").localeCompare(String((a as any).created_at || ""));
+    });
+  }, [payments]);
+
+  const totals = useMemo(
+    () => ({
+      count: visiblePayments.length,
+      amount: visiblePayments.reduce((s, pp) => s + Number(pp.amount || 0), 0),
+      remaining: visiblePayments.reduce((s, pp) => s + Number(pp.remaining || 0), 0),
+    }),
+    [visiblePayments]
+  );
+
   return (
     <Card>
-      <CardHeader><CardTitle>Payment history</CardTitle></CardHeader>
+      <CardHeader>
+        <div className="flex flex-wrap items-center gap-3">
+          <CardTitle>Payment history</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            {totals.count} payment{totals.count !== 1 ? "s" : ""} - {fmtMoney(totals.amount)} received - {fmtMoney(totals.remaining)} unapplied
+          </span>
+        </div>
+      </CardHeader>
       <CardContent>
+        <div className="overflow-x-auto rounded-lg border">
         <Table>
           <TableHeader>
-            <TableRow>
+            <TableRow className="bg-muted/50">
               <TableHead>Date</TableHead>
               <TableHead>Customer</TableHead>
               <TableHead className="text-right">Amount</TableHead>
@@ -80,16 +107,16 @@ export function PaymentsPanel() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {payments.length === 0 ? (
+            {visiblePayments.length === 0 ? (
               <TableRow><TableCell colSpan={7} className="text-center text-sm text-muted-foreground">No payments yet</TableCell></TableRow>
-            ) : payments.map((p) => {
+            ) : visiblePayments.map((p) => {
               const allocs = allocations.filter((a) => a.payment_id === p.id);
               return (
                 <TableRow key={p.id}>
-                  <TableCell>{p.payment_date}</TableCell>
+                  <TableCell className="whitespace-nowrap">{fmtDate(p.payment_date)}</TableCell>
                   <TableCell>{cName(p.customer_id)}</TableCell>
-                  <TableCell className="text-right">{fmtMoney(Number(p.amount))}</TableCell>
-                  <TableCell className="text-right">{fmtMoney(Number(p.applied_amount))}</TableCell>
+                  <TableCell className="text-right tabular-nums">{fmtMoney(Number(p.amount))}</TableCell>
+                  <TableCell className="text-right tabular-nums">{fmtMoney(Number(p.applied_amount))}</TableCell>
                   <TableCell className="text-right">
                     {Number(p.remaining) > 0
                       ? <Badge className="bg-warning text-warning-foreground hover:bg-warning">{fmtMoney(Number(p.remaining))}</Badge>
@@ -171,6 +198,8 @@ export function PaymentsPanel() {
             })}
           </TableBody>
         </Table>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">Newest first - duplicates hidden automatically.</p>
       </CardContent>
     </Card>
   );

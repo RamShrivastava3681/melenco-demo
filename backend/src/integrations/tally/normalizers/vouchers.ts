@@ -36,22 +36,31 @@ function dataOf(ctx: NormalizeContext): Record<string, any> {
 
 /** Resolve or create the customer for a party-ledger name. */
 async function upsertCustomer(userId: string, name: string): Promise<string> {
-  const existing = await findCustomerByName(userId, name);
+  const clean = String(name ?? "").trim().replace(/\s+/g, " ");
+  if (!clean) throw new ApiError("TALLY_DATA_INVALID", "Sales voucher is missing partyName");
+  const existing = await findCustomerByName(userId, clean);
   if (existing) return existing.id as string;
   try {
-    const created = await createCustomer(userId, name);
+    const created = await createCustomer(userId, clean);
     return created.id as string;
   } catch {
-    const again = await findCustomerByName(userId, name);
+    const again = await findCustomerByName(userId, clean);
     return again!.id as string;
   }
 }
 
 async function upsertSupplier(userId: string, name: string): Promise<string> {
-  const existing = await findSupplierByName(userId, name);
+  const clean = String(name ?? "").trim().replace(/\s+/g, " ");
+  if (!clean) throw new ApiError("TALLY_DATA_INVALID", "Purchase voucher is missing partyName");
+  const existing = await findSupplierByName(userId, clean);
   if (existing) return existing.id as string;
-  const created = await createSupplier(userId, name);
-  return created.id as string;
+  try {
+    const created = await createSupplier(userId, clean);
+    return created.id as string;
+  } catch {
+    const again = await findSupplierByName(userId, clean);
+    return again!.id as string;
+  }
 }
 
 /** Valid ISO-ish date guard. */
@@ -145,13 +154,14 @@ export const VOUCHER_TARGETS: Record<string, VoucherTarget> = {
       const customerId = await upsertCustomer(ctx.userId, party.trim());
 
       // Idempotency beyond source records: same customer + date + amount + note tag
+      // (voucher number trimmed + upper-cased in the note so "rct-1" and "RCT-1" match).
       const note = `Tally ${ctx.record.voucherType || "Receipt"} ${voucherNumber}`;
       const existingPayment = (await listPayments(ctx.userId)).find(
         (p) =>
           p.customer_id === customerId &&
-          p.payment_date === paymentDate &&
-          Number(p.amount) === Number(amount) &&
-          p.note === note
+          String(p.payment_date || "").slice(0, 10) === paymentDate &&
+          Math.abs(Number(p.amount) - Number(amount)) < 0.005 &&
+          String(p.note || "").trim().toLowerCase() === note.trim().toLowerCase()
       );
       if (existingPayment) {
         return { table: "payments", recordId: existingPayment.id as string };

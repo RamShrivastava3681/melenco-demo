@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Loader2, RefreshCw, Database, FileJson } from "lucide-react";
+import { dedupeBy, fmtDate, fmtEntity } from "@/lib/ledger";
 
 export function TallyDataPanel() {
   const [entityType, setEntityType] = useState<string>("");
@@ -33,8 +34,39 @@ export function TallyDataPanel() {
     refetchOnWindowFocus: false,
   });
 
-  const batches = batchesQuery.data?.batches ?? [];
-  const records = recordsQuery.data?.records ?? [];
+  // Exact, duplicate-free, newest-first arrangement (client-side safety net
+  // over the server dedupe, so replays never double-show).
+  const batches = useMemo(() => {
+    const rows = batchesQuery.data?.batches ?? [];
+    const unique = dedupeBy(rows, (b: any) => String(b.batch_id ?? b.request_id));
+    return [...unique].sort((a: any, b: any) =>
+      String(b.created_at || "").localeCompare(String(a.created_at || ""))
+    );
+  }, [batchesQuery.data]);
+
+  const records = useMemo(() => {
+    const rows = recordsQuery.data?.records ?? [];
+    const unique = dedupeBy(rows, (r: any) => String(r.id));
+    return [...unique].sort((a: any, b: any) => {
+      const d = String(b.source_voucher_date || b.created_at || "").localeCompare(
+        String(a.source_voucher_date || a.created_at || "")
+      );
+      if (d !== 0) return d;
+      return String(a.source_voucher_number || "").localeCompare(String(b.source_voucher_number || ""));
+    });
+  }, [recordsQuery.data]);
+
+  const [recordSearch, setRecordSearch] = useState("");
+  const visibleRecords = useMemo(() => {
+    const q = recordSearch.trim().toLowerCase();
+    if (!q) return records;
+    return records.filter(
+      (r: any) =>
+        String(r.source_voucher_number || "").toLowerCase().includes(q) ||
+        String(r.source_object_id || "").toLowerCase().includes(q) ||
+        String(r.entity_type || "").toLowerCase().includes(q)
+    );
+  }, [records, recordSearch]);
 
   const refresh = () => {
     setOffset(0);
@@ -93,7 +125,7 @@ export function TallyDataPanel() {
               "day_book",
             ].map((e) => (
               <option key={e} value={e}>
-                {e}
+                {fmtEntity(e)}
               </option>
             ))}
           </select>
@@ -112,6 +144,13 @@ export function TallyDataPanel() {
               </option>
             ))}
           </select>
+          <span className="text-muted-foreground">Search records:</span>
+          <input
+            value={recordSearch}
+            onChange={(e) => setRecordSearch(e.target.value)}
+            placeholder="Voucher #, ID, entity…"
+            className="rounded-md border bg-background px-2 py-1 text-xs outline-none placeholder:text-muted-foreground"
+          />
         </div>
 
         {/* Batches */}
@@ -119,7 +158,7 @@ export function TallyDataPanel() {
           <h4 className="text-sm font-medium">
             Batches{" "}
             <span className="text-xs font-normal text-muted-foreground">
-              ({batches.length} recent)
+              ({batches.length} unique, newest first)
             </span>
           </h4>
           {batchesQuery.isLoading ? (
@@ -152,14 +191,14 @@ export function TallyDataPanel() {
                       </td>
                       <td className="px-3 py-1.5">
                         <Badge variant="secondary" className="font-mono text-[10px]">
-                          {b.entity_type}
+                          {fmtEntity(b.entity_type)}
                         </Badge>
                       </td>
                       <td className="px-3 py-1.5">{b.received_count}</td>
                       <td className="px-3 py-1.5 truncate" title={b.connector_id}>
                         {String(b.connector_id).slice(0, 16)}…
                       </td>
-                      <td className="px-3 py-1.5 whitespace-nowrap">{b.created_at}</td>
+                      <td className="px-3 py-1.5 whitespace-nowrap">{fmtDate(String(b.created_at).slice(0, 10))}</td>
                       <td className="px-3 py-1.5">{b.duplicate ? "yes" : "—"}</td>
                     </tr>
                   ))}
@@ -175,7 +214,7 @@ export function TallyDataPanel() {
             <FileJson className="h-4 w-4" />
             Records
             <span className="text-xs font-normal text-muted-foreground">
-              (raw JSON exactly as sent by the connector)
+              (unique records, newest first - raw JSON exactly as sent)
             </span>
           </h4>
           {recordsQuery.isLoading ? (
@@ -188,7 +227,7 @@ export function TallyDataPanel() {
             </p>
           ) : (
             <div className="space-y-2">
-              {records.map((r) => {
+              {visibleRecords.map((r) => {
                 const open = expandedId === r.id;
                 return (
                   <div key={r.id} className="rounded-lg border">
@@ -197,13 +236,13 @@ export function TallyDataPanel() {
                       onClick={() => setExpandedId(open ? null : r.id)}
                     >
                       <Badge variant="secondary" className="font-mono text-[10px]">
-                        {r.entity_type}
+                        {fmtEntity(r.entity_type)}
                       </Badge>
                       <span className="font-mono text-muted-foreground">
                         {r.source_voucher_number || r.source_object_id || r.id.slice(0, 8)}
                       </span>
                       {r.source_voucher_date && (
-                        <span className="text-muted-foreground">{r.source_voucher_date}</span>
+                        <span className="text-muted-foreground">{fmtDate(r.source_voucher_date)}</span>
                       )}
                       <span className="ml-auto font-mono text-muted-foreground">
                         batch {String(r.batch_id).slice(0, 12)}… · {open ? "hide JSON" : "view JSON"}
@@ -227,12 +266,12 @@ export function TallyDataPanel() {
                   ← Prev
                 </Button>
                 <span className="text-muted-foreground">
-                  offset {offset} · showing {records.length}
+                  offset {offset} · showing {visibleRecords.length} unique
                 </span>
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={records.length < limit}
+                  disabled={visibleRecords.length < limit}
                   onClick={() => setOffset(offset + limit)}
                 >
                   Next →

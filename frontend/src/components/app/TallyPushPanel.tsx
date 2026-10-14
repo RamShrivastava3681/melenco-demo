@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Loader2, RefreshCw, Send, Trash2, Sparkles, Upload } from "lucide-react";
 import { toast } from "sonner";
+import { dedupeBy, fmtDate } from "@/lib/ledger";
 
 const VOUCHER_TYPES = [
   "SALES",
@@ -63,15 +64,36 @@ export function TallyPushPanel() {
     queryFn: () => api.getPushVouchers(),
     refetchOnWindowFocus: false,
   });
-  const vouchers = vouchersQuery.data?.vouchers ?? [];
+  // Exact, duplicate-free, properly arranged views.
+  const vouchers = useMemo(() => {
+    const rows = vouchersQuery.data?.vouchers ?? [];
+    const unique = dedupeBy(rows, (v: any) => String(v.id));
+    return [...unique].sort((a: any, b: any) => {
+      const d = String(a.voucherDate || "").localeCompare(String(b.voucherDate || ""));
+      if (d !== 0) return d;
+      return String(a.voucherNumber || "").toLowerCase().localeCompare(String(b.voucherNumber || "").toLowerCase());
+    });
+  }, [vouchersQuery.data]);
 
   const stockQuery = useQuery({
     queryKey: ["push-stock"],
     queryFn: () => api.getPushStock(),
     refetchOnWindowFocus: false,
   });
-  const stockItems = stockQuery.data?.stockItems ?? [];
-  const masters = stockQuery.data?.masters ?? [];
+  const stockItems = useMemo(() => {
+    const rows = stockQuery.data?.stockItems ?? [];
+    const unique = dedupeBy(rows, (s: any) => String(s.id));
+    return [...unique].sort((a: any, b: any) =>
+      String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase())
+    );
+  }, [stockQuery.data]);
+  const masters = useMemo(() => {
+    const rows = stockQuery.data?.masters ?? [];
+    const unique = dedupeBy(rows, (m: any) => String(m.id));
+    return [...unique].sort((a: any, b: any) =>
+      String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase())
+    );
+  }, [stockQuery.data]);
 
   const commandsQuery = useQuery({
     queryKey: ["tally-commands"],
@@ -79,7 +101,13 @@ export function TallyPushPanel() {
     refetchInterval: 15_000,
     refetchOnWindowFocus: false,
   });
-  const commands = commandsQuery.data?.commands ?? [];
+  const commands = useMemo(() => {
+    const rows = commandsQuery.data?.commands ?? [];
+    const unique = dedupeBy(rows, (c: any) => String(c.id));
+    return [...unique].sort((a: any, b: any) =>
+      String(b.createdAt || "").localeCompare(String(a.createdAt || ""))
+    );
+  }, [commandsQuery.data]);
 
   const invalidate = () => {
     vouchersQuery.refetch();
@@ -284,7 +312,7 @@ export function TallyPushPanel() {
                         </td>
                         <td className="px-3 py-1.5"><Badge variant="secondary" className="font-mono text-[10px]">{v.voucherType}</Badge></td>
                         <td className="px-3 py-1.5 font-mono font-medium">{v.voucherNumber}</td>
-                        <td className="px-3 py-1.5">{v.voucherDate}</td>
+                        <td className="px-3 py-1.5 whitespace-nowrap">{fmtDate(v.voucherDate)}</td>
                         <td className="px-3 py-1.5">{v.partyName}</td>
                         <td className="px-3 py-1.5 text-right">₹{Number(v.amount).toLocaleString("en-IN")}</td>
                         <td className="px-3 py-1.5"><Badge variant={v.status === "DRAFT" ? "outline" : "default"}>{v.status}</Badge></td>
@@ -428,7 +456,7 @@ export function TallyPushPanel() {
                       <td className="px-3 py-1.5">{c.command}</td>
                       <td className="px-3 py-1.5"><Badge variant="outline">{c.status}</Badge></td>
                       <td className="px-3 py-1.5">{c.voucherCount ?? "—"}</td>
-                      <td className="px-3 py-1.5">{c.createdAt}</td>
+                      <td className="px-3 py-1.5 whitespace-nowrap">{fmtDate(String(c.createdAt).slice(0, 10))}</td>
                     </tr>
                   ))}
                 </tbody>

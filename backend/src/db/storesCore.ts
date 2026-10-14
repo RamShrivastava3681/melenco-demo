@@ -68,7 +68,15 @@ export async function getUserByEmail(email: string): Promise<UserItem | undefine
   return found[0] as UserItem | undefined;
 }
 
-// --- Generic user-scoped helpers ---
+// --- Normalization helpers (single source of truth for dedupe) ---
+/** Trim + case-fold a display name so " Acme " and "ACME" are the same customer. */
+export function normName(v: unknown): string {
+  return String(v ?? "").trim().toLowerCase();
+}
+/** Trim an invoice/voucher number; compare case-insensitively to avoid dups. */
+export function normInvoiceNumber(v: unknown): string {
+  return String(v ?? "").trim().toLowerCase();
+}
 async function listByUserAndPrefix(userId: string, prefix: string): Promise<DbItem[]> {
   return dbQueryPk(userPk(userId), prefix);
 }
@@ -94,8 +102,9 @@ export async function getCustomer(userId: string, id: string): Promise<DbItem | 
 
 export async function findCustomerByName(userId: string, name: string): Promise<DbItem | undefined> {
   const rows = await listByUserAndPrefix(userId, "CUSTOMER#");
-  const want = name.toLowerCase();
-  return rows.find((r) => String(r.name || "").toLowerCase() === want);
+  const want = normName(name);
+  if (!want) return undefined;
+  return rows.find((r) => normName(r.name) === want);
 }
 
 export async function findCustomerByNameCI(userId: string, name: string): Promise<DbItem | undefined> {
@@ -103,7 +112,11 @@ export async function findCustomerByNameCI(userId: string, name: string): Promis
 }
 
 export async function createCustomer(userId: string, name: string, extra?: Record<string, any>): Promise<DbItem> {
-  const clash = await findCustomerByName(userId, name);
+  const clean = String(name ?? "").trim();
+  if (!clean) {
+    throw new Error("Name is required");
+  }
+  const clash = await findCustomerByName(userId, clean);
   if (clash) {
     const err: any = new Error("UNIQUE constraint failed: customers.user_id, name");
     throw err;
@@ -115,7 +128,7 @@ export async function createCustomer(userId: string, name: string, extra?: Recor
     recordType: "CUSTOMER",
     id,
     user_id: userId,
-    name,
+    name: clean,
     created_at: nowIso(),
     version: 1,
     ...(extra || {}),
@@ -130,7 +143,9 @@ export async function deleteCustomer(userId: string, id: string): Promise<void> 
 
 // --- Suppliers ---
 export async function listSuppliers(userId: string): Promise<DbItem[]> {
-  return listByUserAndPrefix(userId, "SUPPLIER#");
+  const rows = await listByUserAndPrefix(userId, "SUPPLIER#");
+  rows.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  return rows;
 }
 
 export async function getSupplier(userId: string, id: string): Promise<DbItem | undefined> {
@@ -139,11 +154,19 @@ export async function getSupplier(userId: string, id: string): Promise<DbItem | 
 
 export async function findSupplierByName(userId: string, name: string): Promise<DbItem | undefined> {
   const rows = await listByUserAndPrefix(userId, "SUPPLIER#");
-  const want = name.toLowerCase();
-  return rows.find((r) => String(r.name || "").toLowerCase() === want);
+  const want = normName(name);
+  if (!want) return undefined;
+  return rows.find((r) => normName(r.name) === want);
 }
 
 export async function createSupplier(userId: string, name: string, extra?: Record<string, any>): Promise<DbItem> {
+  const clean = String(name ?? "").trim();
+  if (!clean) throw new Error("Name is required");
+  const clash = await findSupplierByName(userId, clean);
+  if (clash) {
+    const err: any = new Error("UNIQUE constraint failed: suppliers.user_id, name");
+    throw err;
+  }
   const id = uuidv4();
   const item: DbItem = {
     pk: userPk(userId),
@@ -151,7 +174,7 @@ export async function createSupplier(userId: string, name: string, extra?: Recor
     recordType: "SUPPLIER",
     id,
     user_id: userId,
-    name,
+    name: clean,
     created_at: nowIso(),
     version: 1,
     ...(extra || {}),
@@ -173,8 +196,9 @@ export async function getProduct(userId: string, id: string): Promise<DbItem | u
 
 export async function findProductByName(userId: string, name: string): Promise<DbItem | undefined> {
   const rows = await listByUserAndPrefix(userId, "PRODUCT#");
-  const want = name.toLowerCase();
-  return rows.find((r) => String(r.name || "").toLowerCase() === want);
+  const want = normName(name);
+  if (!want) return undefined;
+  return rows.find((r) => normName(r.name) === want);
 }
 
 export async function createProduct(userId: string, data: Record<string, any>): Promise<DbItem> {
@@ -203,10 +227,28 @@ export async function listInvoices(
   filters?: { customer_id?: string; status?: string; due_date_lte?: string }
 ): Promise<DbItem[]> {
   let rows = await listByUserAndPrefix(userId, "INVOICE#");
+  // Safety dedupe: same customer + same normalized invoice number kept once
+  // (oldest/first record wins, keeps the view exact even if legacy dups exist).
+  const seen = new Set<string>();
+  const deduped: DbItem[] = [];
+  for (const r of rows) {
+    const key = `${String(r.customer_id ?? "")}|${normInvoiceNumber(r.invoice_number)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(r);
+  }
+  rows = deduped;
   if (filters?.customer_id) rows = rows.filter((r) => r.customer_id === filters.customer_id);
   if (filters?.status) rows = rows.filter((r) => r.status === filters.status);
   if (filters?.due_date_lte) rows = rows.filter((r) => String(r.due_date || "") <= String(filters.due_date_lte));
-  rows.sort((a, b) => String(a.due_date || "").localeCompare(String(b.due_date || "")));
+  // Stable, view-friendly order: due date, then invoice number, then issue date.
+  rows.sort((a, b) => {
+    const d = String(a.due_date || "").localeCompare(String(b.due_date || ""));
+    if (d !== 0) return d;
+    const n = normInvoiceNumber(a.invoice_number).localeCompare(normInvoiceNumber(b.invoice_number));
+    if (n !== 0) return n;
+    return String(a.issue_date || "").localeCompare(String(b.issue_date || ""));
+  });
   return rows;
 }
 
@@ -225,11 +267,14 @@ export async function findInvoiceByNumber(
   invoiceNumber: string
 ): Promise<DbItem | undefined> {
   const rows = await listByUserAndPrefix(userId, "INVOICE#");
-  return rows.find((r) => r.customer_id === customerId && r.invoice_number === invoiceNumber);
+  const want = normInvoiceNumber(invoiceNumber);
+  if (!want) return undefined;
+  return rows.find((r) => r.customer_id === customerId && normInvoiceNumber(r.invoice_number) === want);
 }
 
 export async function createInvoice(userId: string, data: Record<string, any>): Promise<DbItem> {
   const id = data.id || uuidv4();
+  const cleanNumber = String(data.invoice_number ?? "").trim();
   const item: DbItem = {
     pk: userPk(userId),
     sk: invoiceSk(id),
@@ -238,6 +283,7 @@ export async function createInvoice(userId: string, data: Record<string, any>): 
     user_id: userId,
     created_at: nowIso(),
     ...data,
+    invoice_number: cleanNumber || data.invoice_number,
   };
   await dbPut(item);
   return item;
@@ -254,8 +300,21 @@ export async function deleteInvoice(userId: string, id: string): Promise<void> {
 // --- Payments ---
 export async function listPayments(userId: string): Promise<DbItem[]> {
   const rows = await listByUserAndPrefix(userId, "PAYMENT#");
-  rows.sort((a, b) => String(b.payment_date || "").localeCompare(String(a.payment_date || "")));
-  return rows;
+  // Dedupe identical rows by id (defensive: keeps newest-first order exact).
+  const seen = new Set<string>();
+  const unique = rows.filter((r) => {
+    const id = String(r.id ?? r.sk ?? "");
+    if (!id) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  unique.sort((a, b) => {
+    const d = String(b.payment_date || "").localeCompare(String(a.payment_date || ""));
+    if (d !== 0) return d;
+    return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+  });
+  return unique;
 }
 
 export async function getPayment(userId: string, id: string): Promise<DbItem | undefined> {
@@ -295,7 +354,9 @@ export async function updatePayment(userId: string, id: string, attrs: Record<st
 
 // --- Payment allocations ---
 export async function listAllocations(userId: string): Promise<DbItem[]> {
-  return listByUserAndPrefix(userId, "ALLOC#");
+  const rows = await listByUserAndPrefix(userId, "ALLOC#");
+  rows.sort((a, b) => String(a.applied_date || "").localeCompare(String(b.applied_date || "")));
+  return rows;
 }
 
 export async function listAllocationsForInvoice(userId: string, invoiceId: string): Promise<DbItem[]> {

@@ -400,7 +400,8 @@ export async function latestConnectorEvent(userId: string, event: string): Promi
 // --- Ledgers ---
 export async function findLedger(userId: string, companyId: string, name: string): Promise<DbItem | undefined> {
   const rows = await dbQueryPk(userPk(userId), "LEDGER#");
-  return rows.find((r) => r.company_id === companyId && r.name === name);
+  const want = String(name ?? "").trim().toLowerCase();
+  return rows.find((r) => r.company_id === companyId && String(r.name || "").trim().toLowerCase() === want);
 }
 
 export async function createLedger(data: Record<string, any>): Promise<DbItem> {
@@ -426,7 +427,8 @@ export async function updateLedger(row: DbItem, attrs: Record<string, any>): Pro
 // --- Purchase invoices ---
 export async function findPurchaseInvoice(userId: string, supplierId: string, invoiceNumber: string): Promise<DbItem | undefined> {
   const rows = await dbQueryPk(userPk(userId), "PINVOICE#");
-  return rows.find((r) => r.supplier_id === supplierId && r.invoice_number === invoiceNumber);
+  const want = String(invoiceNumber ?? "").trim().toLowerCase();
+  return rows.find((r) => r.supplier_id === supplierId && String(r.invoice_number || "").trim().toLowerCase() === want);
 }
 
 export async function createPurchaseInvoice(data: Record<string, any>): Promise<DbItem> {
@@ -460,7 +462,14 @@ export async function createVoucher(data: Record<string, any>): Promise<DbItem> 
 }
 
 export async function listVouchers(userId: string): Promise<DbItem[]> {
-  return dbQueryPk(userPk(userId), "VOUCHER#");
+  const rows = await dbQueryPk(userPk(userId), "VOUCHER#");
+  // Newest first, stable by voucher number — tidy display, no shuffling.
+  rows.sort((a, b) => {
+    const d = String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    if (d !== 0) return d;
+    return String(a.voucher_number || "").localeCompare(String(b.voucher_number || ""));
+  });
+  return rows;
 }
 
 // --- Reports ---
@@ -516,10 +525,18 @@ export async function getSyncCommandGlobal(id: string): Promise<DbItem | undefin
 
 export async function listPendingCommandsForConnector(connectorRowId: string, limit = 20): Promise<DbItem[]> {
   const rows = await dbScan(
-    (it) => it.recordType === "TALLY_COMMAND" && it.connector_id === connectorRowId && it.status === "PENDING"
+    (it) => it.recordType === "TALLY_COMMAND" && it.connector_id === connectorRowId && (it.status === "PENDING" || (it.status === "DELIVERED" && isLegacyCommandLeaseExpired(it)))
   );
   rows.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
   return rows.slice(0, limit);
+}
+
+/** Phase 4 §12 lease: DELIVERED-but-unacked legacy commands retry after 5 min. */
+export function isLegacyCommandLeaseExpired(row: DbItem): boolean {
+  const raw = (row.delivered_at as string) ?? (row.updated_at as string) ?? (row.created_at as string) ?? "";
+  const ts = Date.parse(String(raw));
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts >= 5 * 60 * 1000;
 }
 
 export async function updateSyncCommand(row: DbItem, attrs: Record<string, any>): Promise<DbItem | undefined> {

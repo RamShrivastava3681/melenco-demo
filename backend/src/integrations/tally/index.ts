@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import connectorRoutes from "./routes/connector.routes.js";
 import statusRoutes from "./routes/status.routes.js";
 import pushDataRoutes from "./routes/pushData.routes.js";
+import irnRoutes from "./routes/irn.routes.js";
 import whizunikRoutes from "./whizunik/routes.js";
 import { whizunikOpenApi } from "./whizunik/openapi.js";
 import { newRequestId } from "./utils/logger.js";
@@ -25,6 +26,7 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 // so paths like /connectors are not shadowed by connector auth middleware.
 router.use(statusRoutes);
 router.use(pushDataRoutes);
+router.use(irnRoutes);
 
 // WhizUnik Cloud API (exact desktop-connector spec: connect, token,
 // sync/batch, heartbeat, updates + admin pairing codes). Each handler only

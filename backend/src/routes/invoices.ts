@@ -18,9 +18,11 @@ router.use(requireAuth);
 // List invoices
 router.get("/", async (req: Request, res: Response) => {
   const { customer_id, status, due_date_lte } = req.query;
+  const statusFilter =
+    typeof status === "string" && status.trim().length > 0 ? (status as string) : undefined;
   const rows = await listInvoices(req.user!.userId, {
     customer_id: customer_id as string | undefined,
-    status: status === "open" || status === "closed" ? (status as string) : undefined,
+    status: statusFilter,
     due_date_lte: due_date_lte as string | undefined,
   });
   res.json({ invoices: rows });
@@ -42,6 +44,10 @@ router.post("/", async (req: Request, res: Response) => {
   const imported: any[] = [];
   const skipped: Array<{ invoice_number: string; customer_id: string; reason: string }> = [];
   const errors: Array<{ invoice_number: string; error: string }> = [];
+  // Intra-file dedupe: same customer + normalized number twice in one upload
+  // must import once and report the rest as skipped (exact, no duplicates).
+  const seenInFile = new Set<string>();
+  const normNum = (v: unknown) => String(v ?? "").trim().toLowerCase();
 
   try {
     for (const inv of invoiceList) {
@@ -53,12 +59,24 @@ router.post("/", async (req: Request, res: Response) => {
         continue;
       }
 
-      // Check if invoice already exists for this customer
-      const existing = await findInvoiceByNumber(userId, inv.customer_id, inv.invoice_number);
+      const cleanNumber = String(inv.invoice_number).trim();
+      const fileKey = `${String(inv.customer_id)}|${normNum(cleanNumber)}`;
+      if (seenInFile.has(fileKey)) {
+        skipped.push({
+          invoice_number: cleanNumber,
+          customer_id: inv.customer_id,
+          reason: "Duplicate in this file — already imported above",
+        });
+        continue;
+      }
+      seenInFile.add(fileKey);
+
+      // Check if invoice already exists for this customer (trimmed, case-insensitive)
+      const existing = await findInvoiceByNumber(userId, inv.customer_id, cleanNumber);
 
       if (existing) {
         skipped.push({
-          invoice_number: inv.invoice_number,
+          invoice_number: cleanNumber,
           customer_id: inv.customer_id,
           reason: "Already exists in the platform",
         });
@@ -67,12 +85,22 @@ router.post("/", async (req: Request, res: Response) => {
 
       const row = await createInvoice(userId, {
         customer_id: inv.customer_id,
-        invoice_number: inv.invoice_number,
+        invoice_number: cleanNumber,
         issue_date: inv.issue_date,
         due_date: inv.due_date,
         amount: inv.amount,
         balance: inv.amount,
         status: "open",
+        // Phase 4 single-line detail (optional; stored verbatim when supplied
+        // so /invoices/push can build the full PUSH_VOUCHERS command).
+        quantity: inv.quantity ?? inv.qty ?? null,
+        unit: inv.unit ?? inv.base_unit ?? null,
+        unit_price: inv.unit_price ?? inv.unitPrice ?? null,
+        gst_rate: inv.gst_rate ?? inv.gstRate ?? null,
+        sku_id: inv.sku_id ?? inv.skuId ?? null,
+        sku_code: inv.sku_code ?? inv.skuCode ?? null,
+        grand_total: inv.grand_total ?? inv.grandTotal ?? inv.amount,
+        version: inv.version ?? 1,
       });
       imported.push(row);
     }
@@ -127,10 +155,10 @@ router.get("/export", async (req: Request, res: Response) => {
   }
 
   const sorted = [...invoices].sort((a, b) => {
-    const ca = String(a.closed_date || "");
-    const cb = String(b.closed_date || "");
-    if (cb !== ca) return cb.localeCompare(ca);
-    return String(a.invoice_number || "").localeCompare(String(b.invoice_number || ""));
+    // Tidy, exact order: due date first, then invoice number (case-insensitive).
+    const d = String(a.due_date || "").localeCompare(String(b.due_date || ""));
+    if (d !== 0) return d;
+    return String(a.invoice_number || "").toLowerCase().localeCompare(String(b.invoice_number || "").toLowerCase());
   });
 
   for (const i of sorted) {
@@ -149,6 +177,17 @@ router.get("/export", async (req: Request, res: Response) => {
         payment_days: i.payment_days ?? null,
         late_payment_days: i.late_payment_days ?? null,
         customer_name: name,
+        // Phase 4 Update §2.5: both references side by side — WhizUnik
+        // invoice number (commercial) + Tally voucher number (accounting)
+        // + Tally internal reference + sync state.
+        whizunik_invoice_number: i.invoice_number,
+        tally_voucher_number: i.tally_voucher_number ?? null,
+        tally_internal_reference: i.tally_reference ?? null,
+        tally_company_name: i.tally_company_name ?? null,
+        sync_status: i.sync_status ?? null,
+        synced_at: i.synced_at ?? null,
+        connector_id: i.connector_id ?? null,
+        push_command_id: i.push_command_id ?? null,
         amount_applied: pa?.amount_applied ?? null,
         applied_date: pa?.applied_date ?? null,
         closed_invoice: pa?.closed_invoice ?? null,

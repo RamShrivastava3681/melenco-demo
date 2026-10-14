@@ -1,14 +1,14 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { useMemo, useRef, useState } from "react";
+import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { fmtMoney, type Customer, type Invoice } from "@/lib/ledger";
-import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
+import { fmtMoney, fmtDate, dedupeInvoices, sortInvoicesByDue, normInvoiceNumber, type Customer, type Invoice } from "@/lib/ledger";
+import { Trash2, Upload, Download, FileDown, AlertTriangle, CheckCircle2, XCircle, Sparkles, FileCheck } from "lucide-react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -56,7 +56,9 @@ export function InvoicesPanel() {
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
   const [customerId, setCustomerId] = useState<string>("");
-  const [filterStatus, setFilterStatus] = useState<"all" | "open" | "closed">("all");
+  const [filterStatus, setFilterStatus] = useState<"all" | "open" | "closed" | "COMPLETED">("all");
+  const [search, setSearch] = useState("");
+  const [irnPendingId, setIrnPendingId] = useState<string | null>(null);
 
   const { data: customers = [] } = useQuery({
     queryKey: ["customers"],
@@ -76,6 +78,30 @@ export function InvoicesPanel() {
       return res.invoices as Invoice[];
     },
   });
+
+  // Exact, duplicate-free, properly arranged rows: dedupe → search → sort.
+  const visibleInvoices = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const unique = dedupeInvoices(invoices);
+    const filtered = q
+      ? unique.filter(
+          (i) =>
+            normInvoiceNumber(i.invoice_number).includes(q) ||
+            String(i.issue_date || "").includes(q) ||
+            String(i.due_date || "").includes(q)
+        )
+      : unique;
+    return sortInvoicesByDue(filtered);
+  }, [invoices, search]);
+
+  const totals = useMemo(
+    () => ({
+      count: visibleInvoices.length,
+      amount: visibleInvoices.reduce((s, i) => s + Number(i.amount || 0), 0),
+      balance: visibleInvoices.reduce((s, i) => s + Number(i.balance || 0), 0),
+    }),
+    [visibleInvoices]
+  );
 
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
 
@@ -132,6 +158,67 @@ export function InvoicesPanel() {
     },
     onError: (e: Error) => toast.error(e.message),
   });
+
+  // ── Phase 5 demo: posted invoices + one-click IRN ──
+  const seedIrn = useMutation({
+    mutationFn: () => api.seedIrnDemo(),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      qc.invalidateQueries({ queryKey: ["customers"] });
+      if (res.created > 0) {
+        toast.success(`Demo ready: ${res.created} Tally-posted invoice(s) — click Request IRN`);
+      } else {
+        toast.success("Demo invoices already exist — click Request IRN");
+      }
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const irnMut = useMutation({
+    mutationFn: async (inv: Invoice) => {
+      const st = String(inv.irnStatus ?? "IRN_PENDING");
+      if (st === "IRN_FAILED" || st === "IRN_RETRYABLE" || st === "IRN_SUBMITTED") {
+        return api.retryIrn({ invoiceId: inv.id });
+      }
+      return api.requestIrn({ invoiceId: inv.id });
+    },
+    onMutate: (inv) => setIrnPendingId(inv.id),
+    onSettled: () => setIrnPendingId(null),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      if (res.irnStatus === "IRN_GENERATED") {
+        toast.success(
+          res.duplicate
+            ? `IRN already exists: ${res.irn} (no duplicate created)`
+            : `IRN generated: ${res.irn} — mock test result, not a legal IRN`
+        );
+      } else {
+        toast.error(`${res.irnStatus}: ${res.errorMessage ?? res.errorCode ?? "no IRN generated"}`);
+      }
+    },
+    onError: (e: Error) => {
+      const d = (e as ApiError).details;
+      const missing = d?.missingField ? ` Missing field: ${d.missingField}.` : "";
+      const action = d?.action ? ` ${d.action}` : "";
+      toast.error(`${e.message}${missing}${action}`, { duration: 6000 });
+    },
+  });
+
+  function irnBadge(inv: Invoice) {
+    const st = String(inv.irnStatus ?? "IRN_PENDING");
+    if (st === "IRN_GENERATED" && inv.irn) {
+      return (
+        <div className="flex flex-col items-start gap-0.5" title={`Ack ${inv.acknowledgementNumber ?? ""} · Tally ${inv.tally_voucher_number ?? ""}`}>
+          <Badge className="bg-success text-success-foreground hover:bg-success font-mono">{inv.irn}</Badge>
+          <span className="text-[10px] text-muted-foreground">test IRN · Tally {inv.tally_voucher_number ?? "—"}</span>
+        </div>
+      );
+    }
+    if (st === "IRN_FAILED") return <Badge variant="destructive">Failed</Badge>;
+    if (st === "IRN_RETRYABLE") return <Badge className="bg-amber-500 text-white hover:bg-amber-500">Retryable</Badge>;
+    if (st === "IRN_SUBMITTED" || st === "IRN_REQUEST_READY") return <Badge variant="secondary">Submitted</Badge>;
+    return <span className="text-muted-foreground">—</span>;
+  }
 
   async function handleFile(file: File) {
     clearImportResult();
@@ -230,7 +317,12 @@ export function InvoicesPanel() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Invoices</CardTitle>
+        <div className="flex flex-wrap items-center gap-3">
+          <CardTitle>Invoices</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            {totals.count} invoice{totals.count !== 1 ? "s" : ""} · Amount {fmtMoney(totals.amount)} · Balance {fmtMoney(totals.balance)}
+          </span>
+        </div>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="flex flex-wrap items-end gap-3">
@@ -245,16 +337,29 @@ export function InvoicesPanel() {
           </div>
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Status</label>
-            <Select value={filterStatus} onValueChange={(v) => setFilterStatus(v as "all" | "open" | "closed")}>
+            <Select value={filterStatus} onValueChange={(v) => setFilterStatus(v as "all" | "open" | "closed" | "COMPLETED")}>
               <SelectTrigger className="w-36"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All</SelectItem>
                 <SelectItem value="open">Open</SelectItem>
                 <SelectItem value="closed">Closed</SelectItem>
+                <SelectItem value="COMPLETED">Posted to Tally</SelectItem>
               </SelectContent>
             </Select>
           </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Search</label>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Invoice #, date…"
+              className="h-9 w-52 rounded-md border bg-background px-3 text-sm outline-none placeholder:text-muted-foreground"
+            />
+          </div>
           <div className="ml-auto flex gap-2">
+            <Button variant="secondary" onClick={() => seedIrn.mutate()} disabled={seedIrn.isPending}>
+              <Sparkles className="mr-2 h-4 w-4" />{seedIrn.isPending ? "Seeding..." : "Seed IRN demo"}
+            </Button>
             <Button variant="outline" onClick={() => exportMut.mutate()} disabled={exportMut.isPending}>
               <FileDown className="mr-2 h-4 w-4" />{exportMut.isPending ? "Exporting..." : `Export ${filterStatus === "all" ? "All" : filterStatus.charAt(0).toUpperCase() + filterStatus.slice(1)}`}
             </Button>
@@ -351,10 +456,10 @@ export function InvoicesPanel() {
           </div>
         )}
 
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto rounded-lg border">
           <Table>
             <TableHeader>
-              <TableRow>
+              <TableRow className="bg-muted/50">
                 <TableHead>Invoice #</TableHead>
                 <TableHead>Customer</TableHead>
                 <TableHead>Issued</TableHead>
@@ -365,29 +470,52 @@ export function InvoicesPanel() {
                 <TableHead className="text-right">Paid on</TableHead>
                 <TableHead className="text-right">Pay days</TableHead>
                 <TableHead className="text-right">Late days</TableHead>
+                <TableHead>IRN</TableHead>
                 <TableHead />
               </TableRow>
             </TableHeader>
             <TableBody>
-              {invoices.length === 0 ? (
-                <TableRow><TableCell colSpan={12} className="text-center text-sm text-muted-foreground">No invoices</TableCell></TableRow>
-              ) : invoices.map((i) => (
+              {visibleInvoices.length === 0 ? (
+                <TableRow><TableCell colSpan={12} className="py-8 text-center text-sm text-muted-foreground">No invoices{search.trim() ? " match this search" : ""}</TableCell></TableRow>
+              ) : visibleInvoices.map((i) => (
                 <TableRow key={i.id}>
-                  <TableCell className="font-medium">{i.invoice_number}</TableCell>
+                  <TableCell className="font-medium font-mono">{String(i.invoice_number).trim()}</TableCell>
                   <TableCell>{customerName(i.customer_id)}</TableCell>
-                  <TableCell>{i.issue_date}</TableCell>
-                  <TableCell>{i.due_date}</TableCell>
-                  <TableCell className="text-right">{fmtMoney(Number(i.amount))}</TableCell>
-                  <TableCell className="text-right">{fmtMoney(Number(i.balance))}</TableCell>
+                  <TableCell className="whitespace-nowrap">{fmtDate(i.issue_date)}</TableCell>
+                  <TableCell className="whitespace-nowrap">{fmtDate(i.due_date)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{fmtMoney(Number(i.amount))}</TableCell>
+                  <TableCell className="text-right tabular-nums">{fmtMoney(Number(i.balance))}</TableCell>
                   <TableCell>
                     {i.status === "closed"
                       ? <Badge className="bg-success text-success-foreground hover:bg-success">Closed</Badge>
-                      : <Badge variant="secondary">Open</Badge>}
+                      : i.status === "COMPLETED"
+                        ? <Badge variant="outline" title={`Tally voucher ${i.tally_voucher_number ?? ""}`}>Posted to Tally</Badge>
+                        : <Badge variant="secondary">Open</Badge>}
                   </TableCell>
-                  <TableCell className="text-right">{i.closed_date ?? "\u2014"}</TableCell>
-                  <TableCell className="text-right">{i.payment_days ?? "\u2014"}</TableCell>
-                  <TableCell className="text-right">{i.late_payment_days ?? "\u2014"}</TableCell>
-                  <TableCell className="text-right">
+                  <TableCell className="text-right whitespace-nowrap">{i.closed_date ? fmtDate(i.closed_date) : "—"}</TableCell>
+                  <TableCell className="text-right tabular-nums">{i.payment_days ?? "—"}</TableCell>
+                  <TableCell className="text-right tabular-nums">{i.late_payment_days ?? "—"}</TableCell>
+                  <TableCell>{irnBadge(i)}</TableCell>
+                  <TableCell className="text-right whitespace-nowrap">
+                    {String(i.irnStatus ?? "IRN_PENDING") === "IRN_GENERATED" ? (
+                      <span className="mr-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
+                        <FileCheck className="h-4 w-4" />Done
+                      </span>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mr-1"
+                        disabled={irnPendingId === i.id || irnMut.isPending}
+                        onClick={() => irnMut.mutate(i)}
+                      >
+                        {irnPendingId === i.id
+                          ? "Requesting..."
+                          : ["IRN_FAILED", "IRN_RETRYABLE", "IRN_SUBMITTED"].includes(String(i.irnStatus ?? ""))
+                            ? "Retry IRN"
+                            : "Request IRN"}
+                      </Button>
+                    )}
                     <Button variant="ghost" size="icon" onClick={() => {
                       if (confirm(`Delete ${i.invoice_number}?`)) del.mutate(i.id);
                     }}><Trash2 className="h-4 w-4" /></Button>
@@ -397,6 +525,11 @@ export function InvoicesPanel() {
             </TableBody>
           </Table>
         </div>
+        {visibleInvoices.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleInvoices.length} unique invoice{visibleInvoices.length !== 1 ? "s" : ""} · sorted by due date, then invoice # · duplicates hidden automatically.
+          </p>
+        )}
       </CardContent>
     </Card>
   );

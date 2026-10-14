@@ -101,12 +101,15 @@ export async function getWCompany(id: string): Promise<DbItem | undefined> {
 
 export async function findWCompanyByGuid(tenantId: string, guid: string): Promise<DbItem | undefined> {
   const rows = await dbQueryPk(tenantPk(tenantId), "WCOMPANY#");
-  return rows.find((r) => r.tally_guid === guid);
+  const want = String(guid ?? "").trim().toLowerCase();
+  return rows.find((r) => String(r.tally_guid ?? "").trim().toLowerCase() === want);
 }
 
 export async function findWCompanyByName(tenantId: string, name: string): Promise<DbItem | undefined> {
   const rows = await dbQueryPk(tenantPk(tenantId), "WCOMPANY#");
-  return rows.find((r) => r.name === name);
+  const want = String(name ?? "").trim().toLowerCase();
+  if (!want) return undefined;
+  return rows.find((r) => String(r.name ?? "").trim().toLowerCase() === want);
 }
 
 export async function latestWCompanyForTenant(tenantId: string): Promise<DbItem | undefined> {
@@ -167,8 +170,16 @@ export async function listWSyncBatches(
   let rows = await dbQueryPk(tenantPk(tenantId), "WSYNCBATCH#");
   if (filters?.company_id) rows = rows.filter((r) => r.company_id === filters.company_id);
   if (filters?.entity_type) rows = rows.filter((r) => r.entity_type === filters.entity_type);
-  rows.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
-  return rows.slice(0, limit);
+  // Dedupe by batch_id (keep newest) so replays never double-show.
+  const byId = new Map<string, DbItem>();
+  for (const r of rows) {
+    const key = String(r.batch_id ?? r.id);
+    const prev = byId.get(key);
+    if (!prev || String(r.created_at || "") > String(prev.created_at || "")) byId.set(key, r);
+  }
+  const unique = [...byId.values()];
+  unique.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  return unique.slice(0, limit);
 }
 
 // --- Pairing codes (whizunik, pk = code) ---
@@ -218,8 +229,26 @@ export async function listWSyncRecords(
   if (filters?.company_id) rows = rows.filter((r) => r.company_id === filters.company_id);
   if (filters?.entity_type) rows = rows.filter((r) => r.entity_type === filters.entity_type);
   if (filters?.batch_id) rows = rows.filter((r) => r.batch_id === filters.batch_id);
-  rows.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
-  return rows.slice(offset, offset + limit);
+  // Dedupe identical natural keys (keep newest) so the view is exact.
+  const seen = new Map<string, DbItem>();
+  for (const r of rows) {
+    const et = String((r as any).entity_type ?? "").trim().toUpperCase();
+    const oid = String((r as any).source_object_id ?? "").trim().toUpperCase();
+    const vn = String((r as any).source_voucher_number ?? "").trim().toUpperCase();
+    const vd = String((r as any).source_voucher_date ?? "").slice(0, 10);
+    const key = oid ? `${et}|OID|${oid}` : vn ? `${et}|V|${vn}|${vd}` : String((r as any).id);
+    const prev = seen.get(key);
+    if (!prev || String(r.created_at || "") > String(prev.created_at || "")) seen.set(key, r);
+  }
+  const unique = [...seen.values()];
+  unique.sort((a, b) => {
+    const d = String((b as any).source_voucher_date || b.created_at || "").localeCompare(
+      String((a as any).source_voucher_date || a.created_at || "")
+    );
+    if (d !== 0) return d;
+    return String((a as any).source_voucher_number || "").localeCompare(String((b as any).source_voucher_number || ""));
+  });
+  return unique.slice(offset, offset + limit);
 }
 
 // --- Connector commands (whizunik) ---
@@ -249,10 +278,25 @@ export async function getWCommand(id: string, tenantId?: string): Promise<DbItem
 
 export async function listPendingWCommands(connectorId: string, limit = 20): Promise<DbItem[]> {
   const rows = await dbScan(
-    (it) => it.recordType === "WCOMMAND" && it.connector_id === connectorId && it.status === "PENDING"
+    (it) => it.recordType === "WCOMMAND" && it.connector_id === connectorId && (it.status === "PENDING" || (it.status === "DELIVERED" && isCommandLeaseExpired(it)))
   );
   rows.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
   return rows.slice(0, limit);
+}
+
+/**
+ * Phase 4 §12: lease-based retry. A command left DELIVERED (connector took
+ * it but never acked — crash, Tally offline, ack failure) becomes visible
+ * again after LEASE_TTL_MS so polling and connector restarts never lose it.
+ * The DayBook duplicate check on the connector makes the redelivery safe.
+ */
+export const COMMAND_LEASE_TTL_MS = 5 * 60 * 1000;
+
+export function isCommandLeaseExpired(row: DbItem): boolean {
+  const raw = (row.delivered_at as string) ?? (row.updated_at as string) ?? (row.created_at as string) ?? "";
+  const ts = Date.parse(String(raw));
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts >= COMMAND_LEASE_TTL_MS;
 }
 
 export async function listWCommands(tenantId: string, connectorId?: string, limit = 50): Promise<DbItem[]> {

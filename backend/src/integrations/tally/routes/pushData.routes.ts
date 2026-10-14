@@ -82,6 +82,13 @@ const voucherSchema = z.object({
   partyName: z.string().trim().min(1).max(300),
   amount: z.number().finite().positive().max(1_000_000_000),
   narration: z.string().trim().max(500).optional().default(""),
+  // Phase 4 Update §4: non-party ledger (cash/bank/sales/purchase account)
+  // plus note linkage. Optional; the connector falls back to per-type
+  // defaults (Cash for receipt/payment, Sales/Purchase accounts otherwise;
+  // journal/contra MUST name one — they fail closed without it).
+  counterLedgerName: z.string().trim().min(1).max(300).optional(),
+  originalReference: z.string().trim().min(1).max(100).optional(),
+  reason: z.string().trim().min(1).max(300).optional(),
 });
 
 const pushVouchersSchema = z.object({
@@ -111,6 +118,10 @@ const stockSchema = z.object({
 });
 
 function toPublicVoucher(r: any) {
+  let extra: Record<string, unknown> = {};
+  try {
+    extra = JSON.parse((r.raw_json as string) ?? "{}");
+  } catch { /* ignore */ }
   return {
     id: r.id,
     voucherType: r.voucher_type,
@@ -119,6 +130,9 @@ function toPublicVoucher(r: any) {
     partyName: r.party_ledger,
     amount: Number(r.amount),
     narration: r.narration ?? "",
+    counterLedgerName: (extra as any).counterLedgerName ?? null,
+    originalReference: (extra as any).originalReference ?? null,
+    reason: (extra as any).reason ?? null,
     status: r.push_status ?? "DRAFT",
     commandId: r.push_command_id ?? null,
     createdAt: r.created_at,
@@ -344,21 +358,35 @@ router.post("/push-data/vouchers/push", requireAuth, async (req: Request, res: R
 
     const vouchers = drafts.map((d) => {
       const vdate = String(d.voucher_date || "").slice(0, 10);
+      let extra: Record<string, unknown> = {};
+      try {
+        extra = JSON.parse((d.raw_json as string) ?? "{}");
+      } catch { /* ignore */ }
+      const narrationBits = [String(d.narration ?? "").trim()];
+      if (typeof extra.reason === "string" && extra.reason.trim()) narrationBits.push(`Reason: ${extra.reason.trim()}`);
+      const origRef = typeof extra.originalReference === "string" && extra.originalReference.trim() ? extra.originalReference.trim() : null;
+      if (origRef) narrationBits.push(`Against: ${origRef}`);
       return {
         invoiceId: d.id,
         invoiceNumber: d.voucher_number,
         partyName: d.party_ledger,
+        customerLedgerName: d.party_ledger,
+        counterLedgerName: (extra.counterLedgerName as string) ?? null,
+        originalReference: origRef,
+        reason: (extra.reason as string) ?? null,
         amount: Number(d.amount),
+        grandTotal: Number(d.amount),
         issueDate: vdate,
+        invoiceDate: vdate,
         tallyDate: vdate.replace(/-/g, ""),
         voucherType: CONNECTOR_VOUCHER_LABEL[String(d.voucher_type)] ?? "Sales",
         tallyVoucherType: d.voucher_type,
-        narration: d.narration ?? "",
+        narration: narrationBits.filter(Boolean).join(" | "),
       };
     });
 
     const id = `cmd_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
-    const payload = JSON.stringify({ companyId, companyName, tallyCompanyGuid: tallyGuid, vouchers });
+    const payload = JSON.stringify({ companyId, companyName, tallyCompanyGuid: tallyGuid, connectorId: target.connectorId, vouchers });
     if (target.kind === "whizunik") {
       await createWCommand({ id, tenant_id: userId, connector_id: target.connectorId, command: "PUSH_VOUCHERS", payload });
     } else {

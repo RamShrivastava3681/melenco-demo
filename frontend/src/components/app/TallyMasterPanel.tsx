@@ -1,4 +1,4 @@
-import { useState, Fragment } from "react";
+import { useMemo, useState, Fragment } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Loader2, RefreshCw, Send, FileJson, ArrowUpRight } from "lucide-react";
 import { toast } from "sonner";
+import { dedupeBy, fmtEntity } from "@/lib/ledger";
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
   SYNCED: "default",
@@ -48,7 +49,19 @@ export function TallyMasterPanel() {
     refetchInterval: 15_000,
     refetchOnWindowFocus: false,
   });
-  const masters = mastersQuery.data?.masters ?? [];
+  // Exact, duplicate-free, properly arranged: dedupe by stable row key,
+  // then kind → name order so customers, suppliers and SKUs read cleanly.
+  const masters = useMemo(() => {
+    const rows = mastersQuery.data?.masters ?? [];
+    const unique = dedupeBy(rows, (m: any) => `${String(m.kind)}|${String(m.id)}`);
+    return [...unique].sort((a: any, b: any) => {
+      const k = String(a.kind || "").localeCompare(String(b.kind || ""));
+      if (k !== 0) return k;
+      return String(a.displayName || a.name || "").toLowerCase().localeCompare(
+        String(b.displayName || b.name || "").toLowerCase()
+      );
+    });
+  }, [mastersQuery.data]);
 
   const attemptsQuery = useQuery({
     queryKey: ["tally-master-attempts", expandedId],
@@ -182,6 +195,10 @@ export function TallyMasterPanel() {
           </Button>
         </div>
 
+        <p className="text-xs text-muted-foreground">
+          Showing {masters.length} unique master{masters.length !== 1 ? "s" : ""} - sorted by kind, then name - duplicates hidden automatically.
+        </p>
+
         {/* Master table */}
         {mastersQuery.isLoading ? (
           <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
@@ -195,7 +212,7 @@ export function TallyMasterPanel() {
           <div className="overflow-x-auto rounded-lg border">
             <table className="w-full text-xs">
               <thead>
-                <tr className="border-b bg-muted/50 text-left">
+                <tr className="bg-muted/50 text-left">
                   <th className="px-3 py-2"></th>
                   <th className="px-3 py-2">Kind</th>
                   <th className="px-3 py-2">Name</th>
@@ -220,7 +237,7 @@ export function TallyMasterPanel() {
                             aria-label={`Select ${m.displayName}`}
                           />
                         </td>
-                        <td className="px-3 py-1.5 text-muted-foreground">{m.kind}</td>
+                        <td className="px-3 py-1.5 text-muted-foreground">{fmtEntity(m.kind)}</td>
                         <td className="px-3 py-1.5 font-medium">{m.displayName} <span className="text-muted-foreground font-normal">v{m.version}</span></td>
                         <td className="px-3 py-1.5"><Badge variant={STATUS_VARIANT[m.status] ?? "outline"}>{m.status}</Badge></td>
                         <td className="px-3 py-1.5">{m.tallyName ?? "—"}</td>

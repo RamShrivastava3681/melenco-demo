@@ -37,9 +37,9 @@ function dataOf(ctx: NormalizeContext): Record<string, any> {
 
 /** Name for masters: top-level partyName or data.name. */
 function masterName(ctx: NormalizeContext): string {
-  const fromParty = typeof ctx.record.partyName === "string" ? ctx.record.partyName.trim() : "";
+  const fromParty = typeof ctx.record.partyName === "string" ? ctx.record.partyName.trim().replace(/\s+/g, " ") : "";
   const d = dataOf(ctx);
-  const fromData = typeof d.name === "string" ? d.name.trim() : "";
+  const fromData = typeof d.name === "string" ? d.name.trim().replace(/\s+/g, " ") : "";
   const name = fromParty || fromData;
   if (!name) {
     throw new ApiError("TALLY_DATA_INVALID", "Master record is missing a name");
@@ -51,28 +51,38 @@ function masterName(ctx: NormalizeContext): string {
 function parentOf(ctx: NormalizeContext): string | null {
   const d = dataOf(ctx);
   const p = d.parent || d.group || d.category;
-  return typeof p === "string" && p.trim() ? p.trim() : null;
+  const clean = typeof p === "string" ? p.trim().replace(/\s+/g, " ") : "";
+  return clean ? clean : null;
 }
 
 /** Insert a customer (debtor) if absent — matches existing customers table semantics. */
 async function upsertCustomer(userId: string, name: string): Promise<string> {
-  const existing = await findCustomerByName(userId, name);
+  const clean = String(name ?? "").trim().replace(/\s+/g, " ");
+  if (!clean) throw new ApiError("TALLY_DATA_INVALID", "Master record is missing a name");
+  const existing = await findCustomerByName(userId, clean);
   if (existing) return existing.id as string;
   try {
-    const created = await createCustomer(userId, name);
+    const created = await createCustomer(userId, clean);
     return created.id as string;
   } catch {
-    const again = await findCustomerByName(userId, name);
+    const again = await findCustomerByName(userId, clean);
     return again!.id as string;
   }
 }
 
 /** Insert a supplier if absent. */
 async function upsertSupplier(userId: string, name: string): Promise<string> {
-  const existing = await findSupplierByName(userId, name);
+  const clean = String(name ?? "").trim().replace(/\s+/g, " ");
+  if (!clean) throw new ApiError("TALLY_DATA_INVALID", "Master record is missing a name");
+  const existing = await findSupplierByName(userId, clean);
   if (existing) return existing.id as string;
-  const created = await createSupplier(userId, name);
-  return created.id as string;
+  try {
+    const created = await createSupplier(userId, clean);
+    return created.id as string;
+  } catch {
+    const again = await findSupplierByName(userId, clean);
+    return again!.id as string;
+  }
 }
 
 async function upsertLedgerType(

@@ -81,11 +81,15 @@ import {
   getCustomer,
   getSupplier,
   getProduct,
+  getInvoice,
+  updateInvoice,
   listCustomers,
   listSuppliers,
   listProducts,
   listInvoices,
 } from "../../../db/storesCore.js";
+import { listVouchers } from "../../../db/storesTally.js";
+import { dbUpdate } from "../../../db/dynamo.js";
 
 const router = Router();
 
@@ -458,9 +462,60 @@ router.post(
           throw err;
         }
 
-        // Receive path: persist every record so the platform can show and
-        // reconcile exactly what the connector pushed (per-record storage).
+        // Receive path: persist each unique record so the platform shows
+        // exactly what the connector pushed — with no duplications.
+        // Dedupe key: sourceObjectId when present, else normalized
+        // entity + voucher number + date (case/space-insensitive), else payload hash.
+        const norm = (v: unknown) => String(v ?? "").trim().toUpperCase();
+        const keyOf = (r: any): string => {
+          const et = norm(r.entityType || input.entityType);
+          const oid = norm(r.sourceObjectId);
+          if (oid) return `${et}|OID|${oid}`;
+          const vn = norm(r.sourceVoucherNumber ?? r.voucherNumber);
+          const vd = String(r.sourceVoucherDate ?? r.voucherDate ?? "").slice(0, 10);
+          if (vn) return `${et}|V|${vn}|${vd}`;
+          return `${et}|H|${sha256(JSON.stringify(r)).slice(0, 32)}`;
+        };
+        // Existing keys for this company (exact-match guard across re-syncs).
+        const existingKeys = new Set<string>();
+        try {
+          const prior = await listWSyncRecords(claims.tenantId, { company_id: canonicalCompanyId }, 5000, 0);
+          for (const p of prior) {
+            const et = norm((p as any).entity_type || input.entityType);
+            const oid = norm((p as any).source_object_id);
+            if (oid) {
+              existingKeys.add(`${et}|OID|${oid}`);
+              continue;
+            }
+            const vn = norm((p as any).source_voucher_number);
+            const vd = String((p as any).source_voucher_date ?? "").slice(0, 10);
+            if (vn) existingKeys.add(`${et}|V|${vn}|${vd}`);
+          }
+        } catch { /* dedupe degrades to within-batch only */ }
+        const seenInBatch = new Set<string>();
+        let duplicatesSkipped = 0;
+        const uniqueRecords: any[] = [];
         for (const r of input.records) {
+          const k = keyOf(r);
+          if (seenInBatch.has(k) || existingKeys.has(k)) {
+            duplicatesSkipped++;
+            continue;
+          }
+          seenInBatch.add(k);
+          uniqueRecords.push(r);
+        }
+        // Refresh the batch row counts so the dashboard shows exact numbers.
+        try {
+          const batchRow = await getWSyncBatchByBatchId(input.batchId);
+          if (batchRow) {
+            const { dbUpdate: wzDbUpdate } = await import("../../../db/dynamo.js");
+            await wzDbUpdate((batchRow as any).pk, (batchRow as any).sk, {
+              received_count: uniqueRecords.length,
+              duplicate: duplicatesSkipped,
+            });
+          }
+        } catch { /* counts are best-effort */ }
+        for (const r of uniqueRecords) {
           await createWSyncRecord({
             id: uuidv4(),
             batch_id: input.batchId,
@@ -476,7 +531,12 @@ router.post(
 
         await updateWConnectorByPublicId(claims.connectorId, { last_sync: new Date().toISOString() });
 
-        res.status(200).json({ acked: true, batchId: input.batchId, duplicate: false, receivedCount });
+        // Keep the exact 5-endpoint contract: extra field only when dups were skipped.
+        res.status(200).json(
+          duplicatesSkipped > 0
+            ? { acked: true, batchId: input.batchId, duplicate: false, receivedCount: uniqueRecords.length, duplicatesSkipped }
+            : { acked: true, batchId: input.batchId, duplicate: false, receivedCount: uniqueRecords.length }
+        );
       } catch (err: unknown) {
         console.error("[whizunik][sync/batch] failed:", err);
         sendWzError(res, "SERVER_ERROR", "An internal error occurred");
@@ -840,17 +900,51 @@ router.post("/invoices/push", (req: Request, res: Response) => {
 
         const vouchers: Array<Record<string, unknown>> = [];
         for (const r of rows) {
+          const partyName = await custName(r.customer_id as string);
+          // Phase 4: single-line sales invoice fields. Legacy invoices carry
+          // only amount (no line detail) — those keys go out as null and the
+          // connector takes the amount-only path.
+          const version = Number((r as { version?: unknown }).version ?? 1) || 1;
+          const qtyRaw = (r as Record<string, unknown>).quantity ?? (r as Record<string, unknown>).qty ?? null;
+          const priceRaw = (r as Record<string, unknown>).unit_price ?? (r as Record<string, unknown>).unitPrice ?? null;
+          const gstRaw = (r as Record<string, unknown>).gst_rate ?? (r as Record<string, unknown>).gstRate ?? null;
+          const skuId = ((r as Record<string, unknown>).sku_id ?? (r as Record<string, unknown>).skuId ?? null) as string | null;
+          let skuCode = ((r as Record<string, unknown>).sku_code ?? (r as Record<string, unknown>).skuCode ?? null) as string | null;
+          if (!skuCode && skuId) {
+            try {
+              const p = await getProduct(userId, String(skuId));
+              skuCode = ((p?.name as string) ?? null) as string | null;
+            } catch { /* leave null — connector reports the exact reason */ }
+          }
+          const unit = ((r as Record<string, unknown>).unit ?? (r as Record<string, unknown>).base_unit ?? null) as string | null;
+          const grandRaw = (r as Record<string, unknown>).grand_total ?? (r as Record<string, unknown>).grandTotal ?? r.amount;
+          const issueDay = String(r.issue_date).slice(0, 10);
           vouchers.push({
             invoiceId: r.id,
             invoiceNumber: r.invoice_number,
-            partyName: await custName(r.customer_id as string),
+            invoiceDate: issueDay,
+            customerId: r.customer_id,
+            customerLedgerName: partyName,
+            partyName,
+            skuId,
+            skuCode,
+            quantity: qtyRaw !== null ? Number(qtyRaw) : null,
+            unit,
+            unitPrice: priceRaw !== null ? Number(priceRaw) : null,
+            gstRate: gstRaw !== null ? Number(gstRaw) : null,
+            grandTotal: Number(grandRaw),
             amount: Number(r.amount),
             balance: Number(r.balance),
-            issueDate: r.issue_date,
+            issueDate: issueDay,
             dueDate: r.due_date,
-            tallyDate: String(r.issue_date).slice(0, 10).replace(/-/g, ""),
+            tallyDate: issueDay.replace(/-/g, ""),
             voucherType: "Sales",
             narration: `WhizUnik ${r.invoice_number} due ${r.due_date}`,
+            idempotencyKey: `sales_invoice:${r.id as string}:${version}`,
+            version,
+            connectorId: pushTarget.connectorId,
+            companyId,
+            companyName: (company as any)?.name ?? "",
           });
         }
 
@@ -859,6 +953,7 @@ router.post("/invoices/push", (req: Request, res: Response) => {
           companyId,
           companyName: (company as any)?.name ?? "",
           tallyCompanyGuid: (company as any)?.tally_guid ?? null,
+          connectorId: pushTarget.connectorId,
           vouchers,
         };
         const payloadJson = JSON.stringify(payload);
@@ -1065,6 +1160,21 @@ router.post("/commands/ack", (req: Request, res: Response) => {
       if (row.command === "PUSH_MASTERS") {
         await applyMasterAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
       }
+      // Phase 4: voucher results complete the WhizUnik invoices (tally number
+      // stored per invoice; invoice → COMPLETED only on acked success).
+      if (row.command === "PUSH_VOUCHERS") {
+        await applyVoucherAck(claims.tenantId, claims.connectorId, row as any, parsed.data.status, parsed.data.result as any);
+        // Push-data drafts queued for this command flip QUEUED → PUSHED/FAILED
+        // so the dashboard never shows a posted voucher as queued forever.
+        try {
+          const drafts = (await listVouchers(claims.tenantId)).filter(
+            (d) => (d.push_command_id as string) === (row as any).id && (d.push_status ?? "DRAFT") === "QUEUED"
+          );
+          for (const d of drafts) {
+            await dbUpdate(d.pk, d.sk, { push_status: parsed.data.status === "DONE" ? "PUSHED" : "FAILED" });
+          }
+        } catch { /* draft flip must never break the ack */ }
+      }
       res.status(200).json({ id: row.id, status: parsed.data.status });
     } catch (err) {
       console.error("[whizunik][commands/ack] failed:", err);
@@ -1270,6 +1380,73 @@ async function applyMasterAck(
     });
   } catch (err) {
     console.error("[whizunik][masters/ack] link update failed:", err);
+  }
+}
+
+interface VoucherAckEntry {
+  invoiceId?: string;
+  invoiceNumber?: string;
+  tallyVoucherNumber?: string | null;
+  tallyReference?: string | null;
+  resultStatus?: "created" | "already_exists" | "failed";
+}
+
+/**
+ * Phase 4 §10: apply a connector ack for a PUSH_VOUCHERS command to the
+ * WhizUnik invoices. Each acked entry stores the Tally voucher number +
+ * reference, company, connector and command id; the invoice flips to
+ * COMPLETED only when the connector confirms created/already_exists and the
+ * command acks DONE. Failed entries record the failure but never complete.
+ * Duplicate redelivery (same idempotency key) re-links the same voucher —
+ * no second invoice, no status regression once COMPLETED.
+ */
+async function applyVoucherAck(
+  tenantId: string,
+  connectorId: string,
+  cmd: { id: string },
+  ackStatus: string,
+  result: { vouchers?: VoucherAckEntry[]; companyName?: string } | undefined,
+): Promise<void> {
+  try {
+    const entries = Array.isArray(result?.vouchers) ? result!.vouchers! : [];
+    if (entries.length === 0) return;
+    const companyName = typeof result?.companyName === "string" ? result.companyName : null;
+    const now = new Date().toISOString();
+    for (const e of entries) {
+      const invoiceId = typeof e?.invoiceId === "string" && e.invoiceId ? e.invoiceId : null;
+      if (!invoiceId) continue;
+      let inv: Record<string, unknown> | undefined;
+      try {
+        inv = (await getInvoice(tenantId, invoiceId)) as Record<string, unknown> | undefined;
+      } catch {
+        continue;
+      }
+      if (!inv) continue;
+      if (ackStatus === "DONE" && (e?.resultStatus === "created" || e?.resultStatus === "already_exists")) {
+        await updateInvoice(tenantId, invoiceId, {
+          status: "COMPLETED",
+          tally_voucher_number: e?.tallyVoucherNumber ?? null,
+          tally_reference: e?.tallyReference ?? null,
+          tally_company_name: companyName,
+          sync_status: "COMPLETED",
+          synced_at: now,
+          connector_id: connectorId,
+          push_command_id: cmd.id,
+        });
+      } else if (e?.resultStatus === "failed") {
+        // Never falsely complete: keep the invoice open, record the failure.
+        if ((inv as { status?: string }).status !== "COMPLETED") {
+          await updateInvoice(tenantId, invoiceId, {
+            sync_status: "FAILED",
+            sync_error: null,
+            connector_id: connectorId,
+            push_command_id: cmd.id,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[whizunik][vouchers/ack] invoice update failed:", err);
   }
 }
 

@@ -21,7 +21,9 @@ import {
   getSyncCommandGlobal,
   updateSyncCommand,
   listPendingCommandsForConnector,
+  listVouchers,
 } from "../../../db/storesTally.js";
+import { dbUpdate } from "../../../db/dynamo.js";
 import { heartbeatSchema, syncStartSchema, batchSchema, syncCompleteSchema, syncErrorSchema, commandAckSchema } from "../validators/schemas.js";
 import { config } from "../utils/env.js";
 
@@ -211,6 +213,18 @@ router.post("/commands/ack", async (req: Request, res: Response) => {
       return sendError(res, "INVALID_PAYLOAD", "Unknown command for this connector", undefined, req.requestId);
     }
     await updateSyncCommand(row as any, { status: input.status, completed_at: new Date().toISOString() });
+    // Phase 4: flip queued push-data drafts for this command to DONE/CANCELLED
+    // so the dashboard never shows a posted voucher as QUEUED forever.
+    try {
+      const drafts = (await listVouchers(connector.userId)).filter(
+        (d) => (d.push_command_id as string) === (row as any).id && (d.push_status ?? "DRAFT") === "QUEUED"
+      );
+      for (const d of drafts) {
+        await dbUpdate(d.pk, d.sk, {
+          push_status: input.status === "DONE" ? "PUSHED" : "FAILED",
+        });
+      }
+    } catch { /* draft flip must never break the ack */ }
     audit("BATCH_ACCEPTED", {
       userId: connector.userId,
       connectorId: connector.connectorId,
